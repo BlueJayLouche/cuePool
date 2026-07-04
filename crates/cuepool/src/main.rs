@@ -3578,9 +3578,20 @@ fn parse_osc_command(command: &str) -> anyhow::Result<rosc::OscMessage> {
 }
 
 fn main() -> anyhow::Result<()> {
-    // Single instance guard
-    let single = single_instance::SingleInstance::new("CuePool").unwrap();
-    if !single.is_single() {
+    // Single instance guard. On unix the name is a filesystem path, and
+    // Finder launches apps with cwd=/ (read-only) — use an absolute temp
+    // path, and never crash over the guard (worst case: two instances).
+    #[cfg(unix)]
+    let lock_name = std::env::temp_dir()
+        .join("CuePool.lock")
+        .to_string_lossy()
+        .into_owned();
+    #[cfg(not(unix))]
+    let lock_name = "CuePool".to_string();
+    let single = single_instance::SingleInstance::new(&lock_name).ok();
+    if let Some(s) = &single
+        && !s.is_single()
+    {
         log::warn!("Another instance of CuePool is already running. Exiting.");
         return Ok(());
     }
