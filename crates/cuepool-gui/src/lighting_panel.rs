@@ -333,6 +333,13 @@ fn segments_editor(
                         }
                     }
                 });
+            changed |= ui
+                .checkbox(&mut seg.color.derive_amber_uv, "Derive A/UV")
+                .on_hover_text(
+                    "Approximate Amber ((R+G)/2) and UV (0.8·B) from the sampled colour. \
+                     Off: those channels stay at 0.",
+                )
+                .changed();
         });
         // Live preview: what each grid cell sampled (pre-gamma source colours).
         if let Some((cols, rows, rgba)) = preview.get(&seg.id) {
