@@ -40,10 +40,11 @@ pub enum LightingProtocol {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum SegmentSource {
     /// The projection canvas (what the output windows show).
-    #[default]
     Canvas,
     /// The dedicated pixel-map texture, fed by PixelMap cues — LED content
-    /// independent of the projector picture.
+    /// independent of the projector picture. Default: firing a PixelMap cue
+    /// drives the LEDs with its own media, not whatever video is projecting.
+    #[default]
     PixelMap,
 }
 

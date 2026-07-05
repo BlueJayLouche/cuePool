@@ -224,6 +224,9 @@ pub struct SharedState {
     /// When set, the control binary flashes each output a distinct colour so the
     /// operator can see which window is on which projector. Cleared after a timeout.
     pub identify_outputs: bool,
+    /// Live DMX programming: while on, edits to a Lighting cue's looks in the
+    /// inspector stream straight to the fixtures (session-only, not saved).
+    pub lighting_live: bool,
 }
 
 /// State for the progress overlay modal.
@@ -270,6 +273,7 @@ impl Default for SharedState {
             project_generation: 0,
             available_monitors: Vec::new(),
             identify_outputs: false,
+            lighting_live: false,
         }
     }
 }
@@ -341,6 +345,10 @@ pub enum AppCommand {
     UpdateCueTrigger { qid: Decimal, trigger: cuepool_core::TriggerMode },
     LearnMidiTrigger { qid: Decimal },
     CaptureTimecodeTrigger { qid: Decimal },
+    /// Snap the lighting engine's live state to these looks (inspector live mode).
+    LightingLivePush {
+        snapshot: std::collections::BTreeMap<u32, cuepool_core::FixtureLook>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -400,7 +408,10 @@ impl CuePoolApp {
 }
 
 impl CuePoolApp {
-    pub fn update(&mut self, ctx: &egui::Context) {
+    pub fn update(&mut self, ui: &mut egui::Ui) {
+        // Panels lay out in the root `ui`; windows/areas/input still go through
+        // the context.
+        let ctx = &ui.ctx().clone();
         // Keyboard shortcuts. Skip the bare Delete/Backspace cue-delete while a
         // text field is focused so editing isn't hijacked.
         let editing_text = ctx.egui_wants_keyboard_input();
@@ -490,37 +501,37 @@ impl CuePoolApp {
         });
 
         // Top menu bar
-        egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
+        egui::Panel::top("menu_bar").show_inside(ui, |ui| {
             self.menu_bar(ui);
         });
 
         // Transport controls
-        egui::TopBottomPanel::top("transport").show(ctx, |ui| {
+        egui::Panel::top("transport").show_inside(ui, |ui| {
             crate::transport::show(ui, &self.state);
         });
 
+        // Status bar
+        egui::Panel::bottom("status_bar").show_inside(ui, |ui| {
+            self.status_bar(ui);
+        });
+
         // Active cues panel (left side)
-        egui::SidePanel::left("active_cues")
-            .default_width(220.0)
-            .show(ctx, |ui| {
+        egui::Panel::left("active_cues")
+            .default_size(220.0)
+            .show_inside(ui, |ui| {
                 crate::active_cues::show(ui, &self.state);
             });
 
         // Cue inspector (right side)
-        egui::SidePanel::right("inspector")
-            .default_width(280.0)
-            .show(ctx, |ui| {
+        egui::Panel::right("inspector")
+            .default_size(280.0)
+            .show_inside(ui, |ui| {
                 crate::inspector::show(ui, &self.state);
             });
 
-        // Main cue list
-        egui::CentralPanel::default().show(ctx, |ui| {
+        // Main cue list (central: fills what the panels above left over).
+        egui::CentralPanel::default().show_inside(ui, |ui| {
             crate::cue_list::show(ui, &self.state);
-        });
-
-        // Status bar
-        egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
-            self.status_bar(ui);
         });
 
         // Progress overlay
@@ -532,7 +543,7 @@ impl CuePoolApp {
             egui::Area::new(egui::Id::new("progress_overlay"))
                 .order(egui::Order::Foreground)
                 .show(ctx, |ui| {
-                    let screen_rect = ctx.screen_rect();
+                    let screen_rect = ctx.content_rect();
                     ui.painter().rect_filled(screen_rect, 0.0, egui::Color32::from_rgba_premultiplied(0, 0, 0, 180));
 
                     let modal_size = egui::vec2(320.0, 120.0);

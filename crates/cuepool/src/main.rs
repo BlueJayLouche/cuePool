@@ -352,7 +352,7 @@ impl App {
         // stuck-drag failure mode where selection follows the cursor after a
         // click. TextEdits keep their own selection either way.
         let egui_ctx = egui::Context::default();
-        egui_ctx.style_mut(|style| {
+        egui_ctx.global_style_mut(|style| {
             style.interaction.selectable_labels = false;
             style.interaction.multi_widget_text_select = false;
         });
@@ -2002,6 +2002,11 @@ impl App {
                         log::info!("Capturing timecode trigger on Q{} at next tick", qid);
                     }
                 }
+                AppCommand::LightingLivePush { snapshot } => {
+                    // Inspector live mode: snap the edited looks onto the live
+                    // state (LTP — untouched fixtures hold their levels).
+                    self.lighting.go(&snapshot, 0.0, cuepool_core::FadeType::Linear);
+                }
                 _ => {}
             }
         }
@@ -2595,8 +2600,8 @@ impl App {
             }
         }
 
-        let full_output = self.egui_ctx.run(raw_input, |ctx| {
-            self.cuepool.update(ctx);
+        let full_output = self.egui_ctx.run_ui(raw_input, |ui| {
+            self.cuepool.update(ui);
         });
         egui_state.handle_platform_output(window, full_output.platform_output);
 

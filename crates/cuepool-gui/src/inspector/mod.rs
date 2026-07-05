@@ -66,6 +66,7 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
         .iter()
         .map(|f| (f.id, format!("{} (U{} Ch{})", f.name, f.universe, f.address)))
         .collect();
+    let mut lighting_live = state.lighting_live;
 
     // ponytail: one whole-state clone per inspector frame so every edit is undoable.
     // For very large show files this could be replaced with per-field snapshots.
@@ -563,7 +564,12 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
             triggers_editor(ui, &mut base.triggers, base.qid, &mut changed, &mut pending_commands);
         }
         cuepool_core::Cue::Lighting { base, snapshot, fade_time, fade_type } => {
-            ui.label(RichText::new("Lighting Cue").monospace().size(12.0));
+            let was_live = lighting_live;
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Lighting Cue").monospace().size(12.0));
+                ui.checkbox(&mut lighting_live, "🔴 Live")
+                    .on_hover_text("Stream look edits straight to the fixtures (DMX) while programming");
+            });
             ui.horizontal(|ui| {
                 ui.label("Fade (s):");
                 let response = ui.add(egui::DragValue::new(fade_time).speed(0.1).range(0.0..=600.0));
@@ -627,6 +633,13 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
                 });
             }
             triggers_editor(ui, &mut base.triggers, base.qid, &mut changed, &mut pending_commands);
+            // Live mode: push the cue's looks on any edit, and once on toggle-on
+            // so the stage snaps to the cue being programmed.
+            if lighting_live && (changed || !was_live) {
+                pending_commands.push(crate::app::AppCommand::LightingLivePush {
+                    snapshot: snapshot.clone(),
+                });
+            }
         }
     }
 
@@ -634,6 +647,7 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
         state.dirty = true;
         state.undo_redo.push(pre_edit_snapshot);
     }
+    state.lighting_live = lighting_live;
 
     // Write back waveform zoom/scroll (separate borrow to avoid conflict with cue editing)
     state.waveform_zoom = waveform_zoom;
