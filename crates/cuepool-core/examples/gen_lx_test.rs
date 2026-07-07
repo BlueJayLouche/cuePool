@@ -22,6 +22,7 @@ fn main() {
             profile_id: "moving_head_16bit".into(),
             universe: 1,
             address: 1,
+            dest_ip: String::new(),
         },
         PatchedFixture {
             id: 2,
@@ -29,6 +30,7 @@ fn main() {
             profile_id: "dimmer".into(),
             universe: 1,
             address: 10,
+            dest_ip: String::new(),
         },
     ];
 

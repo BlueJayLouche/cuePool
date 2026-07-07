@@ -75,6 +75,7 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
                     profile_id: "dimmer".into(),
                     universe,
                     address,
+                    dest_ip: String::new(),
                 });
                 changed = true;
             }
@@ -123,6 +124,14 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
                 .find(|p| p.id == fixture.profile_id)
                 .map_or(0, |p| p.footprint());
             ui.label(egui::RichText::new(format!("({footprint} ch)")).small().weak());
+            ui.label("IP:");
+            ui.add(
+                egui::TextEdit::singleline(&mut fixture.dest_ip)
+                    .desired_width(100.0)
+                    .hint_text("global"),
+            )
+            .changed()
+            .then(|| changed = true);
             if ui.small_button("✕").clicked() {
                 remove = Some(i);
             }
@@ -133,29 +142,36 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
         changed = true;
     }
 
-    // Overlap warnings — two fixtures claiming the same channels.
-    let spans: Vec<PatchSpan> = lighting
-        .fixtures
-        .iter()
-        .filter_map(|f| {
-            let footprint = lighting.profile(&f.profile_id)?.footprint() as u16;
-            (footprint > 0).then(|| PatchSpan {
+    // Overlap warnings — two fixtures claiming the same channels. Grouped per
+    // destination: the same universe on different nodes doesn't collide.
+    let mut spans_by_dest: std::collections::BTreeMap<String, Vec<PatchSpan>> = Default::default();
+    for f in &lighting.fixtures {
+        let Some(profile) = lighting.profile(&f.profile_id) else { continue };
+        let footprint = profile.footprint() as u16;
+        if footprint == 0 {
+            continue;
+        }
+        spans_by_dest
+            .entry(f.effective_dest(&lighting.dest_ip).to_string())
+            .or_default()
+            .push(PatchSpan {
                 owner: f.name.clone(),
                 detail: f.profile_id.clone(),
                 universe: f.universe,
                 start: f.address,
                 end: f.address + footprint - 1,
-            })
-        })
-        .collect();
-    for o in find_overlaps(&spans) {
-        ui.colored_label(
-            egui::Color32::from_rgb(230, 160, 60),
-            format!(
-                "⚠ '{}' and '{}' overlap on universe {} ch {}–{}",
-                o.a.owner, o.b.owner, o.universe, o.start, o.end
-            ),
-        );
+            });
+    }
+    for spans in spans_by_dest.values() {
+        for o in find_overlaps(spans) {
+            ui.colored_label(
+                egui::Color32::from_rgb(230, 160, 60),
+                format!(
+                    "⚠ '{}' and '{}' overlap on universe {} ch {}–{}",
+                    o.a.owner, o.b.owner, o.universe, o.start, o.end
+                ),
+            );
+        }
     }
 
     ui.separator();

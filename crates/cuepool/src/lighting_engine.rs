@@ -28,9 +28,10 @@ struct ActiveFade {
 
 #[derive(Default)]
 pub struct LightingEngine {
-    sender: Option<DmxSender>,
-    /// (protocol, dest_ip, fps bits) the sender was built from.
-    applied: Option<(LightingProtocol, String, u32)>,
+    /// One paced sender per distinct destination IP ("" = protocol default).
+    senders: BTreeMap<String, DmxSender>,
+    /// (protocol, sorted dest set, fps bits) the senders were built from.
+    applied: Option<(LightingProtocol, Vec<String>, u32)>,
     live: BTreeMap<FixtureId, FixtureLook>,
     fade: Option<ActiveFade>,
     /// Latest sampled canvas pixels per pixel-map segment: (cols, rows, RGBA).
@@ -128,7 +129,9 @@ impl LightingEngine {
         self.last_tick = Some(now);
 
         self.reconcile_sender(cfg);
-        let Some(sender) = &self.sender else { return };
+        if self.senders.is_empty() {
+            return;
+        }
 
         let fading = self.fade.is_some();
         if !fading && !self.dirty {
@@ -144,13 +147,16 @@ impl LightingEngine {
             }
         }
 
-        let mut frame = DmxFrame::new();
+        // One frame per destination — fixtures render into their node's frame.
+        let mut frames: BTreeMap<String, DmxFrame> = BTreeMap::new();
         for fixture in &cfg.fixtures {
             let Some(profile) = cfg.profile(&fixture.profile_id) else {
                 continue;
             };
             let look = looks.get(&fixture.id).copied().unwrap_or_default();
             let bytes = render_look(&profile, &look);
+            let dest = fixture.effective_dest(&cfg.dest_ip);
+            let frame = frames.entry(dest.to_string()).or_default();
             let u = frame.universe_mut(fixture.universe);
             let start = fixture.address.max(1) as usize - 1;
             for (i, b) in bytes.iter().enumerate() {
@@ -160,7 +166,8 @@ impl LightingEngine {
             }
         }
 
-        // Pixel-map segments overlay their channels over cue looks.
+        // Pixel-map segments overlay their channels over cue looks. They go to
+        // the project-level destination (no per-segment override yet).
         self.segment_pixels
             .retain(|id, _| cfg.segments.iter().any(|s| s.id == *id));
         for seg in cfg.active_segments() {
@@ -177,61 +184,77 @@ impl LightingEngine {
                 let bgra = [p[2], p[1], p[0], p[3]];
                 bytes.extend(color_pipeline(bgra, seg.gamma, &seg.color, &profile));
             }
-            pack_fixtures(&mut frame, profile.footprint(), &bytes, seg.universe, seg.address);
+            let frame = frames.entry(cfg.dest_ip.trim().to_string()).or_default();
+            pack_fixtures(frame, profile.footprint(), &bytes, seg.universe, seg.address);
         }
 
-        sender.submit(frame);
+        // Every sender gets a frame (empty if its last fixture moved away) so
+        // keep-alive never re-sends levels for a destination no longer patched.
+        for (dest, sender) in &self.senders {
+            sender.submit(frames.remove(dest).unwrap_or_default());
+        }
         self.dirty = false;
     }
 
-    /// Build/tear down/rebuild the DMX sender to match the config.
+    /// Build/tear down/rebuild the DMX senders to match the config — one per
+    /// distinct destination (project-level + per-fixture overrides).
     fn reconcile_sender(&mut self, cfg: &LightingConfig) {
-        let wanted = cfg
-            .enabled
-            .then(|| (cfg.protocol, cfg.dest_ip.clone(), cfg.fps.to_bits()));
+        let wanted = cfg.enabled.then(|| {
+            let mut dests: Vec<String> = cfg
+                .fixtures
+                .iter()
+                .map(|f| f.effective_dest(&cfg.dest_ip).to_string())
+                .chain(std::iter::once(cfg.dest_ip.trim().to_string()))
+                .collect();
+            dests.sort();
+            dests.dedup();
+            (cfg.protocol, dests, cfg.fps.to_bits())
+        });
         if wanted == self.applied {
             return;
         }
-        if let Some(sender) = self.sender.take() {
+        for sender in std::mem::take(&mut self.senders).into_values() {
             sender.shutdown();
         }
         self.applied = wanted.clone();
-        let Some((protocol, dest_ip, _)) = wanted else {
+        let Some((protocol, dests, _)) = wanted else {
             return;
         };
 
-        let dest = match dest_ip.trim() {
-            "" => match protocol {
-                LightingProtocol::Sacn => Dest::Multicast,
-                LightingProtocol::ArtNet => Dest::Broadcast,
-            },
-            ip => match ip.parse() {
-                Ok(addr) => Dest::Unicast(addr),
-                Err(_) => {
-                    log::error!("Lighting: invalid destination IP '{ip}'");
-                    return;
+        for dest_ip in dests {
+            let dest = match dest_ip.as_str() {
+                "" => match protocol {
+                    LightingProtocol::Sacn => Dest::Multicast,
+                    LightingProtocol::ArtNet => Dest::Broadcast,
+                },
+                ip => match ip.parse() {
+                    Ok(addr) => Dest::Unicast(addr),
+                    Err(_) => {
+                        log::error!("Lighting: invalid destination IP '{ip}'");
+                        continue;
+                    }
+                },
+            };
+            log::info!("Lighting output: {protocol:?} → {dest:?} @ {} fps", cfg.fps);
+            let transport: std::io::Result<Box<dyn DmxTransport>> = match protocol {
+                LightingProtocol::Sacn => {
+                    SacnTransport::new(dest, 100, "CuePool").map(|t| Box::new(t) as _)
                 }
-            },
-        };
-        log::info!("Lighting output: {protocol:?} → {dest:?} @ {} fps", cfg.fps);
-        let transport: std::io::Result<Box<dyn DmxTransport>> = match protocol {
-            LightingProtocol::Sacn => {
-                SacnTransport::new(dest, 100, "CuePool").map(|t| Box::new(t) as _)
+                LightingProtocol::ArtNet => ArtNetTransport::new(dest).map(|t| Box::new(t) as _),
+            };
+            match transport {
+                Ok(t) => {
+                    self.senders.insert(dest_ip, DmxSender::spawn(t, cfg.fps));
+                    self.dirty = true; // push current state to the new output
+                }
+                Err(e) => log::error!("Lighting output failed to start: {e}"),
             }
-            LightingProtocol::ArtNet => ArtNetTransport::new(dest).map(|t| Box::new(t) as _),
-        };
-        match transport {
-            Ok(t) => {
-                self.sender = Some(DmxSender::spawn(t, cfg.fps));
-                self.dirty = true; // push current state to the new output
-            }
-            Err(e) => log::error!("Lighting output failed to start: {e}"),
         }
     }
 
-    /// Drop the sender (project close/reload). Live state resets.
+    /// Drop the senders (project close/reload). Live state resets.
     pub fn shutdown(&mut self) {
-        if let Some(sender) = self.sender.take() {
+        for sender in std::mem::take(&mut self.senders).into_values() {
             sender.shutdown();
         }
         self.applied = None;

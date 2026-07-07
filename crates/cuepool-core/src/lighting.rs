@@ -27,6 +27,10 @@ pub struct PatchedFixture {
     /// 1-based DMX start address.
     #[serde(default = "one_u16")]
     pub address: u16,
+    /// Unicast destination IP for this fixture's node (Art-Net/sACN); empty =
+    /// project-level [`LightingConfig::dest_ip`].
+    #[serde(default)]
+    pub dest_ip: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -118,6 +122,19 @@ impl Default for LightingConfig {
             fixtures: Vec::new(),
             profiles: Vec::new(),
             segments: Vec::new(),
+        }
+    }
+}
+
+impl PatchedFixture {
+    /// Destination this fixture's DMX is sent to: own IP if set, else the
+    /// project-level one. Empty = protocol default (multicast/broadcast).
+    pub fn effective_dest<'a>(&'a self, global: &'a str) -> &'a str {
+        let ip = self.dest_ip.trim();
+        if ip.is_empty() {
+            global.trim()
+        } else {
+            ip
         }
     }
 }
@@ -218,6 +235,7 @@ mod tests {
                 profile_id: "moving_head_16bit".into(),
                 universe: 1,
                 address: 1,
+                dest_ip: String::new(),
             }],
             ..Default::default()
         };
@@ -254,6 +272,7 @@ mod tests {
             profile_id: "rgb".into(),
             universe: 1,
             address: 1,
+            dest_ip: String::new(),
         });
         assert_eq!(cfg.next_fixture_id(), 8);
     }
