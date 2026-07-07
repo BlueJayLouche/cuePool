@@ -727,24 +727,6 @@ impl App {
             self.play_cue(&cue, event_loop);
         }
 
-        // Check for AfterLast cues and schedule them
-        let after_last = {
-            let state = self.cuepool.state().lock_unpoisoned();
-            let mut after_last_qids = Vec::new();
-            for i in (start_idx + 1)..state.show_file.cues.len() {
-                let cue = &state.show_file.cues[i];
-                if cue.base().trigger == cuepool_core::TriggerMode::AfterLast {
-                    after_last_qids.push(cue.base().qid);
-                } else {
-                    break;
-                }
-            }
-            after_last_qids
-        };
-        for qid in after_last {
-            log::info!("AfterLast cue Q{} scheduled", qid);
-        }
-
         // Advance the playhead so the next Go fires the following cue (QLab-style
         // stepping). Skip the cues that auto-fired alongside this one. A goto cue
         // sets its own standby (the target), so don't override it here.
@@ -832,11 +814,15 @@ impl App {
             }
         }
 
-        // If cue has a delay, schedule it instead of playing immediately
+        // If cue has a delay, schedule it instead of playing immediately.
+        // Store it with the delay stripped: the replay re-enters play_cue,
+        // which would otherwise reschedule it forever.
         if delay.as_secs_f64() > 0.0 {
             log::info!("Delaying cue Q{} by {:.2}s", qid, delay.as_secs_f64());
+            let mut cue = cue.clone();
+            cue.base_mut().delay = cuepool_core::Timespan::ZERO;
             self.delayed_cues.push(DelayedCue {
-                cue: cue.clone(),
+                cue,
                 start_at: std::time::Instant::now() + std::time::Duration::from_secs_f64(delay.as_secs_f64()),
             });
             return;
@@ -900,7 +886,13 @@ impl App {
                         .iter()
                         // Exclude self: a group can never be its own member (guards
                         // against stray self-referential data causing recursion).
-                        .filter(|c| c.base().parent == Some(qid) && c.base().qid != qid)
+                        // AfterLast members don't fire at go — they chain off the
+                        // preceding member's completion like anywhere else.
+                        .filter(|c| {
+                            c.base().parent == Some(qid)
+                                && c.base().qid != qid
+                                && c.base().trigger != cuepool_core::TriggerMode::AfterLast
+                        })
                         .cloned()
                         .collect()
                 };
@@ -1009,6 +1001,21 @@ impl App {
             other => {
                 log::info!("Go on unsupported cue type: {:?}", std::mem::discriminant(other));
             }
+        }
+
+        // Instant cue types complete the moment they execute — continue an
+        // AfterLast chain now. Sound/Video chain from check_finished_cues when
+        // playback ends, TimeCode from its marker/deadline, Group members chain
+        // individually, and a Goto only moves the playhead.
+        if !matches!(
+            cue,
+            cuepool_core::Cue::Sound { .. }
+                | cuepool_core::Cue::Video { .. }
+                | cuepool_core::Cue::TimeCode { .. }
+                | cuepool_core::Cue::Group { .. }
+                | cuepool_core::Cue::Goto { .. }
+        ) {
+            self.play_after_last_chain(qid, event_loop);
         }
     }
 
@@ -1603,32 +1610,18 @@ impl App {
         }
     }
 
-    /// Fire the consecutive AfterLast cues that follow `finished_qid` in the cue list.
+    /// Fire the next AfterLast cue following `finished_qid` in the cue list.
+    /// Only the first enabled follower fires here — every cue continues the
+    /// chain itself when it completes (instant cues from play_cue, audio/video
+    /// from check_finished_cues, timecode from its marker/deadline), so firing
+    /// more would double-trigger. Disabled followers are skipped over.
     fn play_after_last_chain(&mut self, finished_qid: rust_decimal::Decimal, event_loop: &ActiveEventLoop) {
-        let state = self.cuepool.state().lock_unpoisoned();
-        let Some(idx) = state.show_file.cues.iter().position(|c| c.base().qid == finished_qid) else {
-            return;
+        let next = {
+            let state = self.cuepool.state().lock_unpoisoned();
+            next_after_last(&state.show_file.cues, finished_qid).cloned()
         };
-
-        let mut after_last_cues = Vec::new();
-        for i in (idx + 1)..state.show_file.cues.len() {
-            let cue = &state.show_file.cues[i];
-            if cue.base().trigger == cuepool_core::TriggerMode::AfterLast {
-                after_last_cues.push(cue.clone());
-            } else {
-                break;
-            }
-        }
-        drop(state);
-
-        // Non-audio cues fire immediately in a burst; the first audio cue starts
-        // and will trigger its own chain when it finishes.
-        for cue in after_last_cues {
-            let is_audio = matches!(cue, cuepool_core::Cue::Sound { .. } | cuepool_core::Cue::Video { .. });
+        if let Some(cue) = next {
             self.play_cue(&cue, event_loop);
-            if is_audio {
-                break;
-            }
         }
     }
 
@@ -3296,6 +3289,20 @@ fn next_standby_qid(
     cues.get(i).map(|c| c.base().qid)
 }
 
+/// The first enabled `AfterLast` cue directly following `finished_qid` — the
+/// next link of a completion chain. Disabled followers are skipped; anything
+/// else (or an unknown qid) ends the chain.
+fn next_after_last(
+    cues: &[cuepool_core::Cue],
+    finished_qid: rust_decimal::Decimal,
+) -> Option<&cuepool_core::Cue> {
+    let idx = cues.iter().position(|c| c.base().qid == finished_qid)?;
+    cues[idx + 1..]
+        .iter()
+        .take_while(|c| c.base().trigger == cuepool_core::TriggerMode::AfterLast)
+        .find(|c| c.enabled())
+}
+
 /// Follow a goto chain from `first_target` to the first non-goto cue. Returns
 /// `None` on a cycle (including a self-target) or a dead end, so the caller never
 /// recurses into `play_cue` indefinitely. `goto_qid` is the originating goto cue.
@@ -3710,6 +3717,23 @@ mod tests {
     fn test_parse_osc_command_empty() {
         let err = parse_osc_command("");
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn after_last_chain_fires_one_link_at_a_time() {
+        use cuepool_core::TriggerMode::{AfterLast, Go};
+        let cues = vec![dummy(1, Go), dummy(2, AfterLast), dummy(3, AfterLast), dummy(4, Go)];
+        // Each completion fires exactly the next link; a non-AfterLast cue ends it.
+        let q = |n: i64| rust_decimal::Decimal::from(n);
+        assert_eq!(next_after_last(&cues, q(1)).map(|c| c.base().qid), Some(q(2)));
+        assert_eq!(next_after_last(&cues, q(2)).map(|c| c.base().qid), Some(q(3)));
+        assert_eq!(next_after_last(&cues, q(3)), None);
+        assert_eq!(next_after_last(&cues, q(99)), None);
+
+        // A disabled link is skipped over, not a dead end.
+        let mut cues = cues;
+        cues[1].base_mut().enabled = false;
+        assert_eq!(next_after_last(&cues, q(1)).map(|c| c.base().qid), Some(q(3)));
     }
 
     fn dummy(qid: i64, trigger: cuepool_core::TriggerMode) -> cuepool_core::Cue {
