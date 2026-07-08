@@ -200,6 +200,19 @@ pub struct SharedState {
     /// Whether the Projection Mapping window is open.
     pub show_projection_window: bool,
     pub show_lighting_window: bool,
+    /// Whether the DMX Recorder window is open.
+    pub show_recorder_window: bool,
+    /// Recorder target `.dmxrec` path (GUI-owned, session-only).
+    pub recorder_file: String,
+    /// Monitor toggle mirror (engine applies it via RecorderSetMonitor).
+    pub recorder_monitor: bool,
+    /// MIDI CC → DMX bridge: enabled + target universe (CC# = channel).
+    pub recorder_midi_enabled: bool,
+    pub recorder_midi_universe: u16,
+    /// Live status published by the engine.
+    pub recorder_status: RecorderStatus,
+    /// One-shot request to open the Take Editor on this file.
+    pub open_take_editor: Option<String>,
     /// Latest pixel-map sample per segment: id → (cols, rows, RGBA bytes).
     /// Published by the control binary; painted by the lighting panel preview.
     pub lighting_preview: std::collections::HashMap<u32, (u32, u32, Vec<u8>)>,
@@ -264,6 +277,13 @@ impl Default for SharedState {
             show_video_window: false,
             show_projection_window: false,
             show_lighting_window: false,
+            show_recorder_window: false,
+            recorder_file: String::new(),
+            recorder_monitor: true,
+            recorder_midi_enabled: false,
+            recorder_midi_universe: 1,
+            open_take_editor: None,
+            recorder_status: RecorderStatus::default(),
             lighting_preview: std::collections::HashMap::new(),
             pending_close_confirm: false,
             quit: false,
@@ -349,6 +369,31 @@ pub enum AppCommand {
     LightingLivePush {
         snapshot: std::collections::BTreeMap<u32, cuepool_core::FixtureLook>,
     },
+    /// Start a recording pass on `file`, or stop-and-keep the running one.
+    RecorderRecord { file: String },
+    /// Stop and throw away the in-flight pass.
+    RecorderDiscard,
+    /// Swap `file` with its `.prev` (undo the last kept pass).
+    RecorderRevert { file: String },
+    RecorderSetMonitor(bool),
+    /// Preview the take through the lighting output (no cue involved).
+    RecorderPreview { file: String },
+    RecorderStopPreview,
+    /// Release every channel the OSC/MIDI live bridge holds.
+    RecorderClearLive,
+    /// Take-editor scrub: hold this frame on the lighting output (None = release).
+    RecorderScrub { frame: Option<rustjay_lighting::MaskedFrame> },
+}
+
+/// DMX recorder status, published by the engine each tick.
+#[derive(Debug, Clone, Default)]
+pub struct RecorderStatus {
+    pub recording: bool,
+    pub elapsed_s: f32,
+    pub event_count: usize,
+    pub punched_count: usize,
+    pub rx_packets: u64,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -365,6 +410,7 @@ pub enum CueType {
     Image,
     Goto,
     Lighting,
+    DmxShow,
     PixelMap,
 }
 
@@ -377,6 +423,7 @@ pub enum ShowMode {
 /// The main egui application.
 pub struct CuePoolApp {
     state: SharedStateHandle,
+    take_editor: crate::take_editor::TakeEditor,
 }
 
 impl Default for CuePoolApp {
@@ -389,6 +436,7 @@ impl CuePoolApp {
     pub fn new() -> Self {
         Self {
             state: Arc::new(Mutex::new(SharedState::new())),
+            take_editor: Default::default(),
         }
     }
 
@@ -399,6 +447,7 @@ impl CuePoolApp {
                 project_path: path,
                 ..SharedState::default()
             })),
+            take_editor: Default::default(),
         }
     }
 
@@ -814,6 +863,37 @@ impl CuePoolApp {
             state.show_lighting_window = show_lighting;
         }
 
+        // DMX Recorder window (wire capture → .dmxrec takes)
+        let mut show_recorder = if let Ok(state) = self.state.lock() {
+            state.show_recorder_window
+        } else {
+            false
+        };
+        if show_recorder {
+            egui::Window::new("DMX Recorder")
+                .collapsible(false)
+                .resizable(true)
+                .default_size([420.0, 220.0])
+                .open(&mut show_recorder)
+                .show(ctx, |ui| {
+                    crate::recorder_panel::show(ui, &self.state);
+                });
+        }
+        if let Ok(mut state) = self.state.lock() {
+            state.show_recorder_window = show_recorder;
+        }
+
+        // Take Editor (curve editing for .dmxrec recordings).
+        let editor_request = self
+            .state
+            .lock()
+            .ok()
+            .and_then(|mut s| s.open_take_editor.take());
+        if let Some(path) = editor_request {
+            self.take_editor.open_file(path);
+        }
+        self.take_editor.show(ctx, &self.state);
+
         // Quit-confirm modal (in-app; a native dialog deadlocks the winit loop).
         let pending_close = self.state.lock().map(|s| s.pending_close_confirm).unwrap_or(false);
         if pending_close {
@@ -1036,6 +1116,16 @@ impl CuePoolApp {
                 if ui.checkbox(&mut show_lighting, "Lighting").clicked() {
                     if let Ok(mut state) = self.state.lock() {
                         state.show_lighting_window = show_lighting;
+                    }
+                    ui.close();
+                }
+                let mut show_recorder = {
+                    let Ok(state) = self.state.lock() else { return; };
+                    state.show_recorder_window
+                };
+                if ui.checkbox(&mut show_recorder, "DMX Recorder").clicked() {
+                    if let Ok(mut state) = self.state.lock() {
+                        state.show_recorder_window = show_recorder;
                     }
                     ui.close();
                 }
@@ -1333,6 +1423,14 @@ impl CuePoolApp {
                                 snapshot: Default::default(),
                                 fade_time: 2.0,
                                 fade_type: cuepool_core::FadeType::Linear,
+                            },
+                            CueType::DmxShow => cuepool_core::Cue::DmxShow {
+                                base,
+                                path: String::new(),
+                                fade_in: 0.0,
+                                fade_out: 0.0,
+                                fade_type: cuepool_core::FadeType::Linear,
+                                priority: 100,
                             },
                             CueType::PixelMap => cuepool_core::Cue::PixelMap {
                                 base,

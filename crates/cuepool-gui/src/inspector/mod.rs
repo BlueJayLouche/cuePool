@@ -563,6 +563,52 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
             );
             triggers_editor(ui, &mut base.triggers, base.qid, &mut changed, &mut pending_commands);
         }
+        cuepool_core::Cue::DmxShow { base, path, fade_in, fade_out, fade_type, priority } => {
+            ui.label(RichText::new("DMX Show Cue").monospace().size(12.0));
+            ui.horizontal(|ui| {
+                ui.label("File:");
+                let response = ui.text_edit_singleline(path);
+                changed |= response.changed();
+                if ui.button("Browse…").clicked() {
+                    if let Some(new_path) = rfd::FileDialog::new()
+                        .add_filter("DMX recording", &["dmxrec"])
+                        .pick_file()
+                    {
+                        *path = new_path.to_string_lossy().to_string();
+                        changed = true;
+                    }
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("Fade In (s):");
+                changed |= ui.add(egui::DragValue::new(fade_in).speed(0.1).range(0.0..=600.0)).changed();
+                ui.label("Fade Out (s):");
+                changed |= ui.add(egui::DragValue::new(fade_out).speed(0.1).range(0.0..=600.0)).changed();
+            });
+            ui.horizontal(|ui| {
+                ui.label("Fade Type:");
+                egui::ComboBox::from_id_salt("dmxshow_fade_type")
+                    .selected_text(format!("{:?}", fade_type))
+                    .show_ui(ui, |ui| {
+                        for variant in [cuepool_core::FadeType::Linear, cuepool_core::FadeType::SCurve, cuepool_core::FadeType::Square, cuepool_core::FadeType::InverseSquare] {
+                            if ui.selectable_value(fade_type, variant, format!("{:?}", variant)).clicked() {
+                                changed = true;
+                            }
+                        }
+                    });
+                ui.label("Priority:")
+                    .on_hover_text("sACN-style merge priority vs the look engine and other shows (default 100)");
+                changed |= ui.add(egui::DragValue::new(priority).speed(1).range(0..=255)).changed();
+            });
+            ui.label(
+                egui::RichText::new(
+                    "Plays a recorded DMX show (.dmxrec) to the lighting output. Loop follows the cue's loop mode; HoldLast holds the final frame until stopped.",
+                )
+                .small()
+                .weak(),
+            );
+            triggers_editor(ui, &mut base.triggers, base.qid, &mut changed, &mut pending_commands);
+        }
         cuepool_core::Cue::Lighting { base, snapshot, fade_time, fade_type } => {
             let was_live = lighting_live;
             ui.horizontal(|ui| {

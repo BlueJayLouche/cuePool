@@ -31,6 +31,21 @@ pub enum OscEvent {
     RemotePing,
     RemoteUpdateShowAck { name: String, block: i32 },
     RemoteUpdateShowNack { name: String, block: i32 },
+    /// `/dmx/{universe}/{channel} <0.0–1.0 | 0–255>` — literal DMX channel
+    /// input (recorder live bridge). Channel is 1-based on the wire.
+    DmxChannel { universe: u16, channel: u16, value: u8 },
+    /// `/recorder/record` — start a pass / stop-and-keep.
+    RecorderRecord,
+    /// `/recorder/stop` — stop pass (keep) or stop preview playback.
+    RecorderStop,
+    /// `/recorder/play` — preview the selected take.
+    RecorderPlay,
+    /// `/recorder/discard` — throw away the in-flight pass.
+    RecorderDiscard,
+    /// `/recorder/revert` — swap the take with its `.prev`.
+    RecorderRevert,
+    /// `/recorder/select <name>` — choose the target take.
+    RecorderSelect { name: String },
     RawMessage(OscMessage),
 }
 
@@ -352,6 +367,38 @@ impl OscManager {
                     let _ = tx.send(OscEvent::RemoteUpdateShowNack { name, block });
                 }
             });
+
+            // DMX recorder: literal channel input + transport verbs.
+            let tx = event_tx.clone();
+            r.subscribe("/dmx/?/?", move |msg| {
+                if let Some((universe, channel)) = parse_dmx_addr(&msg.addr) {
+                    if let Some(value) = msg.args.first().and_then(arg_to_dmx) {
+                        let _ = tx.send(OscEvent::DmxChannel { universe, channel, value });
+                    }
+                }
+            });
+            for (verb, event) in [
+                ("record", OscEvent::RecorderRecord),
+                ("stop", OscEvent::RecorderStop),
+                ("play", OscEvent::RecorderPlay),
+                ("discard", OscEvent::RecorderDiscard),
+                ("revert", OscEvent::RecorderRevert),
+            ] {
+                let tx = event_tx.clone();
+                r.subscribe(&format!("/recorder/{verb}"), move |msg| {
+                    // TouchOSC push buttons send 1.0 on press and 0.0 on
+                    // release — fire on press only (bare messages also fire).
+                    if is_press(msg) {
+                        let _ = tx.send(event.clone());
+                    }
+                });
+            }
+            let tx = event_tx.clone();
+            r.subscribe("/recorder/select", move |msg| {
+                if let Some(name) = msg.args.first().and_then(arg_to_string) {
+                    let _ = tx.send(OscEvent::RecorderSelect { name });
+                }
+            });
         }
 
         let router_clone = Arc::clone(&router);
@@ -396,6 +443,39 @@ fn arg_to_f32(arg: &OscType) -> Option<f32> {
         OscType::Int(i) => Some(*i as f32),
         OscType::Double(d) => Some(*d as f32),
         OscType::Long(l) => Some(*l as f32),
+        _ => None,
+    }
+}
+
+/// Momentary-button press detection: a message with no args fires, a
+/// numeric first arg fires only when non-zero (TouchOSC push release = 0.0).
+fn is_press(msg: &OscMessage) -> bool {
+    msg.args.first().and_then(arg_to_f32).is_none_or(|v| v > 0.0)
+}
+
+/// Parse `/dmx/{universe}/{channel}` (channel 1-based on the wire).
+fn parse_dmx_addr(addr: &str) -> Option<(u16, u16)> {
+    let mut parts = addr.split('/').filter(|s| !s.is_empty());
+    if parts.next() != Some("dmx") {
+        return None;
+    }
+    let universe: u16 = parts.next()?.parse().ok()?;
+    let channel: u16 = parts.next()?.parse().ok()?;
+    if !(1..=512).contains(&channel) || parts.next().is_some() {
+        return None;
+    }
+    Some((universe, channel))
+}
+
+/// OSC arg → DMX value: floats/doubles are 0.0–1.0 (touchOSC fader default),
+/// ints are raw 0–255.
+fn arg_to_dmx(arg: &OscType) -> Option<u8> {
+    match arg {
+        OscType::Float(f) => Some((f.clamp(0.0, 1.0) * 255.0).round() as u8),
+        OscType::Double(d) => Some((d.clamp(0.0, 1.0) * 255.0).round() as u8),
+        OscType::Int(i) => Some((*i).clamp(0, 255) as u8),
+        OscType::Long(l) => Some((*l).clamp(0, 255) as u8),
+        OscType::Bool(b) => Some(if *b { 255 } else { 0 }),
         _ => None,
     }
 }
@@ -446,6 +526,38 @@ mod tests {
         });
 
         assert_eq!(*received.lock().unwrap(), "/qplayer/123/go");
+    }
+
+    #[test]
+    fn test_parse_dmx_addr() {
+        assert_eq!(parse_dmx_addr("/dmx/1/1"), Some((1, 1)));
+        assert_eq!(parse_dmx_addr("/dmx/400/512"), Some((400, 512)));
+        assert_eq!(parse_dmx_addr("/dmx/1/0"), None, "channel is 1-based");
+        assert_eq!(parse_dmx_addr("/dmx/1/513"), None);
+        assert_eq!(parse_dmx_addr("/dmx/1"), None);
+        assert_eq!(parse_dmx_addr("/dmx/1/1/extra"), None);
+        assert_eq!(parse_dmx_addr("/qplayer/1/1"), None);
+    }
+
+    #[test]
+    fn test_is_press_ignores_button_release() {
+        let msg = |args: Vec<OscType>| OscMessage { addr: "/recorder/record".into(), args };
+        assert!(is_press(&msg(vec![])), "bare message fires");
+        assert!(is_press(&msg(vec![OscType::Float(1.0)])), "press fires");
+        assert!(!is_press(&msg(vec![OscType::Float(0.0)])), "release must not fire");
+        assert!(is_press(&msg(vec![OscType::String("x".into())])), "non-numeric fires");
+    }
+
+    #[test]
+    fn test_arg_to_dmx() {
+        assert_eq!(arg_to_dmx(&OscType::Float(0.0)), Some(0));
+        assert_eq!(arg_to_dmx(&OscType::Float(1.0)), Some(255));
+        assert_eq!(arg_to_dmx(&OscType::Float(0.5)), Some(128));
+        assert_eq!(arg_to_dmx(&OscType::Float(7.0)), Some(255), "clamped");
+        assert_eq!(arg_to_dmx(&OscType::Int(200)), Some(200), "ints are raw DMX");
+        assert_eq!(arg_to_dmx(&OscType::Int(999)), Some(255));
+        assert_eq!(arg_to_dmx(&OscType::Bool(true)), Some(255));
+        assert_eq!(arg_to_dmx(&OscType::String("x".into())), None);
     }
 
     #[test]

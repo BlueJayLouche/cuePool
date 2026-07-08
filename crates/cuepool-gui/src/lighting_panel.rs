@@ -50,6 +50,11 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
         changed |= ui
             .add(egui::DragValue::new(&mut lighting.fps).speed(1).range(1.0..=60.0))
             .changed();
+        ui.label("Look priority:")
+            .on_hover_text("sACN-style merge priority of lighting-cue looks vs DMX Show cues (default 100)");
+        changed |= ui
+            .add(egui::DragValue::new(&mut lighting.look_priority).speed(1).range(0..=255))
+            .changed();
     });
 
     ui.separator();

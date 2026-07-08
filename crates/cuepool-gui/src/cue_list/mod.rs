@@ -38,6 +38,7 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
                 ("🖼", "Image", CueType::Image),
                 ("↪", "Goto", CueType::Goto),
                 ("💡", "Lighting", CueType::Lighting),
+                ("🎞", "DMX Show", CueType::DmxShow),
                 ("⊞", "Pixel Map", CueType::PixelMap),
             ] {
                 if ui
@@ -451,6 +452,7 @@ fn cue_type_label(cue: &Cue) -> &'static str {
         Cue::Image { .. } => "IMG",
         Cue::Goto { .. } => "GTO",
         Cue::Lighting { .. } => "LX",
+        Cue::DmxShow { .. } => "DMX",
         Cue::PixelMap { .. } => "PXM",
     }
 }

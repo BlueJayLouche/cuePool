@@ -28,6 +28,8 @@ use human_panic::Metadata;
 
 mod lighting_engine;
 use lighting_engine::LightingEngine;
+mod recorder;
+use recorder::Recorder;
 
 
 /// Decode-channel depth (frames). A small buffer absorbs decode jitter; the
@@ -223,6 +225,7 @@ struct App {
 
     // ── lighting ──
     lighting: LightingEngine,
+    recorder: Recorder,
     /// Canvas downsampler for pixel-map segments (lazy; needs the device).
     pixel_sampler: Option<cuepool_video::PixelSampler>,
     last_pixel_sample: Instant,
@@ -414,6 +417,7 @@ impl App {
             active_timecodes: Vec::new(),
             modifiers: winit::keyboard::ModifiersState::empty(),
             lighting: LightingEngine::default(),
+            recorder: Recorder::new(),
             pixel_sampler: None,
             last_pixel_sample: Instant::now(),
             pixmap_texture: None,
@@ -998,6 +1002,32 @@ impl App {
                 );
                 self.lighting.go(snapshot, *fade_time, *fade_type);
             }
+            cuepool_core::Cue::DmxShow { path, fade_in, fade_out, fade_type, priority, .. } => {
+                let resolved = self.resolve_path(path).unwrap_or_else(|| path.to_string());
+                match rustjay_lighting::read_rec(&resolved) {
+                    Ok(events) => {
+                        log::info!(
+                            "Go DmxShowCue Q{}: {} — {} event(s), {:.1}s, priority {}",
+                            qid,
+                            path,
+                            events.len(),
+                            rustjay_lighting::rec_duration_ms(&events) as f32 / 1000.0,
+                            priority
+                        );
+                        self.lighting.go_show(
+                            qid,
+                            events,
+                            *priority,
+                            *fade_in,
+                            *fade_out,
+                            *fade_type,
+                            cue.base().loop_mode,
+                            cue.base().loop_count,
+                        );
+                    }
+                    Err(e) => log::error!("DmxShow cue Q{qid} failed to load '{resolved}': {e}"),
+                }
+            }
             other => {
                 log::info!("Go on unsupported cue type: {:?}", std::mem::discriminant(other));
             }
@@ -1014,6 +1044,7 @@ impl App {
                 | cuepool_core::Cue::TimeCode { .. }
                 | cuepool_core::Cue::Group { .. }
                 | cuepool_core::Cue::Goto { .. }
+                | cuepool_core::Cue::DmxShow { .. }
         ) {
             self.play_after_last_chain(qid, event_loop);
         }
@@ -1482,12 +1513,46 @@ impl App {
                 input.set_volume(0.0);
                 self.active_cues[idx].state = CueState::Done;
             }
+        } else if self.lighting.stop_show(stop_qid, fade_out_time, fade_type) {
+            // Recorded DMX shows live in the lighting engine, not active_cues.
+            log::info!("Stop DmxShow Q{} (fade {:.2}s)", stop_qid, fade_out_time);
         } else if self.current_text_qid == Some(stop_qid) {
             // Text cues live on the overlay, not in the audio-backed active list.
             self.clear_text_overlay();
             self.request_output_redraw();
         } else {
             log::warn!("StopCue target Q{} not found in active cues", stop_qid);
+        }
+    }
+
+    /// The panel's current take path (`/recorder/*` verbs operate on it).
+    fn recorder_file(&self) -> String {
+        self.cuepool
+            .state()
+            .lock()
+            .map(|s| s.recorder_file.clone())
+            .unwrap_or_default()
+    }
+
+    /// Play a `.dmxrec` take through the lighting output on the sentinel
+    /// preview id (`-1`) — panel preview and `/recorder/play`.
+    fn preview_recording(&mut self, file: &str) {
+        let resolved = self.resolve_path(file).unwrap_or_else(|| file.to_string());
+        match rustjay_lighting::read_rec(&resolved) {
+            Ok(events) => {
+                log::info!("Recorder preview: '{resolved}' ({} events)", events.len());
+                self.lighting.go_show(
+                    rust_decimal::Decimal::NEGATIVE_ONE,
+                    events,
+                    100,
+                    0.0,
+                    0.0,
+                    cuepool_core::FadeType::Linear,
+                    cuepool_core::LoopMode::OneShot,
+                    1,
+                );
+            }
+            Err(e) => log::error!("Recorder preview failed to load '{resolved}': {e}"),
         }
     }
 
@@ -1606,6 +1671,16 @@ impl App {
         for qid in finished_qids {
             self.active_cues.retain(|ac| ac.qid != qid);
             log::info!("Cue Q{} finished — checking AfterLast chain", qid);
+            self.play_after_last_chain(qid, event_loop);
+        }
+
+        // Recorded DMX shows finish inside the lighting engine's tick.
+        // The panel preview plays on the sentinel qid -1 — never a cue.
+        for qid in self.lighting.take_finished_shows() {
+            if qid == rust_decimal::Decimal::NEGATIVE_ONE {
+                continue;
+            }
+            log::info!("DmxShow Q{} finished — checking AfterLast chain", qid);
             self.play_after_last_chain(qid, event_loop);
         }
     }
@@ -1790,6 +1865,8 @@ impl App {
         self.paused = false;
         // Halt any in-flight lighting fade; levels hold (blackout is a cue's job).
         self.lighting.stop_fade();
+        // Recorded DMX shows stop dead — their channels release to the looks.
+        self.lighting.stop_all_shows();
         // Stop the pixmap stream and blank its texture so pixel-mapped LEDs go dark.
         self.pixmap_stop_flag.store(true, Ordering::Relaxed);
         self.pixmap_frame_rx = None;
@@ -2000,6 +2077,26 @@ impl App {
                     // state (LTP — untouched fixtures hold their levels).
                     self.lighting.go(&snapshot, 0.0, cuepool_core::FadeType::Linear);
                 }
+                AppCommand::RecorderRecord { file } => {
+                    let file = self.resolve_path(&file).unwrap_or(file);
+                    self.recorder.record_toggle(&file);
+                }
+                AppCommand::RecorderDiscard => self.recorder.discard(),
+                AppCommand::RecorderRevert { file } => {
+                    let file = self.resolve_path(&file).unwrap_or(file);
+                    self.recorder.revert(&file);
+                }
+                AppCommand::RecorderSetMonitor(on) => self.recorder.monitor = on,
+                AppCommand::RecorderPreview { file } => self.preview_recording(&file),
+                AppCommand::RecorderStopPreview => {
+                    self.lighting.stop_show(
+                        rust_decimal::Decimal::NEGATIVE_ONE,
+                        0.0,
+                        cuepool_core::FadeType::Linear,
+                    );
+                }
+                AppCommand::RecorderClearLive => self.recorder.clear_live(),
+                AppCommand::RecorderScrub { frame } => self.recorder.set_scrub(frame),
                 _ => {}
             }
         }
@@ -2063,6 +2160,18 @@ impl App {
                     log::info!("Learned MIDI trigger for Q{}: {:?}", qid, trigger);
                 }
                 continue;
+            }
+
+            // Recorder live bridge: CC# → DMX channel (1-based) on the
+            // configured universe, 0–127 scaled to 0–255.
+            if let MidiEvent::CC { cc, value, .. } = ev {
+                let bridge = {
+                    let Ok(state) = self.cuepool.state().lock() else { continue };
+                    state.recorder_midi_enabled.then_some(state.recorder_midi_universe)
+                };
+                if let Some(universe) = bridge {
+                    self.recorder.live_input(universe, cc as u16, (value as u16 * 255 / 127) as u8);
+                }
             }
 
             let cues: Vec<_> = {
@@ -2233,6 +2342,55 @@ impl App {
                     OscEvent::Save => {
                         if let Ok(mut state) = self.cuepool.state().lock() {
                             state.command_queue.push(AppCommand::SaveProject);
+                        }
+                    }
+                    OscEvent::DmxChannel { universe, channel, value } => {
+                        // Wire channel is 1-based; recorder is 0-based.
+                        self.recorder.live_input(universe, channel - 1, value);
+                    }
+                    OscEvent::RecorderRecord => {
+                        let file = self.recorder_file();
+                        if let Ok(mut state) = self.cuepool.state().lock() {
+                            state.command_queue.push(AppCommand::RecorderRecord { file });
+                        }
+                    }
+                    OscEvent::RecorderStop => {
+                        // Recording → stop & keep; idle → stop preview.
+                        // stub: no OSC status feedback yet.
+                        if self.recorder.recording() {
+                            let file = self.recorder_file();
+                            if let Ok(mut state) = self.cuepool.state().lock() {
+                                state.command_queue.push(AppCommand::RecorderRecord { file });
+                            }
+                        } else if let Ok(mut state) = self.cuepool.state().lock() {
+                            state.command_queue.push(AppCommand::RecorderStopPreview);
+                        }
+                    }
+                    OscEvent::RecorderPlay => {
+                        let file = self.recorder_file();
+                        if let Ok(mut state) = self.cuepool.state().lock() {
+                            state.command_queue.push(AppCommand::RecorderPreview { file });
+                        }
+                    }
+                    OscEvent::RecorderDiscard => {
+                        if let Ok(mut state) = self.cuepool.state().lock() {
+                            state.command_queue.push(AppCommand::RecorderDiscard);
+                        }
+                    }
+                    OscEvent::RecorderRevert => {
+                        let file = self.recorder_file();
+                        if let Ok(mut state) = self.cuepool.state().lock() {
+                            state.command_queue.push(AppCommand::RecorderRevert { file });
+                        }
+                    }
+                    OscEvent::RecorderSelect { name } => {
+                        let mut file = name;
+                        if !file.ends_with(".dmxrec") {
+                            file.push_str(".dmxrec");
+                        }
+                        if let Ok(mut state) = self.cuepool.state().lock() {
+                            log::info!("Recorder: selected take '{file}' via OSC");
+                            state.recorder_file = file;
                         }
                     }
                     OscEvent::RemotePing => {
@@ -3165,6 +3323,13 @@ impl ApplicationHandler<AppEvent> for App {
                     }
                     sampler.sample(&self.device, &self.queue, &batch);
                 }
+            }
+
+            // Recorder: drain received DMX into the pass and refresh the
+            // monitor overlay before the lighting engine composites.
+            self.recorder.tick(&mut self.lighting);
+            if let Ok(mut state) = self.cuepool.state().lock() {
+                state.recorder_status = self.recorder.snapshot();
             }
 
             self.lighting.tick(&cfg);

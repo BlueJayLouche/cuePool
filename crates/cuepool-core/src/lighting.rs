@@ -110,6 +110,14 @@ pub struct LightingConfig {
     /// Pixel-map segments sampling the video canvas.
     #[serde(default)]
     pub segments: Vec<PixelMapSegment>,
+    /// sACN-style merge priority of the fixture-look engine against recorded
+    /// DMX shows (which carry their own per-cue priority).
+    #[serde(default = "default_look_priority")]
+    pub look_priority: u8,
+}
+
+fn default_look_priority() -> u8 {
+    100
 }
 
 impl Default for LightingConfig {
@@ -122,6 +130,7 @@ impl Default for LightingConfig {
             fixtures: Vec::new(),
             profiles: Vec::new(),
             segments: Vec::new(),
+            look_priority: default_look_priority(),
         }
     }
 }

@@ -9,6 +9,8 @@ pub mod inspector;
 pub mod log_window;
 pub mod logging;
 pub mod lighting_panel;
+pub mod recorder_panel;
+pub mod take_editor;
 pub mod projection_panel;
 pub mod transport;
 pub mod waveform;

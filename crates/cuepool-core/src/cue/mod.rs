@@ -370,6 +370,30 @@ pub enum Cue {
         #[serde(default)]
         fade_type: FadeType,
     },
+
+    #[serde(rename = "DmxShowCue")]
+    DmxShow {
+        #[serde(flatten)]
+        base: CueBase,
+        /// Path to a `.dmxrec` recording (sidecar media, like audio/video).
+        #[serde(default)]
+        path: String,
+        #[serde(default)]
+        fade_in: f32,
+        /// Tail fade starting `fade_out` seconds before the natural end
+        /// (mirrors SoundCue). Ignored for HoldLast / infinite loops.
+        #[serde(default)]
+        fade_out: f32,
+        #[serde(default)]
+        fade_type: FadeType,
+        /// sACN-style merge priority against the look engine and other shows.
+        #[serde(default = "default_dmx_priority")]
+        priority: u8,
+    },
+}
+
+fn default_dmx_priority() -> u8 {
+    100
 }
 
 /// (De)serialize `BTreeMap<u32, V>` with string keys, surviving `flatten`
@@ -425,6 +449,7 @@ impl Cue {
             Cue::Goto { base, .. } => base,
             Cue::PixelMap { base, .. } => base,
             Cue::Lighting { base, .. } => base,
+            Cue::DmxShow { base, .. } => base,
         }
     }
 
@@ -444,6 +469,7 @@ impl Cue {
             Cue::Goto { base, .. } => base,
             Cue::PixelMap { base, .. } => base,
             Cue::Lighting { base, .. } => base,
+            Cue::DmxShow { base, .. } => base,
         }
     }
 
@@ -740,6 +766,40 @@ mod tests {
                 assert_eq!(fade_time, 0.0);
             }
             other => panic!("expected LightingCue, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_dmx_show_cue_serde() {
+        let cue = Cue::DmxShow {
+            base: CueBase {
+                qid: Decimal::from(30),
+                name: "Act 1 LX".into(),
+                loop_mode: LoopMode::HoldLast,
+                ..Default::default()
+            },
+            path: "act1.dmxrec".into(),
+            fade_in: 1.5,
+            fade_out: 3.0,
+            fade_type: FadeType::Linear,
+            priority: 150,
+        };
+        let json = serde_json::to_string(&cue).unwrap();
+        let de: Cue = serde_json::from_str(&json).unwrap();
+        assert_eq!(cue, de);
+        let val = serde_json::to_value(&cue).unwrap();
+        assert_eq!(val["$type"], "DmxShowCue");
+        // Missing fields default; priority defaults to 100 (sACN convention).
+        let minimal: Cue =
+            serde_json::from_value(serde_json::json!({"$type": "DmxShowCue", "qid": 1.0}))
+                .unwrap();
+        match minimal {
+            Cue::DmxShow { path, priority, fade_in, .. } => {
+                assert!(path.is_empty());
+                assert_eq!(priority, 100);
+                assert_eq!(fade_in, 0.0);
+            }
+            other => panic!("expected DmxShowCue, got {:?}", other),
         }
     }
 
