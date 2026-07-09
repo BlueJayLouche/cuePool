@@ -209,6 +209,108 @@ fn segment_color_default() -> SegmentColor {
     SegmentColor { white: WhiteMode::Off, ..Default::default() }
 }
 
+/// Patch sheet CSV for riggers/electricians: fixture summary rows with
+/// per-channel detail underneath, plus pixel-map segment spans (one row per
+/// universe a segment crosses), sorted by universe/address. The `Notes`
+/// column flags address overlaps.
+pub fn patch_sheet_csv(cfg: &LightingConfig) -> String {
+    use rustjay_lighting::{find_overlaps, segment_spans, PatchSpan};
+
+    let fixture_label =
+        |f: &PatchedFixture| if f.name.is_empty() { format!("Fixture {}", f.id) } else { f.name.clone() };
+
+    // Occupied spans (fixtures + all patched segments) for overlap detection.
+    let mut spans: Vec<PatchSpan> = Vec::new();
+    for f in &cfg.fixtures {
+        let Some(p) = cfg.profile(&f.profile_id) else { continue };
+        spans.extend(segment_spans(fixture_label(f), p.name.clone(), f.universe, f.address, p.footprint(), 1));
+    }
+    for s in &cfg.segments {
+        let Some(p) = cfg.profile(&s.profile_id) else { continue };
+        spans.extend(segment_spans(
+            s.name.clone(),
+            p.name.clone(),
+            s.universe,
+            s.address,
+            p.footprint(),
+            (s.cols * s.rows) as usize,
+        ));
+    }
+    let overlaps = find_overlaps(&spans);
+    let overlap_note = |owner: &str, universe: u16, start: u16, end: u16| -> String {
+        overlaps
+            .iter()
+            .filter(|o| {
+                o.universe == universe
+                    && start <= o.end
+                    && o.start <= end
+                    && (o.a.owner == owner || o.b.owner == owner)
+            })
+            .map(|o| {
+                let other = if o.a.owner == owner { &o.b.owner } else { &o.a.owner };
+                format!("OVERLAP with {} @ U{} {}-{}", other, o.universe, o.start, o.end)
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+
+    let esc = |s: &str| -> String {
+        if s.contains([',', '"', '\n']) {
+            format!("\"{}\"", s.replace('"', "\"\""))
+        } else {
+            s.to_string()
+        }
+    };
+
+    // (sort key, csv line) so fixtures/segments interleave by address.
+    let mut rows: Vec<((u16, u16, u8), String)> = Vec::new();
+    for f in &cfg.fixtures {
+        let Some(p) = cfg.profile(&f.profile_id) else { continue };
+        let name = fixture_label(f);
+        let end = f.address + p.footprint().max(1) as u16 - 1;
+        let note = overlap_note(&name, f.universe, f.address, end);
+        rows.push((
+            (f.universe, f.address, 0),
+            format!(
+                "fixture,{},{},{},{},{},{},{},{}",
+                esc(&name), esc(&p.name), f.universe, f.address, p.footprint(), end,
+                esc(f.effective_dest(&cfg.dest_ip)), esc(&note)
+            ),
+        ));
+        for (i, role) in p.channels.iter().enumerate() {
+            let addr = f.address + i as u16;
+            rows.push((
+                (f.universe, f.address, 1 + i.min(254) as u8),
+                format!("channel,{},{},{},{},1,{},,", esc(&name), esc(&role.describe()), f.universe, addr, addr),
+            ));
+        }
+    }
+    for s in &cfg.segments {
+        let Some(p) = cfg.profile(&s.profile_id) else { continue };
+        let count = (s.cols * s.rows) as usize;
+        for span in segment_spans(s.name.clone(), p.name.clone(), s.universe, s.address, p.footprint(), count) {
+            let note = overlap_note(&s.name, span.universe, span.start, span.end);
+            let layout = format!("{} × {} ({} ch/cell)", count, p.name, p.footprint());
+            rows.push((
+                (span.universe, span.start, 0),
+                format!(
+                    "segment,{},{},{},{},{},{},{},{}",
+                    esc(&s.name), esc(&layout), span.universe, span.start,
+                    span.end - span.start + 1, span.end, esc(cfg.dest_ip.trim()), esc(&note)
+                ),
+            ));
+        }
+    }
+    rows.sort_by_key(|(k, _)| *k);
+
+    let mut out = String::from("Kind,Name,Profile,Universe,Address,Channels,End,Dest IP,Notes\n");
+    for (_, line) in rows {
+        out.push_str(&line);
+        out.push('\n');
+    }
+    out
+}
+
 impl PixelMapSegment {
     /// A full-canvas RGB segment with sane defaults.
     pub fn new(id: u32) -> Self {
@@ -284,5 +386,52 @@ mod tests {
             dest_ip: String::new(),
         });
         assert_eq!(cfg.next_fixture_id(), 8);
+    }
+}
+
+#[cfg(test)]
+mod patch_sheet_tests {
+    use super::*;
+
+    #[test]
+    fn patch_sheet_rows_and_overlaps() {
+        let mut cfg = LightingConfig::default();
+        cfg.fixtures.push(PatchedFixture {
+            id: 1,
+            name: "Spot L".into(),
+            profile_id: "rgb".into(),
+            universe: 1,
+            address: 1,
+            dest_ip: String::new(),
+        });
+        // Overlapping fixture: rgb footprint 3, so 1-3 and 2-4 collide.
+        cfg.fixtures.push(PatchedFixture {
+            id: 2,
+            name: String::new(), // falls back to "Fixture 2"
+            profile_id: "rgb".into(),
+            universe: 1,
+            address: 2,
+            dest_ip: "10.0.0.5".into(),
+        });
+        let mut seg = PixelMapSegment::new(1);
+        seg.universe = 2;
+        seg.cols = 200; // 200 × 3ch = 600 ch → spans universes 2 and 3
+        seg.rows = 1;
+        cfg.segments.push(seg);
+
+        let csv = patch_sheet_csv(&cfg);
+        let lines: Vec<&str> = csv.lines().collect();
+        assert_eq!(lines[0], "Kind,Name,Profile,Universe,Address,Channels,End,Dest IP,Notes");
+        // Fixture summary, then its channel rows, sorted by address.
+        assert!(lines[1].starts_with("fixture,Spot L,"), "got {}", lines[1]);
+        assert!(lines[2].starts_with("channel,Spot L,Red,1,1,"), "got {}", lines[2]);
+        assert!(lines[1].contains("OVERLAP with Fixture 2"), "got {}", lines[1]);
+        // Second fixture carries its per-fixture dest IP.
+        let fx2 = lines.iter().find(|l| l.starts_with("fixture,Fixture 2")).unwrap();
+        assert!(fx2.contains("10.0.0.5"));
+        // Segment produces one row per universe crossed.
+        let seg_rows: Vec<_> = lines.iter().filter(|l| l.starts_with("segment,")).collect();
+        assert_eq!(seg_rows.len(), 2, "600ch tape spans two universes");
+        assert!(seg_rows[0].contains(",2,1,"), "first span starts at U2 ch1");
     }
 }

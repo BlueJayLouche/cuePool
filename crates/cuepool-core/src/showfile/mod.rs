@@ -144,6 +144,16 @@ pub struct ShowSettings {
     pub msc_executor: i32,
     #[serde(default = "default_negative_one")]
     pub msc_page: i32,
+
+    // Timecode
+    /// Display-only frame rate for the transport timecode readout (triggers
+    /// are stored in seconds; this only affects the `.ff` formatting).
+    #[serde(default = "default_timecode_fps")]
+    pub timecode_fps: f32,
+}
+
+fn default_timecode_fps() -> f32 {
+    30.0
 }
 
 impl Default for ShowSettings {
@@ -175,6 +185,7 @@ impl Default for ShowSettings {
             msc_tx_device: default_msc_device_tx(),
             msc_executor: -1,
             msc_page: -1,
+            timecode_fps: default_timecode_fps(),
         }
     }
 }

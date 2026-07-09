@@ -6,6 +6,7 @@
 pub mod colour;
 pub mod cue;
 pub mod eq;
+pub mod gdtf;
 pub mod lighting;
 pub mod projection;
 pub mod showfile;

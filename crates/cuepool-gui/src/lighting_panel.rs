@@ -61,6 +61,24 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
     ui.horizontal(|ui| {
         ui.heading("Patch");
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui
+                .button("Export sheet…")
+                .on_hover_text("Save the patch as CSV: fixtures, per-channel detail, and segment spans, with overlap warnings")
+                .clicked()
+            {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("CSV", &["csv"])
+                    .set_file_name("patch-sheet.csv")
+                    .save_file()
+                {
+                    let csv = cuepool_core::lighting::patch_sheet_csv(lighting);
+                    if let Err(e) = std::fs::write(&path, csv) {
+                        log::error!("Patch sheet export failed: {e}");
+                    } else {
+                        log::info!("Patch sheet exported to {}", path.display());
+                    }
+                }
+            }
             if ui.button("+ Add Fixture").clicked() {
                 let id = lighting.next_fixture_id();
                 // Next free address after the last fixture in its universe.
@@ -405,22 +423,90 @@ fn segments_editor(
 
 /// User fixture-profile editor. Builtins are fixed; user profiles are
 /// name-editable with an append/remove channel-chip row (vjarda pattern).
+fn import_gdtf_mode(
+    lighting: &mut cuepool_core::LightingConfig,
+    fixture: &cuepool_core::gdtf::GdtfFixture,
+    mode_idx: usize,
+    free_user_id: &dyn Fn(&cuepool_core::LightingConfig) -> String,
+) {
+    let mode = &fixture.modes[mode_idx];
+    let name = if fixture.modes.len() > 1 {
+        format!("{} — {}", fixture.name, mode.name)
+    } else {
+        fixture.name.clone()
+    };
+    log::info!("Imported GDTF profile '{name}' ({} ch)", mode.channels.len());
+    lighting.profiles.push(FixtureProfile {
+        id: free_user_id(lighting),
+        name,
+        channels: mode.channels.clone(),
+    });
+}
+
 fn profiles_editor(ui: &mut egui::Ui, lighting: &mut cuepool_core::LightingConfig) -> bool {
     let mut changed = false;
 
-    if ui.button("+ New Profile").clicked() {
-        let n = (1..)
-            .find(|n| {
-                let id = format!("user_{n}");
-                lighting.all_profiles().iter().all(|p| p.id != id)
-            })
-            .unwrap();
-        lighting.profiles.push(FixtureProfile {
-            id: format!("user_{n}"),
-            name: format!("User Profile {n}"),
-            channels: vec![ChannelRole::Red, ChannelRole::Green, ChannelRole::Blue],
+    let free_user_id = |lighting: &cuepool_core::LightingConfig| -> String {
+        (1..)
+            .map(|n| format!("user_{n}"))
+            .find(|id| lighting.all_profiles().iter().all(|p| &p.id != id))
+            .unwrap()
+    };
+
+    ui.horizontal(|ui| {
+        if ui.button("+ New Profile").clicked() {
+            let id = free_user_id(lighting);
+            let name = format!("User Profile {}", id.trim_start_matches("user_"));
+            lighting.profiles.push(FixtureProfile {
+                id,
+                name,
+                channels: vec![ChannelRole::Red, ChannelRole::Green, ChannelRole::Blue],
+            });
+            changed = true;
+        }
+        if ui
+            .button("Import GDTF…")
+            .on_hover_text("Import a fixture profile from a .gdtf file (pick a DMX mode if it has several)")
+            .clicked()
+        {
+            if let Some(path) = rfd::FileDialog::new().add_filter("GDTF fixture", &["gdtf"]).pick_file() {
+                match cuepool_core::gdtf::parse_gdtf(&path) {
+                    Ok(f) if f.modes.len() == 1 => {
+                        import_gdtf_mode(lighting, &f, 0, &free_user_id);
+                        changed = true;
+                    }
+                    Ok(f) => {
+                        ui.data_mut(|d| d.insert_temp(egui::Id::new("gdtf_pending"), f));
+                    }
+                    Err(e) => log::error!("GDTF import failed: {e}"),
+                }
+            }
+        }
+    });
+
+    // Multi-mode GDTF: pick which DMX mode becomes the profile.
+    let pending: Option<cuepool_core::gdtf::GdtfFixture> =
+        ui.data(|d| d.get_temp(egui::Id::new("gdtf_pending")));
+    if let Some(f) = pending {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(format!("{} ({}): mode →", f.name, f.manufacturer));
+            let mut done = false;
+            for (i, mode) in f.modes.iter().enumerate() {
+                if ui.button(format!("{} ({} ch)", mode.name, mode.channels.len())).clicked() {
+                    import_gdtf_mode(lighting, &f, i, &free_user_id);
+                    changed = true;
+                    done = true;
+                }
+            }
+            if ui.button("Cancel").clicked() {
+                done = true;
+            }
+            if done {
+                ui.data_mut(|d| {
+                    d.remove::<cuepool_core::gdtf::GdtfFixture>(egui::Id::new("gdtf_pending"))
+                });
+            }
         });
-        changed = true;
     }
 
     let in_use: std::collections::HashSet<&str> = lighting
@@ -443,19 +529,38 @@ fn profiles_editor(ui: &mut egui::Ui, lighting: &mut cuepool_core::LightingConfi
                 remove = Some(i);
             }
         });
-        // Channel chips — click one to remove it.
+        // Channel chips — drag to reorder (channel order = DMX layout),
+        // right-click to delete. Left click is deliberately inert.
         ui.horizontal_wrapped(|ui| {
             let mut remove_ch: Option<usize> = None;
+            let mut move_ch: Option<(usize, usize)> = None; // (from, insert-at)
             for (ci, role) in profile.channels.iter().enumerate() {
-                if ui
-                    .small_button(format!("{}:{}", ci + 1, role.label()))
-                    .on_hover_text("Click to remove")
-                    .clicked()
-                {
+                let chip_id = egui::Id::new(("lx_chip", &profile.id, ci));
+                let resp = ui
+                    .dnd_drag_source(chip_id, (profile.id.clone(), ci), |ui| {
+                        let _ = ui.small_button(format!("{}:{}", ci + 1, role.label()));
+                    })
+                    .response
+                    .interact(egui::Sense::click())
+                    .on_hover_text(format!(
+                        "ch {}: {} — drag to reorder, right-click to delete",
+                        ci + 1,
+                        role.describe()
+                    ));
+                if resp.secondary_clicked() {
                     remove_ch = Some(ci);
                 }
+                if let Some(payload) = resp.dnd_release_payload::<(String, usize)>() {
+                    if payload.0 == profile.id && payload.1 != ci {
+                        move_ch = Some((payload.1, ci));
+                    }
+                }
             }
-            if let Some(ci) = remove_ch {
+            if let Some((from, to)) = move_ch {
+                let role = profile.channels.remove(from);
+                profile.channels.insert(to.min(profile.channels.len()), role);
+                changed = true;
+            } else if let Some(ci) = remove_ch {
                 profile.channels.remove(ci);
                 changed = true;
             }

@@ -213,6 +213,11 @@ pub struct SharedState {
     pub recorder_status: RecorderStatus,
     /// One-shot request to open the Take Editor on this file.
     pub open_take_editor: Option<String>,
+    /// Show-clock elapsed seconds (None until the first Go); frozen while paused.
+    pub show_time: Option<f64>,
+    pub show_paused: bool,
+    /// Next armed timecode trigger: (cue qid, trigger seconds).
+    pub next_timecode: Option<(Decimal, f64)>,
     /// Latest pixel-map sample per segment: id → (cols, rows, RGBA bytes).
     /// Published by the control binary; painted by the lighting panel preview.
     pub lighting_preview: std::collections::HashMap<u32, (u32, u32, Vec<u8>)>,
@@ -283,6 +288,9 @@ impl Default for SharedState {
             recorder_midi_enabled: false,
             recorder_midi_universe: 1,
             open_take_editor: None,
+            show_time: None,
+            show_paused: false,
+            next_timecode: None,
             recorder_status: RecorderStatus::default(),
             lighting_preview: std::collections::HashMap::new(),
             pending_close_confirm: false,
@@ -383,6 +391,8 @@ pub enum AppCommand {
     RecorderClearLive,
     /// Take-editor scrub: hold this frame on the lighting output (None = release).
     RecorderScrub { frame: Option<rustjay_lighting::MaskedFrame> },
+    /// Step one video frame forward while paused (show clock follows).
+    FrameStep,
 }
 
 /// DMX recorder status, published by the engine each tick.
@@ -681,6 +691,17 @@ impl CuePoolApp {
                                 let linear = 10.0f32.powf(db / 20.0);
                                 limiter_cmd = Some(AppCommand::SetLimiterThreshold(linear));
                             }
+                        });
+                        ui.separator();
+
+                        egui::CollapsingHeader::new("Timecode").default_open(false).show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label("Display fps:")
+                                    .on_hover_text("Frame rate of the transport clock readout only — triggers are stored in seconds");
+                                settings_changed |= ui
+                                    .add(egui::DragValue::new(&mut settings.timecode_fps).speed(1).range(1.0..=120.0))
+                                    .changed();
+                            });
                         });
                         ui.separator();
 
@@ -1343,11 +1364,18 @@ impl CuePoolApp {
 
                         let next_qid = state.show_file.choose_qid(state.selected_cue_id);
 
-                        let base = cuepool_core::CueBase {
+                        let mut base = cuepool_core::CueBase {
                             qid: next_qid,
                             name: format!("New {:?} Cue", cue_type),
                             ..Default::default()
                         };
+                        // Show clock running (or paused mid-step): pre-fill the
+                        // timecode trigger with the current time, so "pause at
+                        // the moment, add cue" lands armed at the right spot.
+                        if let Some(t) = state.show_time {
+                            base.triggers.timecode =
+                                Some(cuepool_core::TimecodeTrigger { time: cuepool_core::Timespan::from_secs_f64(t) });
+                        }
 
                         let cue = match cue_type {
                             CueType::Sound => cuepool_core::Cue::Sound {

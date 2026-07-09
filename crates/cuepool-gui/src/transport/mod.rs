@@ -3,6 +3,23 @@
 use crate::app::{AppCommand, GuiMeterData, SharedStateHandle};
 use egui::{Button, Color32, RichText, Vec2};
 
+/// `HH:MM:SS.ff` at a display-only frame rate (triggers store seconds).
+fn format_timecode(secs: f64, fps: f32) -> String {
+    let fps = fps.max(1.0) as f64;
+    let t = secs.max(0.0);
+    let frames = (t * fps).round() as u64;
+    let fph = (fps * 3600.0) as u64;
+    let fpm = (fps * 60.0) as u64;
+    let fpsu = fps as u64;
+    format!(
+        "{:02}:{:02}:{:02}.{:02}",
+        frames / fph,
+        (frames % fph) / fpm,
+        (frames % fpm) / fpsu,
+        frames % fpsu
+    )
+}
+
 pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
     ui.horizontal(|ui| {
         let button_size = Vec2::new(60.0, 32.0);
@@ -33,12 +50,57 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
             }
         }
 
+        let (show_time, show_paused, next_tc, tc_fps) = {
+            let Ok(state) = state.lock() else { return };
+            (
+                state.show_time,
+                state.show_paused,
+                state.next_timecode,
+                state.show_file.show_settings.timecode_fps,
+            )
+        };
+        let step_btn = Button::new(RichText::new("⏭")).min_size(Vec2::new(36.0, 32.0));
+        if ui
+            .add_enabled(show_paused, step_btn)
+            .on_hover_text("Step one video frame forward (paused only); the show clock follows")
+            .clicked()
+        {
+            if let Ok(mut state) = state.lock() {
+                state.command_queue.push(AppCommand::FrameStep);
+            }
+        }
+
         let preload_btn = Button::new(RichText::new("PRELOAD"))
             .min_size(Vec2::new(70.0, 32.0));
         if ui.add(preload_btn).clicked() {
             if let Ok(mut state) = state.lock() {
                 state.command_queue.push(AppCommand::Preload);
             }
+        }
+
+        ui.separator();
+
+        // Show clock (the clock timecode triggers fire against) + next trigger.
+        let tc_color = if show_paused {
+            Color32::from_rgb(230, 190, 60)
+        } else if show_time.is_some() {
+            Color32::from_rgb(120, 220, 120)
+        } else {
+            Color32::from_gray(110)
+        };
+        let tc_text = match show_time {
+            Some(t) => format_timecode(t, tc_fps),
+            None => "--:--:--.--".into(),
+        };
+        ui.label(RichText::new(tc_text).monospace().size(20.0).color(tc_color))
+            .on_hover_text(if show_paused { "Show clock (paused)" } else { "Show clock" });
+        if let Some((qid, t)) = next_tc {
+            ui.label(
+                RichText::new(format!("next: Q{qid} @ {}", format_timecode(t, tc_fps)))
+                    .monospace()
+                    .small()
+                    .weak(),
+            );
         }
 
         ui.separator();
@@ -151,5 +213,19 @@ fn draw_meter(ui: &mut egui::Ui, data: &GuiMeterData) {
         if lit {
             painter.rect_filled(seg_rect, 1.0, colour);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_timecode;
+
+    #[test]
+    fn timecode_formatting() {
+        assert_eq!(format_timecode(0.0, 30.0), "00:00:00.00");
+        assert_eq!(format_timecode(1.0, 30.0), "00:00:01.00");
+        assert_eq!(format_timecode(0.5, 30.0), "00:00:00.15");
+        assert_eq!(format_timecode(3661.5, 25.0), "01:01:01.13", "25fps half-second = frame 12.5 → 13");
+        assert_eq!(format_timecode(-3.0, 30.0), "00:00:00.00", "negative clamps");
     }
 }

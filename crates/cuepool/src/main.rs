@@ -168,6 +168,13 @@ struct App {
     paused: bool,
     show_start_time: Option<Instant>,
     show_start_clock: Option<std::time::Duration>,
+    /// Audio-clock time when the show was paused — freezes the show clock.
+    show_pause_started: Option<std::time::Duration>,
+    /// Seconds subtracted from the raw show clock (accumulated pause time,
+    /// minus any frame-step advances made while paused).
+    show_paused_offset: f64,
+    /// A frame-step was requested while paused: present one video frame.
+    video_step_pending: bool,
     triggered_timecodes: Vec<rust_decimal::Decimal>,
     /// TimeCode cues with a duration currently occupying time.
     active_timecodes: Vec<(rust_decimal::Decimal, std::time::Instant)>,
@@ -413,6 +420,9 @@ impl App {
             paused: false,
             show_start_time: None,
             show_start_clock: None,
+            show_pause_started: None,
+            show_paused_offset: 0.0,
+            video_step_pending: false,
             triggered_timecodes: Vec::new(),
             active_timecodes: Vec::new(),
             modifiers: winit::keyboard::ModifiersState::empty(),
@@ -682,6 +692,8 @@ impl App {
         if self.show_start_time.is_none() {
             self.show_start_time = Some(Instant::now());
             self.show_start_clock = Some(self.audio_engine.playback_time());
+            self.show_paused_offset = 0.0;
+            self.show_pause_started = self.paused.then(|| self.audio_engine.playback_time());
             self.triggered_timecodes.clear();
             self.active_timecodes.clear();
             self.timecode_fired.clear();
@@ -1862,6 +1874,12 @@ impl App {
         self.delayed_cues.clear();
         self.active_timecodes.clear();
         self.timecode_fired.clear();
+        // Stop while paused: fold the pause interval into the clock offset so
+        // the show clock stays consistent instead of freezing forever.
+        if let Some(p) = self.show_pause_started.take() {
+            self.show_paused_offset +=
+                (self.audio_engine.playback_time().saturating_sub(p)).as_secs_f64();
+        }
         self.paused = false;
         // Halt any in-flight lighting fade; levels hold (blackout is a cue's job).
         self.lighting.stop_fade();
@@ -1904,6 +1922,10 @@ impl App {
         self.video_pause_flag.store(true, Ordering::Relaxed);
         self.paused = true;
         self.video_pause_started = Some(std::time::Instant::now());
+        // Freeze the show clock — timecode must not advance (or fire) mid-pause.
+        if self.show_pause_started.is_none() {
+            self.show_pause_started = Some(self.audio_engine.playback_time());
+        }
         log::info!("Paused {} cue(s)", self.active_cues.len());
     }
 
@@ -1923,7 +1945,56 @@ impl App {
                 *c += t.elapsed();
             }
         }
+        // Unfreeze the show clock: the paused interval joins the offset.
+        if let Some(p) = self.show_pause_started.take() {
+            self.show_paused_offset +=
+                (self.audio_engine.playback_time().saturating_sub(p)).as_secs_f64();
+        }
         log::info!("Resumed {} cue(s)", self.active_cues.len());
+    }
+
+    /// Show-clock elapsed seconds — frozen while paused, adjusted for
+    /// accumulated pause time and frame-step advances. None before the first Go.
+    fn show_elapsed(&self) -> Option<f64> {
+        let start = self.show_start_clock?;
+        let now = self
+            .show_pause_started
+            .unwrap_or_else(|| self.audio_engine.playback_time());
+        Some((now.as_secs_f64() - start.as_secs_f64() - self.show_paused_offset).max(0.0))
+    }
+
+    /// Step one video frame forward while paused; show clock follows in
+    /// lockstep. Without a video playing, advances by one display frame.
+    fn frame_step(&mut self) {
+        if !self.paused {
+            return;
+        }
+        if let Some(clock) = self.video_clock {
+            if self.video_peek.is_none() {
+                self.video_peek = self.video_frame_rx.as_ref().and_then(|rx| rx.try_recv().ok());
+            }
+            if let Some(f) = self.video_peek.as_ref() {
+                let delta = f.pts - clock.elapsed().as_secs_f64();
+                if delta > 0.0 {
+                    // Moving the clock's epoch back makes the next frame due.
+                    if let Some(c) = clock.checked_sub(Duration::from_secs_f64(delta)) {
+                        self.video_clock = Some(c);
+                        self.show_paused_offset -= delta;
+                    }
+                }
+                self.video_step_pending = true;
+                self.request_output_redraw();
+                return;
+            }
+            log::debug!("Frame step: no decoded frame available yet");
+            return;
+        }
+        // No video: advance the frozen clock by one display frame.
+        let fps = {
+            let Ok(state) = self.cuepool.state().lock() else { return };
+            state.show_file.show_settings.timecode_fps.max(1.0)
+        };
+        self.show_paused_offset -= 1.0 / fps as f64;
     }
 
     fn handle_dropped_file(&mut self, path: &Path) {
@@ -2097,6 +2168,7 @@ impl App {
                 }
                 AppCommand::RecorderClearLive => self.recorder.clear_live(),
                 AppCommand::RecorderScrub { frame } => self.recorder.set_scrub(frame),
+                AppCommand::FrameStep => self.frame_step(),
                 _ => {}
             }
         }
@@ -2255,31 +2327,53 @@ impl App {
         }
     }
 
-    /// Poll timecode triggers against the show clock.
+    /// Poll timecode triggers against the show clock; publishes the clock and
+    /// the next armed trigger to the GUI. The clock is frozen while paused
+    /// (see [`Self::show_elapsed`]) and triggers never fire mid-pause.
     fn poll_timecode_triggers(&mut self, event_loop: &ActiveEventLoop) {
-        let Some(show_start) = self.show_start_clock else { return };
-        let playback = self.audio_engine.playback_time();
-        if playback < show_start {
-            return;
-        }
-        let elapsed = playback - show_start;
+        let elapsed = self.show_elapsed();
 
-        // Capture current show time into a cue's timecode trigger if requested.
+        // Publish clock + next armed trigger; handle a pending capture.
         let capture_qid = {
-            let Ok(state) = self.cuepool.state().lock() else { return };
+            let Ok(mut state) = self.cuepool.state().lock() else { return };
+            state.show_time = elapsed;
+            state.show_paused = self.paused;
+            state.next_timecode = elapsed.and_then(|now| {
+                state
+                    .show_file
+                    .cues
+                    .iter()
+                    .filter(|c| c.enabled() && !self.timecode_fired.contains(&c.base().qid))
+                    .filter_map(|c| {
+                        let t = c.base().triggers.timecode.as_ref()?.time.as_secs_f64();
+                        (t >= now).then_some((c.base().qid, t))
+                    })
+                    .min_by(|a, b| a.1.total_cmp(&b.1))
+            });
             state.pending_timecode_capture
         };
+        let Some(elapsed) = elapsed else { return };
+
+        // Capture current show time into a cue's timecode trigger if
+        // requested — works while paused (that's the frame-step workflow).
         if let Some(qid) = capture_qid {
             if let Ok(mut state) = self.cuepool.state().lock() {
                 if let Some(cue) = state.show_file.cues.iter_mut().find(|c| c.base().qid == qid) {
                     cue.base_mut().triggers.timecode = Some(cuepool_core::TimecodeTrigger {
-                        time: Timespan::from_secs_f64(elapsed.as_secs_f64()),
+                        time: Timespan::from_secs_f64(elapsed),
                     });
                     state.dirty = true;
-                    log::info!("Captured timecode trigger for Q{} at {:.2}s", qid, elapsed.as_secs_f64());
+                    log::info!("Captured timecode trigger for Q{} at {:.2}s", qid, elapsed);
                 }
                 state.pending_timecode_capture = None;
             }
+        }
+
+        // Frozen clock: never fire while paused (a just-captured or stepped-past
+        // trigger would fire instantly). Anything passed by stepping fires on
+        // resume.
+        if self.paused {
+            return;
         }
 
         let cues: Vec<_> = {
@@ -2290,9 +2384,9 @@ impl App {
         for cue in cues {
             let Some(trigger) = cue.base().triggers.timecode.as_ref() else { continue };
             let qid = cue.base().qid;
-            let target = Duration::from_secs_f64(trigger.time.as_secs_f64());
+            let target = trigger.time.as_secs_f64();
             if elapsed >= target && !self.timecode_fired.contains(&qid) {
-                log::info!("Timecode trigger fired Q{} at {:.2}s", qid, target.as_secs_f64());
+                log::info!("Timecode trigger fired Q{} at {:.2}s", qid, target);
                 self.timecode_fired.insert(qid);
                 self.play_cue_by_qid(qid, event_loop);
             }
@@ -2815,7 +2909,7 @@ impl App {
         // keeps A/V in sync and plays correct-speed on any display refresh. Frames
         // late vs the clock are dropped to catch up; when ahead, the last frame is
         // held and re-presented at vsync.
-        if !self.paused {
+        if !self.paused || std::mem::take(&mut self.video_step_pending) {
             if let Some(target) = self.video_clock.map(|c| c.elapsed()) {
                 let mut newest_due: Option<VideoFrame> = None;
                 loop {
@@ -3507,27 +3601,21 @@ fn video_decode_thread(
         }
     };
 
+    // Note: decode does NOT stop while paused — the bounded channel blocks it
+    // after VIDEO_QUEUE_CAP frames anyway, and keeping it topped up (without
+    // dropping frames) is what makes frame-stepping through a pause possible.
+    let _ = &pause_flag;
     while !stop_flag.load(Ordering::Relaxed) {
-        // Paused: stop decoding (the consumer also stops pulling, so the channel
-        // stays full and we'd block anyway).
-        if pause_flag.load(Ordering::Relaxed) {
-            std::thread::sleep(Duration::from_millis(10));
-            continue;
-        }
-
         match source.read_frame() {
             Some(frame) => {
                 // Backpressure: wait until the vsync-paced consumer takes a frame.
                 // This is what paces decode to the display refresh. We poll with a
-                // short sleep so we stay responsive to stop/pause signals; the channel
+                // short sleep so we stay responsive to the stop signal; the channel
                 // still caps the decode rate to exactly what the display consumes.
                 let mut frame = frame;
                 loop {
                     if stop_flag.load(Ordering::Relaxed) {
                         return;
-                    }
-                    if pause_flag.load(Ordering::Relaxed) {
-                        break; // drop this frame; the outer loop handles the pause
                     }
                     match frame_tx.try_send(frame) {
                         Ok(()) => break,
