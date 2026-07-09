@@ -1874,12 +1874,12 @@ impl App {
         self.delayed_cues.clear();
         self.active_timecodes.clear();
         self.timecode_fired.clear();
-        // Stop while paused: fold the pause interval into the clock offset so
-        // the show clock stays consistent instead of freezing forever.
-        if let Some(p) = self.show_pause_started.take() {
-            self.show_paused_offset +=
-                (self.audio_engine.playback_time().saturating_sub(p)).as_secs_f64();
-        }
+        // Stop ends the show clock (display returns to --:--:--.--); the next
+        // Go restarts it from zero.
+        self.show_start_time = None;
+        self.show_start_clock = None;
+        self.show_pause_started = None;
+        self.show_paused_offset = 0.0;
         self.paused = false;
         // Halt any in-flight lighting fade; levels hold (blackout is a cue's job).
         self.lighting.stop_fade();
