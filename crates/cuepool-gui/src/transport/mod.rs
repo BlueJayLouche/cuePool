@@ -20,6 +20,24 @@ fn format_timecode(secs: f64, fps: f32) -> String {
     )
 }
 
+/// Parse `[HH:][MM:]SS[.ff]` — the `.ff` part is frames at the display rate,
+/// matching the readout. `5:30`, `01:05:30.15`, and plain `90` all work.
+fn parse_timecode(text: &str, fps: f32) -> Option<f64> {
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let (clock, frames) = match text.split_once('.') {
+        Some((c, f)) => (c, f.trim().parse::<u32>().ok()?),
+        None => (text, 0),
+    };
+    let mut secs = 0.0f64;
+    for part in clock.split(':') {
+        secs = secs * 60.0 + part.trim().parse::<u32>().ok()? as f64;
+    }
+    Some(secs + frames as f64 / fps.max(1.0) as f64)
+}
+
 pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
     ui.horizontal(|ui| {
         let button_size = Vec2::new(60.0, 32.0);
@@ -92,8 +110,52 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
             Some(t) => format_timecode(t, tc_fps),
             None => "--:--:--.--".into(),
         };
-        ui.label(RichText::new(tc_text).monospace().size(20.0).color(tc_color))
-            .on_hover_text(if show_paused { "Show clock (paused)" } else { "Show clock" });
+        // Click the readout to type a new position (playhead seek).
+        let edit_id = egui::Id::new("tc_edit");
+        let editing: Option<String> = ui.data(|d| d.get_temp(edit_id));
+        if let Some(mut text) = editing {
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut text)
+                    .desired_width(150.0)
+                    .font(egui::TextStyle::Monospace),
+            );
+            resp.request_focus();
+            let confirmed = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            let cancelled = ui.input(|i| i.key_pressed(egui::Key::Escape))
+                || (resp.lost_focus() && !confirmed);
+            if confirmed {
+                match parse_timecode(&text, tc_fps) {
+                    Some(secs) => {
+                        if let Ok(mut state) = state.lock() {
+                            state.command_queue.push(AppCommand::SeekShowClock { secs });
+                        }
+                    }
+                    None => log::warn!("Unparseable timecode '{text}' — use HH:MM:SS.ff"),
+                }
+            }
+            if confirmed || cancelled {
+                ui.data_mut(|d| d.remove::<String>(edit_id));
+            } else {
+                ui.data_mut(|d| d.insert_temp(edit_id, text));
+            }
+        } else {
+            let resp = ui
+                .add(
+                    egui::Label::new(
+                        RichText::new(tc_text).monospace().size(20.0).color(tc_color),
+                    )
+                    .sense(egui::Sense::click()),
+                )
+                .on_hover_text(if show_paused {
+                    "Show clock (paused) — click to jump the playhead"
+                } else {
+                    "Show clock — click to jump the playhead"
+                });
+            if resp.clicked() {
+                let initial = show_time.map(|t| format_timecode(t, tc_fps)).unwrap_or_default();
+                ui.data_mut(|d| d.insert_temp(edit_id, initial));
+            }
+        }
         if let Some((qid, t)) = next_tc {
             ui.label(
                 RichText::new(format!("next: Q{qid} @ {}", format_timecode(t, tc_fps)))
@@ -219,6 +281,20 @@ fn draw_meter(ui: &mut egui::Ui, data: &GuiMeterData) {
 #[cfg(test)]
 mod tests {
     use super::format_timecode;
+
+    #[test]
+    fn timecode_parsing() {
+        use super::parse_timecode;
+        assert_eq!(parse_timecode("90", 30.0), Some(90.0));
+        assert_eq!(parse_timecode("5:30", 30.0), Some(330.0));
+        assert_eq!(parse_timecode("01:05:30.15", 30.0), Some(3930.5));
+        assert_eq!(parse_timecode("0:00.15", 30.0), Some(0.5), "frames at display fps");
+        assert_eq!(parse_timecode("", 30.0), None);
+        assert_eq!(parse_timecode("abc", 30.0), None);
+        // Round-trip with the formatter.
+        let t = parse_timecode(&super::format_timecode(3930.5, 30.0), 30.0).unwrap();
+        assert!((t - 3930.5).abs() < 1.0 / 30.0);
+    }
 
     #[test]
     fn timecode_formatting() {
