@@ -1963,44 +1963,6 @@ impl App {
         Some((now.as_secs_f64() - start.as_secs_f64() - self.show_paused_offset).max(0.0))
     }
 
-    /// Jump the show clock to `secs`. Triggers before the new position are
-    /// marked as already fired (skipped), later ones re-armed — a seek must
-    /// never machine-gun the cues in between. If the clock isn't running it
-    /// starts frozen at the target (pre-show line-check workflow).
-    fn seek_show_clock(&mut self, secs: f64) {
-        let secs = secs.max(0.0);
-        let now = self.audio_engine.playback_time();
-        if self.show_start_clock.is_none() {
-            self.show_start_time = Some(Instant::now());
-            self.show_start_clock = Some(now);
-            self.pause_all(); // freeze at the target until the operator resumes
-        }
-        let start = self.show_start_clock.unwrap_or_default().as_secs_f64();
-        let now_eff = self.show_pause_started.unwrap_or(now).as_secs_f64();
-        self.show_paused_offset = now_eff - start - secs;
-
-        // Rebuild the fired set relative to the new position.
-        let Ok(state) = self.cuepool.state().lock() else { return };
-        self.timecode_fired = state
-            .show_file
-            .cues
-            .iter()
-            .filter(|c| {
-                c.enabled()
-                    && c.base()
-                        .triggers
-                        .timecode
-                        .as_ref()
-                        .is_some_and(|t| t.time.as_secs_f64() < secs)
-            })
-            .map(|c| c.base().qid)
-            .collect();
-        log::info!(
-            "Show clock seek → {secs:.2}s ({} earlier trigger(s) skipped)",
-            self.timecode_fired.len()
-        );
-    }
-
     /// Step one video frame forward while paused; show clock follows in
     /// lockstep. Without a video playing, advances by one display frame.
     fn frame_step(&mut self) {
@@ -2207,7 +2169,6 @@ impl App {
                 AppCommand::RecorderClearLive => self.recorder.clear_live(),
                 AppCommand::RecorderScrub { frame } => self.recorder.set_scrub(frame),
                 AppCommand::FrameStep => self.frame_step(),
-                AppCommand::SeekShowClock { secs } => self.seek_show_clock(secs),
                 _ => {}
             }
         }
