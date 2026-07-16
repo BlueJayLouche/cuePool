@@ -2751,7 +2751,14 @@ impl App {
         }
     }
 
-    fn render_control(&mut self, event_loop: &ActiveEventLoop) {
+    /// Engine housekeeping that must run every loop iteration regardless of
+    /// window visibility: cue lifecycle (fades, stops, finish chains), video
+    /// loop restarts, delayed and TimeCode cues, and queued commands. Windows
+    /// stops delivering paint events to a minimized/covered control window,
+    /// so none of this can live in render_control — looping videos froze on
+    /// their last frame with the GUI hidden because the loop-restart poll
+    /// below never ran until the GUI was focused again.
+    fn tick_engine(&mut self, event_loop: &ActiveEventLoop) {
         self.check_fade_outs();
         self.check_pending_stops();
         self.check_finished_cues(event_loop);
@@ -2846,6 +2853,14 @@ impl App {
             }
         }
 
+        // Process commands queued by the GUI and OSC/remote handlers; refresh
+        // the mixer snapshot after, so any play() calls are reflected before
+        // the next audio callback fires.
+        self.process_commands(event_loop);
+        self.audio_engine.refresh();
+    }
+
+    fn render_control(&mut self) {
         self.update_window_title();
         let Some(surface) = self.control_surface.as_ref() else { return };
         let Some(config) = self.control_config.as_ref() else { return };
@@ -2988,14 +3003,8 @@ impl App {
 
         self.queue.submit(std::iter::once(encoder.finish()));
         output.present();
-
-        // Process commands that were queued during the UI frame
-        self.process_commands(event_loop);
-
-        // Sync the mixer snapshot so newly-added inputs are visible to the audio callback.
-        // Must be called after process_commands() so any play() calls from this frame
-        // are reflected before the next callback fires.
-        self.audio_engine.refresh();
+        // Commands queued during the UI frame drain in tick_engine, which runs
+        // in about_to_wait later this same iteration.
     }
 
     /// Render the video output windows.
@@ -3350,7 +3359,7 @@ impl ApplicationHandler<AppEvent> for App {
                     self.handle_dropped_file(&path);
                 }
                 WindowEvent::RedrawRequested => {
-                    self.render_control(event_loop);
+                    self.render_control();
                 }
                 WindowEvent::ModifiersChanged(modifiers) => {
                     self.modifiers = modifiers.state();
@@ -3502,6 +3511,7 @@ impl ApplicationHandler<AppEvent> for App {
         self.process_protocol_events();
         self.poll_wall_clock_triggers(event_loop);
         self.poll_timecode_triggers(event_loop);
+        self.tick_engine(event_loop);
 
         // Lighting: sender lifecycle + fade advance + DMX submit (self-throttled).
         {
