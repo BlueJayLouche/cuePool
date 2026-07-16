@@ -393,6 +393,8 @@ pub enum AppCommand {
     RecorderScrub { frame: Option<rustjay_lighting::MaskedFrame> },
     /// Step one video frame forward while paused (show clock follows).
     FrameStep,
+    /// Step one video frame back while paused (show clock follows).
+    FrameStepBack,
 }
 
 /// DMX recorder status, published by the engine each tick.

@@ -67,6 +67,7 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
         .map(|f| (f.id, format!("{} (U{} Ch{})", f.name, f.universe, f.address)))
         .collect();
     let mut lighting_live = state.lighting_live;
+    let tc_fps = state.show_file.show_settings.timecode_fps;
 
     // ponytail: one whole-state clone per inspector frame so every edit is undoable.
     // For very large show files this could be replaced with per-field snapshots.
@@ -243,7 +244,7 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
             });
             eq_editor(ui, eq, &mut changed);
             routing_editor(ui, routing, &mut changed);
-            triggers_editor(ui, &mut base.triggers, base.qid, &mut changed, &mut pending_commands);
+            triggers_editor(ui, &mut base.triggers, base.qid, tc_fps, &mut changed, &mut pending_commands);
         }
         cuepool_core::Cue::Video { base, path, start_time: _, duration: _, volume, pan, fade_in, fade_out, fade_type, eq, routing } => {
             ui.label(RichText::new("Video Cue").monospace().size(12.0));
@@ -306,11 +307,11 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
             });
             eq_editor(ui, eq, &mut changed);
             routing_editor(ui, routing, &mut changed);
-            triggers_editor(ui, &mut base.triggers, base.qid, &mut changed, &mut pending_commands);
+            triggers_editor(ui, &mut base.triggers, base.qid, tc_fps, &mut changed, &mut pending_commands);
         }
         cuepool_core::Cue::Group { base } => {
             ui.label(RichText::new("Group Cue").monospace().size(12.0));
-            triggers_editor(ui, &mut base.triggers, base.qid, &mut changed, &mut pending_commands);
+            triggers_editor(ui, &mut base.triggers, base.qid, tc_fps, &mut changed, &mut pending_commands);
         }
         cuepool_core::Cue::Stop { base, stop_qid, stop_mode, fade_out_time, fade_type } => {
             ui.label(RichText::new("Stop Cue").monospace().size(12.0));
@@ -347,7 +348,7 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
                         }
                     });
             });
-            triggers_editor(ui, &mut base.triggers, base.qid, &mut changed, &mut pending_commands);
+            triggers_editor(ui, &mut base.triggers, base.qid, tc_fps, &mut changed, &mut pending_commands);
         }
         cuepool_core::Cue::Volume { base, sound_qid, volume, fade_time, fade_type } => {
             ui.label(RichText::new("Volume Cue").monospace().size(12.0));
@@ -381,11 +382,11 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
                         }
                     });
             });
-            triggers_editor(ui, &mut base.triggers, base.qid, &mut changed, &mut pending_commands);
+            triggers_editor(ui, &mut base.triggers, base.qid, tc_fps, &mut changed, &mut pending_commands);
         }
         cuepool_core::Cue::Dummy { base } => {
             ui.label(RichText::new("Dummy Cue").monospace().size(12.0));
-            triggers_editor(ui, &mut base.triggers, base.qid, &mut changed, &mut pending_commands);
+            triggers_editor(ui, &mut base.triggers, base.qid, tc_fps, &mut changed, &mut pending_commands);
         }
         cuepool_core::Cue::TimeCode { base, start_time, duration } => {
             ui.label(RichText::new("TimeCode Cue").monospace().size(12.0));
@@ -407,7 +408,7 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
                     changed = true;
                 }
             });
-            triggers_editor(ui, &mut base.triggers, base.qid, &mut changed, &mut pending_commands);
+            triggers_editor(ui, &mut base.triggers, base.qid, tc_fps, &mut changed, &mut pending_commands);
         }
         cuepool_core::Cue::Osc { base, command } => {
             ui.label(RichText::new("OSC Cue").monospace().size(12.0));
@@ -417,7 +418,7 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
                 let response = ui.text_edit_singleline(command);
                 changed |= response.changed();
             });
-            triggers_editor(ui, &mut base.triggers, base.qid, &mut changed, &mut pending_commands);
+            triggers_editor(ui, &mut base.triggers, base.qid, tc_fps, &mut changed, &mut pending_commands);
         }
         cuepool_core::Cue::Text { base, text, font_size, font_colour, fit, font } => {
             ui.label(RichText::new("Text Cue").monospace().size(12.0));
@@ -498,7 +499,7 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
                         }
                     });
             });
-            triggers_editor(ui, &mut base.triggers, base.qid, &mut changed, &mut pending_commands);
+            triggers_editor(ui, &mut base.triggers, base.qid, tc_fps, &mut changed, &mut pending_commands);
         }
         cuepool_core::Cue::Image { base, path, fit } => {
             ui.label(RichText::new("Image Cue").monospace().size(12.0));
@@ -528,7 +529,7 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
                         }
                     });
             });
-            triggers_editor(ui, &mut base.triggers, base.qid, &mut changed, &mut pending_commands);
+            triggers_editor(ui, &mut base.triggers, base.qid, tc_fps, &mut changed, &mut pending_commands);
         }
         cuepool_core::Cue::Goto { base, target_qid } => {
             ui.label(RichText::new("Goto Cue").monospace().size(12.0));
@@ -536,7 +537,7 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
                 ui.label("Target Q#:");
                 changed |= qid_edit(ui, "goto_target", target_qid);
             });
-            triggers_editor(ui, &mut base.triggers, base.qid, &mut changed, &mut pending_commands);
+            triggers_editor(ui, &mut base.triggers, base.qid, tc_fps, &mut changed, &mut pending_commands);
         }
         cuepool_core::Cue::PixelMap { base, path } => {
             ui.label(RichText::new("Pixel Map Cue").monospace().size(12.0));
@@ -561,7 +562,7 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
                 .small()
                 .weak(),
             );
-            triggers_editor(ui, &mut base.triggers, base.qid, &mut changed, &mut pending_commands);
+            triggers_editor(ui, &mut base.triggers, base.qid, tc_fps, &mut changed, &mut pending_commands);
         }
         cuepool_core::Cue::DmxShow { base, path, fade_in, fade_out, fade_type, priority } => {
             ui.label(RichText::new("DMX Show Cue").monospace().size(12.0));
@@ -607,7 +608,7 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
                 .small()
                 .weak(),
             );
-            triggers_editor(ui, &mut base.triggers, base.qid, &mut changed, &mut pending_commands);
+            triggers_editor(ui, &mut base.triggers, base.qid, tc_fps, &mut changed, &mut pending_commands);
         }
         cuepool_core::Cue::Lighting { base, snapshot, fade_time, fade_type } => {
             let was_live = lighting_live;
@@ -678,7 +679,7 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
                     }
                 });
             }
-            triggers_editor(ui, &mut base.triggers, base.qid, &mut changed, &mut pending_commands);
+            triggers_editor(ui, &mut base.triggers, base.qid, tc_fps, &mut changed, &mut pending_commands);
             // Live mode: push the cue's looks on any edit, and once on toggle-on
             // so the stage snaps to the cue being programmed.
             if lighting_live && (changed || !was_live) {
@@ -793,11 +794,54 @@ fn qid_edit(ui: &mut egui::Ui, salt: &str, value: &mut Decimal) -> bool {
     false
 }
 
+/// Text field for editing a time in `HH:MM:SS.FF` timecode (matching the show
+/// clock display; also accepts plain seconds). Same commit-on-blur scheme as
+/// [`qid_edit`] — see there for why the live text lives in egui temp storage.
+/// Returns `true` if the value changed.
+fn timecode_edit(ui: &mut egui::Ui, salt: &str, value: &mut f64, fps: f32) -> bool {
+    let id = ui.make_persistent_id(salt);
+    // Pending edit: (in-progress text, model value when the edit started).
+    let pending = ui.ctx().data(|d| d.get_temp::<(String, f64)>(id));
+    let mut text = pending
+        .as_ref()
+        .map(|(t, _)| t.clone())
+        .unwrap_or_else(|| crate::transport::format_timecode(*value, fps));
+    let response = ui
+        .add(egui::TextEdit::singleline(&mut text).id(id).desired_width(100.0))
+        .on_hover_text(format!("HH:MM:SS.FF at {fps} fps, or plain seconds"));
+
+    if response.has_focus() && response.clicked_elsewhere() {
+        ui.memory_mut(|mem| mem.surrender_focus(id));
+    }
+
+    if response.has_focus() {
+        ui.ctx().data_mut(|d| d.insert_temp(id, (text, *value)));
+        return false;
+    }
+
+    let Some((_, started_from)) = pending else { return false };
+    ui.ctx().data_mut(|d| d.remove_temp::<(String, f64)>(id));
+    let cancelled = ui.input(|i| i.key_pressed(egui::Key::Escape));
+    // If the field was rebound mid-edit (selection changed), drop the edit
+    // rather than commit one cue's text into another.
+    if cancelled || started_from != *value {
+        return false;
+    }
+    if let Some(new) = crate::transport::parse_timecode(&text, fps) {
+        if new != *value {
+            *value = new;
+            return true;
+        }
+    }
+    false
+}
+
 /// Trigger editor — hotkey, MIDI, wall-clock and timecode firing methods.
 fn triggers_editor(
     ui: &mut egui::Ui,
     triggers: &mut cuepool_core::CueTriggers,
     qid: Decimal,
+    tc_fps: f32,
     changed: &mut bool,
     pending: &mut Vec<crate::app::AppCommand>,
 ) {
@@ -951,10 +995,9 @@ fn triggers_editor(
         }
         if let Some(ref mut tc) = triggers.timecode {
             ui.horizontal(|ui| {
-                ui.label("Time (s):");
+                ui.label("Time:");
                 let mut secs = tc.time.as_secs_f64();
-                let response = ui.add(egui::DragValue::new(&mut secs).speed(0.1));
-                if response.changed() {
+                if timecode_edit(ui, "timecode_trigger_time", &mut secs, tc_fps) {
                     tc.time = cuepool_core::Timespan::from_secs_f64(secs);
                     *changed = true;
                 }

@@ -4,7 +4,7 @@ use crate::app::{AppCommand, GuiMeterData, SharedStateHandle};
 use egui::{Button, Color32, RichText, Vec2};
 
 /// `HH:MM:SS.ff` at a display-only frame rate (triggers store seconds).
-fn format_timecode(secs: f64, fps: f32) -> String {
+pub(crate) fn format_timecode(secs: f64, fps: f32) -> String {
     let fps = fps.max(1.0) as f64;
     let t = secs.max(0.0);
     let frames = (t * fps).round() as u64;
@@ -18,6 +18,28 @@ fn format_timecode(secs: f64, fps: f32) -> String {
         (frames % fpm) / fpsu,
         frames % fpsu
     )
+}
+
+/// Parse a timecode string into seconds. Colon-separated `[HH:][MM:]SS[.FF]`
+/// where `.FF` is a frame count at `fps` (matching `format_timecode`); a bare
+/// number without colons is plain seconds. Returns `None` on malformed input.
+pub(crate) fn parse_timecode(text: &str, fps: f32) -> Option<f64> {
+    let t = text.trim();
+    if t.is_empty() {
+        return None;
+    }
+    if !t.contains(':') {
+        return t.parse::<f64>().ok().filter(|s| s.is_finite() && *s >= 0.0);
+    }
+    let (hms, frames) = match t.rsplit_once('.') {
+        Some((a, f)) => (a, f.trim().parse::<u32>().ok()? as f64),
+        None => (t, 0.0),
+    };
+    let mut secs = 0.0;
+    for part in hms.split(':') {
+        secs = secs * 60.0 + part.trim().parse::<u32>().ok()? as f64;
+    }
+    Some(secs + frames / fps.max(1.0) as f64)
 }
 
 pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
@@ -59,6 +81,16 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
                 state.show_file.show_settings.timecode_fps,
             )
         };
+        let back_btn = Button::new(RichText::new("⏮")).min_size(Vec2::new(36.0, 32.0));
+        if ui
+            .add_enabled(show_paused, back_btn)
+            .on_hover_text("Step one video frame back (paused only); the show clock follows")
+            .clicked()
+        {
+            if let Ok(mut state) = state.lock() {
+                state.command_queue.push(AppCommand::FrameStepBack);
+            }
+        }
         let step_btn = Button::new(RichText::new("⏭")).min_size(Vec2::new(36.0, 32.0));
         if ui
             .add_enabled(show_paused, step_btn)
@@ -218,7 +250,7 @@ fn draw_meter(ui: &mut egui::Ui, data: &GuiMeterData) {
 
 #[cfg(test)]
 mod tests {
-    use super::format_timecode;
+    use super::{format_timecode, parse_timecode};
 
     #[test]
     fn timecode_formatting() {
@@ -227,5 +259,23 @@ mod tests {
         assert_eq!(format_timecode(0.5, 30.0), "00:00:00.15");
         assert_eq!(format_timecode(3661.5, 25.0), "01:01:01.13", "25fps half-second = frame 12.5 → 13");
         assert_eq!(format_timecode(-3.0, 30.0), "00:00:00.00", "negative clamps");
+    }
+
+    #[test]
+    fn timecode_parsing() {
+        assert_eq!(parse_timecode("00:19:28.08", 25.0), Some(19.0 * 60.0 + 28.0 + 8.0 / 25.0));
+        assert_eq!(parse_timecode("01:01:01", 30.0), Some(3661.0));
+        assert_eq!(parse_timecode("2:30", 30.0), Some(150.0), "MM:SS shorthand");
+        assert_eq!(parse_timecode("2:30.15", 30.0), Some(150.5), "frames at 30fps");
+        assert_eq!(parse_timecode("668.259", 25.0), Some(668.259), "no colons = plain seconds");
+        assert_eq!(parse_timecode("", 30.0), None);
+        assert_eq!(parse_timecode("abc", 30.0), None);
+        assert_eq!(parse_timecode("1:xx", 30.0), None);
+        assert_eq!(parse_timecode("-5", 30.0), None, "negative rejected");
+        // Round-trip: format(parse(x)) == x
+        for s in ["00:00:00.00", "00:19:28.08", "12:34:56.20"] {
+            let secs = parse_timecode(s, 25.0).unwrap();
+            assert_eq!(format_timecode(secs, 25.0), s);
+        }
     }
 }

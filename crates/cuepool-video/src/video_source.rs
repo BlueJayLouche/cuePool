@@ -211,6 +211,16 @@ impl VideoSource {
         Some(VideoFrame::new(self.dst_width, self.dst_height, data, pts))
     }
 
+    /// Seek to the keyframe at or before `secs` and reset decoder state, so the
+    /// next `read_frame` calls decode forward from there. Used for frame-step-back.
+    pub fn seek_before(&mut self, secs: f64) -> anyhow::Result<()> {
+        let ts = (secs.max(0.0) * f64::from(ffmpeg_next::ffi::AV_TIME_BASE)) as i64;
+        self.ictx.seek(ts, ..ts)?;
+        self.decoder.flush();
+        self.eof = false;
+        Ok(())
+    }
+
     /// Read the next frame and return it with PTS in seconds. `None` at EOF.
     pub fn read_frame(&mut self) -> Option<VideoFrame> {
         if self.eof {
