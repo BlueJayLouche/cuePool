@@ -1465,6 +1465,7 @@ impl CuePoolApp {
                                 stop_mode: cuepool_core::StopMode::Immediate,
                                 fade_out_time: 0.0,
                                 fade_type: cuepool_core::FadeType::Linear,
+                                stop_all: false,
                             },
                             CueType::Volume => cuepool_core::Cue::Volume {
                                 base,

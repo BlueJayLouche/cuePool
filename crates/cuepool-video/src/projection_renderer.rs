@@ -35,7 +35,9 @@ struct Uniforms {
     edge_top: [f32; 3],      // offset 64
     _pad3: f32,
     edge_bottom: [f32; 3],   // offset 80
-    _pad4: f32,
+    /// Global canvas opacity (Stop-cue picture fade). Rides the pad slot, so
+    /// the uniform layout is unchanged.
+    opacity: f32,            // offset 92
 }
 
 impl Uniforms {
@@ -44,6 +46,7 @@ impl Uniforms {
         canvas_size: [u32; 2],
         output_size: [u32; 2],
         edge_blend: &EdgeBlend,
+        opacity: f32,
     ) -> Self {
         let sx = source_rect[0] as f32;
         let sy = source_rect[1] as f32;
@@ -70,7 +73,7 @@ impl Uniforms {
             edge_top: edge_uniform(&edge_blend.top),
             _pad3: 0.0,
             edge_bottom: edge_uniform(&edge_blend.bottom),
-            _pad4: 0.0,
+            opacity,
         }
     }
 }
@@ -261,12 +264,15 @@ impl ProjectionRenderer {
         output_view: &TextureView,
         output: &ProjectorOutput,
         canvas_size: [u32; 2],
+        // 1.0 = full brightness; ramps to 0 during a Stop-cue picture fade.
+        opacity: f32,
     ) {
         let uniforms = Uniforms::new(
             [output.source_x, output.source_y, output.source_width, output.source_height],
             canvas_size,
             [output.output_width, output.output_height],
             &output.edge_blend,
+            opacity,
         );
 
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
@@ -399,6 +405,7 @@ mod tests {
             &output_view,
             &output,
             [64, 4],
+            1.0,
         );
         queue.submit(std::iter::once(encoder.finish()));
 
@@ -486,7 +493,7 @@ mod tests {
             label: Some("test-encoder-fullres"),
         });
         let overlay = CanvasTexture::new(&device, cw, ch);
-        renderer.render(&device, &queue, &mut encoder, &canvas.view(), &overlay.view(), &output_view, &output, [cw, ch]);
+        renderer.render(&device, &queue, &mut encoder, &canvas.view(), &overlay.view(), &output_view, &output, [cw, ch], 1.0);
         queue.submit(std::iter::once(encoder.finish()));
 
         let bytes_per_row = cw * 4; // 7680, already 256-aligned

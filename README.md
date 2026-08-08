@@ -19,7 +19,7 @@ cargo run --release
 |---|---|
 | Top | Menu bar + transport (GO / Stop / Pause, master meter) |
 | Left | **Active Cues** — every playing cue with state, volume meter, and a progress bar (`elapsed / total  −remaining`; yellow = paused) |
-| Center | **Cue list** — the show, in playback order |
+| Center | **Cue list** — the show, in playback order (selected cue highlighted blue, playing cues green with a ▶ marker, paused cues amber) |
 | Right | **Inspector** — full editor for the selected cue |
 | Bottom | Status bar |
 

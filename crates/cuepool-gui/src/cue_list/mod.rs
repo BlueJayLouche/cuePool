@@ -8,8 +8,8 @@ use rust_decimal::Decimal;
 pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
     let (cues, selected_id, show_mode, active_positions) = {
         let Ok(state) = state.lock() else { return };
-        let active_positions: std::collections::HashMap<rust_decimal::Decimal, (f32, Option<f32>)> =
-            state.active_cues.iter().map(|ac| (ac.qid, (ac.position_secs, ac.length_secs))).collect();
+        let active_positions: std::collections::HashMap<rust_decimal::Decimal, (f32, Option<f32>, bool)> =
+            state.active_cues.iter().map(|ac| (ac.qid, (ac.position_secs, ac.length_secs, ac.paused))).collect();
         (
             state.show_file.cues.clone(),
             state.selected_cue_id,
@@ -100,9 +100,17 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
             let in_group = base.parent.is_some() && !is_group;
             // The group a cue dropped onto this row should join.
             let row_group = if is_group { Some(qid) } else { base.parent };
+            let is_active = active_positions.contains_key(&qid);
+            let is_paused = active_positions.get(&qid).is_some_and(|(_, _, p)| *p);
 
-            let bg = if is_selected {
+            let bg = if is_selected && is_active {
+                selected_active_fill(ui.visuals())
+            } else if is_selected {
                 ui.visuals().selection.bg_fill
+            } else if is_paused {
+                paused_row_fill(ui.visuals())
+            } else if is_active {
+                active_row_fill(ui.visuals())
             } else if is_group {
                 ui.visuals().widgets.active.weak_bg_fill
             } else {
@@ -141,8 +149,11 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
                         let mut qid_str = pending.clone().unwrap_or_else(|| qid.to_string());
                         let response = ui.add_sized(
                             [COL_QID, 18.0],
+                            // Frameless so the row highlight (selected/active)
+                            // shows through the cell.
                             egui::TextEdit::singleline(&mut qid_str)
                                 .id_salt(edit_id)
+                                .frame(egui::Frame::NONE)
                                 .font(egui::TextStyle::Monospace),
                         );
                         // A focused TextEdit only surrenders focus on
@@ -172,9 +183,20 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
                             queue_select(state, qid);
                         }
                     } else {
-                        let qid_str = qid.to_string();
+                        // QLab-style play marker: green ▶ for a playing cue
+                        // (amber when paused) in front of the cue number.
+                        let qid_str = if is_active { format!("▶ {qid}") } else { qid.to_string() };
                         let response = ui.add_sized([COL_QID, 18.0], |ui: &mut egui::Ui| {
-                            ui.selectable_label(is_selected, &qid_str)
+                            let text = if is_active {
+                                RichText::new(&qid_str).color(if is_paused {
+                                    Color32::from_rgb(224, 172, 60)
+                                } else {
+                                    Color32::from_rgb(86, 200, 120)
+                                })
+                            } else {
+                                RichText::new(&qid_str)
+                            };
+                            ui.selectable_label(is_selected, text)
                         });
                         if response.clicked() {
                             queue_select(state, qid);
@@ -189,8 +211,10 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
                         let mut name_str = name.clone();
                         let response = ui.add_sized(
                             [name_w, 18.0],
+                            // Frameless so the row highlight shows through.
                             egui::TextEdit::singleline(&mut name_str)
                                 .id_salt(egui::Id::new(("name", qid)))
+                                .frame(egui::Frame::NONE)
                                 .font(egui::TextStyle::Body),
                         );
                         if response.changed() {
@@ -253,7 +277,7 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
                         _ => "—".to_string(),
                     };
                     ui.add_sized([COL_DURATION, 18.0], |ui: &mut egui::Ui| {
-                        if let Some((pos, len)) = active_positions.get(&qid) {
+                        if let Some((pos, len, _paused)) = active_positions.get(&qid) {
                             if let Some(len) = len {
                                 if *len > 0.0 {
                                     let progress = (pos / len).clamp(0.0, 1.0);
@@ -454,6 +478,35 @@ fn cue_type_label(cue: &Cue) -> &'static str {
         Cue::Lighting { .. } => "LX",
         Cue::DmxShow { .. } => "DMX",
         Cue::PixelMap { .. } => "PXM",
+    }
+}
+
+/// Row fill for a currently playing cue: a clear green tint (QLab-style) so
+/// live cues stand out in the list without fighting the selection colour.
+fn active_row_fill(visuals: &egui::Visuals) -> Color32 {
+    if visuals.dark_mode {
+        Color32::from_rgb(33, 96, 55)
+    } else {
+        Color32::from_rgb(168, 224, 186)
+    }
+}
+
+/// Row fill for a paused cue: amber, matching the Active Cues panel.
+fn paused_row_fill(visuals: &egui::Visuals) -> Color32 {
+    if visuals.dark_mode {
+        Color32::from_rgb(102, 78, 26)
+    } else {
+        Color32::from_rgb(240, 214, 140)
+    }
+}
+
+/// Row fill for a cue that is both selected and playing: the selection colour
+/// shifted toward the active green.
+fn selected_active_fill(visuals: &egui::Visuals) -> Color32 {
+    if visuals.dark_mode {
+        Color32::from_rgb(43, 105, 96)
+    } else {
+        Color32::from_rgb(150, 210, 195)
     }
 }
 

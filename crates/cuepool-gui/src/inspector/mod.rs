@@ -332,11 +332,18 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
             ui.label(RichText::new("Group Cue").monospace().size(12.0));
             triggers_editor(ui, &mut base.triggers, base.qid, tc_fps, &mut changed, &mut pending_commands);
         }
-        cuepool_core::Cue::Stop { base, stop_qid, stop_mode, fade_out_time, fade_type } => {
+        cuepool_core::Cue::Stop { base, stop_qid, stop_mode, fade_out_time, fade_type, stop_all } => {
             ui.label(RichText::new("Stop Cue").monospace().size(12.0));
+            if ui.checkbox(stop_all, "Stop All (like transport Stop)").changed() {
+                changed = true;
+            }
             ui.horizontal(|ui| {
                 ui.label("Stops Q#:");
                 changed |= qid_edit(ui, "stop_qid", stop_qid);
+                if *stop_all {
+                    // Target is ignored in Stop All mode.
+                    ui.label(RichText::new("(ignored)").weak());
+                }
             });
             ui.horizontal(|ui| {
                 ui.label("Stop Mode:");

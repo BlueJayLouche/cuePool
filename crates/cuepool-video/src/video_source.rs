@@ -17,6 +17,8 @@ pub struct VideoSource {
     decoded_frame: frame::Video,
     rgb_frame: frame::Video,
     eof: bool,
+    /// `send_eof` has been issued; remaining calls just drain delayed frames.
+    eof_sent: bool,
 }
 
 /// Formats that upload straight to the GPU and convert in-shader.
@@ -133,6 +135,7 @@ impl VideoSource {
             decoded_frame,
             rgb_frame,
             eof: false,
+            eof_sent: false,
         })
     }
 
@@ -218,6 +221,7 @@ impl VideoSource {
         self.ictx.seek(ts, ..ts)?;
         self.decoder.flush();
         self.eof = false;
+        self.eof_sent = false;
         Ok(())
     }
 
@@ -243,10 +247,15 @@ impl VideoSource {
             }
         }
 
-        // Flush decoder
-        let _ = self.decoder.send_eof();
+        // Flush: send EOF once, then drain the delayed frames the threaded
+        // decoder still holds — one per call — until it runs dry. (Sending
+        // EOF and converting a single frame would silently drop the tail of
+        // every clip: the decoder queues ~thread-count frames.)
+        if !self.eof_sent {
+            let _ = self.decoder.send_eof();
+            self.eof_sent = true;
+        }
         if self.decoder.receive_frame(&mut self.decoded_frame).is_ok() {
-            self.eof = true;
             return self.convert_current();
         }
         self.eof = true;

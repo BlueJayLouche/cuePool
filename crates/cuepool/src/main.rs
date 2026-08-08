@@ -210,6 +210,9 @@ struct App {
     video_pause_flag: Arc<AtomicBool>,
     /// QID of the cue whose video is currently playing (for loop sync).
     current_video_qid: Option<rust_decimal::Decimal>,
+    /// Stop-cue picture fade: (start, duration_secs). While set, the canvas is
+    /// rendered at a linearly falling opacity; playback stops when it hits 0.
+    video_fade: Option<(std::time::Instant, f32)>,
     /// Last `SharedState.project_generation` we acted on. A change means a project
     /// was loaded, so the output windows must rebuild for its projection settings.
     last_project_generation: u64,
@@ -421,6 +424,7 @@ impl App {
             video_stop_flag: Arc::new(AtomicBool::new(false)),
             video_pause_flag: Arc::new(AtomicBool::new(false)),
             current_video_qid: None,
+            video_fade: None,
             last_project_generation: 0,
             last_control_redraw: std::time::Instant::now(),
             last_monitor_set: Vec::new(),
@@ -929,9 +933,14 @@ impl App {
                     self.play_video(path, qid, event_loop);
                 }
             }
-            cuepool_core::Cue::Stop { stop_qid, stop_mode, fade_out_time, fade_type, .. } => {
-                log::info!("Go StopCue -> stop Q{}", stop_qid);
-                self.handle_stop_cue(*stop_qid, *stop_mode, *fade_out_time, *fade_type);
+            cuepool_core::Cue::Stop { stop_qid, stop_mode, fade_out_time, fade_type, stop_all, .. } => {
+                if *stop_all {
+                    log::info!("Go StopCue -> stop all (transport Stop)");
+                    self.stop_all();
+                } else {
+                    log::info!("Go StopCue -> stop Q{}", stop_qid);
+                    self.handle_stop_cue(*stop_qid, *stop_mode, *fade_out_time, *fade_type);
+                }
             }
             cuepool_core::Cue::Volume { sound_qid, volume, fade_time, fade_type, .. } => {
                 log::info!("Go VolumeCue -> adjust Q{} to {:.1} dB", sound_qid, 20.0 * volume.log10());
@@ -1574,6 +1583,8 @@ impl App {
     }
 
     fn handle_stop_cue(&mut self, stop_qid: rust_decimal::Decimal, stop_mode: cuepool_core::StopMode, fade_out_time: f32, fade_type: cuepool_core::FadeType) {
+        let mut handled = false;
+
         let idx = self.active_cues.iter().position(|ac| ac.qid == stop_qid);
         if let Some(idx) = idx {
             if stop_mode == cuepool_core::StopMode::LoopEnd {
@@ -1583,6 +1594,7 @@ impl App {
                     fade_type,
                 });
                 log::info!("LoopEnd stop scheduled for Q{}", stop_qid);
+                self.reset_show_clock();
                 return;
             }
 
@@ -1597,16 +1609,53 @@ impl App {
                 input.set_volume(0.0);
                 self.active_cues[idx].state = CueState::Done;
             }
+            handled = true;
         } else if self.lighting.stop_show(stop_qid, fade_out_time, fade_type) {
             // Recorded DMX shows live in the lighting engine, not active_cues.
             log::info!("Stop DmxShow Q{} (fade {:.2}s)", stop_qid, fade_out_time);
+            handled = true;
         } else if self.current_text_qid == Some(stop_qid) {
             // Text cues live on the overlay, not in the audio-backed active list.
             self.clear_text_overlay();
             self.request_output_redraw();
+            handled = true;
+        }
+
+        // The picture is tracked outside active_cues (a video file with no
+        // audio track never lands there), so check it separately — otherwise a
+        // Stop cue mutes the soundtrack but leaves the image running.
+        if self.current_video_qid == Some(stop_qid) {
+            if stop_mode != cuepool_core::StopMode::LoopEnd {
+                if fade_out_time > 0.0 {
+                    // Ramp the canvas to black over the fade time (matching the
+                    // audio fade); playback stops when the ramp reaches zero.
+                    // ponytail: picture ramp is always linear; fade_type only
+                    // shapes the audio.
+                    self.video_fade = Some((std::time::Instant::now(), fade_out_time));
+                } else {
+                    self.stop_video_playback();
+                }
+                self.request_output_redraw();
+            }
+            handled = true;
+        }
+
+        if handled {
+            self.reset_show_clock();
         } else {
             log::warn!("StopCue target Q{} not found in active cues", stop_qid);
         }
+    }
+
+    /// Stop and reset the show timecode: the display returns to --:--:--.--,
+    /// armed timecode triggers are cleared, and the next Go restarts the clock
+    /// from zero. Fired by both the transport Stop and Stop cues.
+    fn reset_show_clock(&mut self) {
+        self.show_start_time = None;
+        self.show_start_clock = None;
+        self.show_pause_started = None;
+        self.show_paused_offset = 0.0;
+        self.timecode_fired.clear();
     }
 
     /// The panel's current take path (`/recorder/*` verbs operate on it).
@@ -1849,6 +1898,9 @@ impl App {
         self.video_pause_started = None;
         self.video_peek = None;
         self.last_video_pts = None;
+        // A new video always starts at full brightness, cancelling any
+        // Stop-cue fade still in flight.
+        self.video_fade = None;
 
         // Create/resize the shared projection canvas.
         let projection = {
@@ -1939,30 +1991,30 @@ impl App {
         self.current_text_qid = None;
     }
 
-    fn stop_all(&mut self) {
+    /// Stop video/image playback: signal the decode thread, drop the frame
+    /// channel (its send fails with Disconnected and the thread exits), and
+    /// clear presentation state so the next redraw goes black.
+    fn stop_video_playback(&mut self) {
         self.video_stop_flag.store(true, Ordering::Relaxed);
-        self.video_pause_flag.store(false, Ordering::Relaxed);
-        // Drop the receiver: the decode thread's send will fail with
-        // Disconnected and exit, and we stop presenting new frames.
         self.video_frame_rx = None;
         self.video_clock = None;
         self.video_peek = None;
         self.last_video_pts = None;
         self.canvas_has_frame = false;
         self.current_video_qid = None;
+        self.video_fade = None;
+    }
+
+    fn stop_all(&mut self) {
+        self.stop_video_playback();
+        self.video_pause_flag.store(false, Ordering::Relaxed);
         // StopAll releases the MTC-follow cue too.
         self.mtc_follow = None;
         self.audio_engine.stop_all();
         self.active_cues.clear();
         self.delayed_cues.clear();
         self.active_timecodes.clear();
-        self.timecode_fired.clear();
-        // Stop ends the show clock (display returns to --:--:--.--); the next
-        // Go restarts it from zero.
-        self.show_start_time = None;
-        self.show_start_clock = None;
-        self.show_pause_started = None;
-        self.show_paused_offset = 0.0;
+        self.reset_show_clock();
         self.paused = false;
         // Halt any in-flight lighting fade; levels hold (blackout is a cue's job).
         self.lighting.stop_fade();
@@ -3260,6 +3312,25 @@ impl App {
         let canvas_view = self.canvas_texture.as_ref().map(|c| c.view());
         let canvas_render_view = self.canvas_texture.as_ref().map(|c| c.render_view());
         let overlay_view = self.text_overlay.as_ref().map(|t| t.view());
+
+        // Stop-cue picture fade: ramp the canvas to black over the fade time,
+        // then stop playback for good. Must run before has_video is computed
+        // so the completed fade renders as the black clear-pass.
+        let video_opacity = match self.video_fade {
+            Some((start, duration)) => {
+                let t = (start.elapsed().as_secs_f32() / duration).clamp(0.0, 1.0);
+                if t >= 1.0 {
+                    self.stop_video_playback();
+                    0.0
+                } else {
+                    // Keep repainting while the ramp is animating.
+                    self.request_output_redraw();
+                    1.0 - t
+                }
+            }
+            None => 1.0,
+        };
+
         let has_video = self.current_video_qid.is_some()
             || self.canvas_has_frame
             || self.current_text_qid.is_some();
@@ -3350,6 +3421,7 @@ impl App {
                         &view,
                         &out.output_config,
                         [projection.canvas_width, projection.canvas_height],
+                        video_opacity,
                     );
                 } else {
                     encoder.begin_render_pass(&wgpu::RenderPassDescriptor {

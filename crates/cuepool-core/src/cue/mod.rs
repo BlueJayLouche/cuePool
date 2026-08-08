@@ -258,6 +258,10 @@ pub enum Cue {
         fade_out_time: f32,
         #[serde(default)]
         fade_type: FadeType,
+        /// Stop every playing cue (same as the transport Stop button); the
+        /// target Q# is ignored when set.
+        #[serde(default)]
+        stop_all: bool,
     },
 
     #[serde(rename = "VolumeCue")]

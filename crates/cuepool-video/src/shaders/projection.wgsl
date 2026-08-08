@@ -27,6 +27,8 @@ struct Uniforms {
     edge_right: vec3<f32>,
     edge_top: vec3<f32>,
     edge_bottom: vec3<f32>,
+    // Global canvas opacity (Stop-cue picture fade).
+    opacity: f32,
 }
 
 @group(0) @binding(0)
@@ -72,8 +74,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let top = edge_alpha(uniforms.edge_top.x, top_dist, uniforms.edge_top.y, uniforms.edge_top.z);
     let bottom = edge_alpha(uniforms.edge_bottom.x, bottom_dist, uniforms.edge_bottom.y, uniforms.edge_bottom.z);
 
-    // Modulate RGB by the product of enabled edge ramps.
-    let blend = left * right * top * bottom;
+    // Modulate RGB by the product of enabled edge ramps and global opacity.
+    let blend = left * right * top * bottom * uniforms.opacity;
     color.r *= blend;
     color.g *= blend;
     color.b *= blend;
