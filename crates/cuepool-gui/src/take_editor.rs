@@ -391,7 +391,7 @@ impl TakeEditor {
         // Value gridlines.
         for v in [0u8, 64, 128, 192, 255] {
             let y = to_y(v);
-            painter.hline(rect.x_range(), y, egui::Stroke::new(1.0, egui::Color32::from_gray(38)));
+            painter.hline(rect.x_range(), y, egui::Stroke::new(1.0_f32, egui::Color32::from_gray(38)));
             painter.text(
                 egui::pos2(rect.left() + 2.0, y),
                 egui::Align2::LEFT_BOTTOM,
@@ -407,7 +407,7 @@ impl TakeEditor {
             let idxs: Vec<usize> = (0..self.events.len())
                 .filter(|&i| (self.events[i].universe, self.events[i].channel) == (su, sc))
                 .collect();
-            let stroke = egui::Stroke::new(1.5, egui::Color32::from_rgb(120, 190, 255));
+            let stroke = egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(120, 190, 255));
             let mut last: Option<(f32, u8)> = None;
             for &i in &idxs {
                 let e = self.events[i];
@@ -514,7 +514,7 @@ impl TakeEditor {
         // Playhead.
         let px = to_x(self.scrub_ms as f32);
         if rect.x_range().contains(px) {
-            painter.vline(px, rect.y_range(), egui::Stroke::new(1.0, egui::Color32::YELLOW));
+            painter.vline(px, rect.y_range(), egui::Stroke::new(1.0_f32, egui::Color32::YELLOW));
         }
         painter.text(
             egui::pos2(px + 3.0, rect.top() + 2.0),

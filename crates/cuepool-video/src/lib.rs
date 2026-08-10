@@ -17,6 +17,12 @@ mod video_source;
 mod yuv_converter;
 
 pub use canvas_texture::CanvasTexture;
+
+/// FFmpeg library version (libavutil, encoded major<<16 | minor<<8 | micro),
+/// for the Status diagnostics window.
+pub fn ffmpeg_version() -> u32 {
+    ffmpeg_next::util::version()
+}
 pub use pixel_sampler::PixelSampler;
 pub use frame::{BitDepth, ChromaSubsample, FramePixels, VideoFrame, YuvPlane};
 pub use projection_renderer::ProjectionRenderer;

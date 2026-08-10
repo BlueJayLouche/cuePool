@@ -157,6 +157,127 @@ pub struct GuiMeterData {
     pub limiter_gr_db: f32,
 }
 
+/// One output window's diagnostics snapshot (refreshed ~1 Hz by the engine).
+#[derive(Debug, Clone)]
+pub struct OutputDiagnostics {
+    pub name: String,
+    pub size: (u32, u32),
+    pub present_mode: String,
+    pub format: String,
+    /// Monitor refresh, e.g. "59.94 Hz" ("?" when the monitor won't say).
+    pub refresh: String,
+    pub fullscreen: bool,
+}
+
+/// The currently-decoding video source, published by the decode thread.
+#[derive(Debug, Clone)]
+pub struct VideoDiagnostics {
+    pub path: String,
+    pub width: u32,
+    pub height: u32,
+    /// `hardware (<api>)` or `software`, from `VideoSource::decode_path()`.
+    pub decode_path: String,
+}
+
+/// Plain-data snapshot behind the Status window (Help → Status…): what a
+/// designer copies into a bug report. The engine fills the static fields once
+/// at startup and refreshes the live counters ~once per second; the GUI only
+/// reads it.
+#[derive(Debug, Clone, Default)]
+pub struct Diagnostics {
+    pub app_version: String,
+    pub os: String,
+    pub arch: String,
+    pub gpu_name: String,
+    pub gpu_backend: String,
+    pub gpu_driver: String,
+    pub gpu_driver_info: String,
+    pub ffmpeg_version: String,
+    /// Set `QPLAYER_*` overrides as (name, value); empty when none are set.
+    pub env_overrides: Vec<(String, String)>,
+    pub outputs: Vec<OutputDiagnostics>,
+    pub presented_per_sec: f64,
+    pub starved_per_sec: f64,
+    pub avg_present_ms: f64,
+    pub video: Option<VideoDiagnostics>,
+}
+
+impl Diagnostics {
+    /// Sectioned key/value rows — the single source for both the on-screen
+    /// layout and the clipboard text, so the two can't drift.
+    pub fn sections(&self) -> Vec<(&'static str, Vec<(String, String)>)> {
+        let mut sections = Vec::new();
+
+        sections.push(("System", vec![
+            ("App Version".into(), self.app_version.clone()),
+            ("OS".into(), self.os.clone()),
+            ("Arch".into(), self.arch.clone()),
+        ]));
+
+        sections.push(("GPU", vec![
+            ("Name".into(), self.gpu_name.clone()),
+            ("Backend".into(), self.gpu_backend.clone()),
+            ("Driver".into(), self.gpu_driver.clone()),
+            ("Driver Info".into(), self.gpu_driver_info.clone()),
+        ]));
+
+        let mut outputs = Vec::new();
+        if self.outputs.is_empty() {
+            outputs.push(("Outputs".into(), "none open".into()));
+        }
+        for (i, out) in self.outputs.iter().enumerate() {
+            let p = format!("Output {}", i + 1);
+            outputs.push((format!("{p} Name"), out.name.clone()));
+            outputs.push((format!("{p} Size"), format!("{}x{}", out.size.0, out.size.1)));
+            outputs.push((format!("{p} Present Mode"), out.present_mode.clone()));
+            outputs.push((format!("{p} Surface Format"), out.format.clone()));
+            outputs.push((format!("{p} Monitor Refresh"), out.refresh.clone()));
+            outputs.push((format!("{p} Fullscreen"), if out.fullscreen { "yes" } else { "no" }.into()));
+        }
+        sections.push(("Outputs", outputs));
+
+        let video = match &self.video {
+            Some(v) => vec![
+                ("File".into(), v.path.clone()),
+                ("Source Size".into(), format!("{}x{}", v.width, v.height)),
+                ("Decode Path".into(), v.decode_path.clone()),
+            ],
+            None => vec![("Status".into(), "no video playing".into())],
+        };
+        sections.push(("Video Decode", video));
+
+        sections.push(("Render Loop", vec![
+            ("Output Count".into(), self.outputs.len().to_string()),
+            ("Presented/s".into(), format!("{:.0}", self.presented_per_sec)),
+            ("Starved/s".into(), format!("{:.0}", self.starved_per_sec)),
+            ("Avg Present-Cycle".into(), format!("{:.1} ms", self.avg_present_ms)),
+        ]));
+
+        let env = if self.env_overrides.is_empty() {
+            vec![("Overrides".into(), "none set".into())]
+        } else {
+            self.env_overrides.clone()
+        };
+        sections.push(("Environment Overrides", env));
+
+        sections
+    }
+
+    /// Plain-text rendering of every section, for the clipboard.
+    pub fn to_text(&self) -> String {
+        let mut text = String::new();
+        for (title, rows) in self.sections() {
+            text.push_str(title);
+            text.push('\n');
+            for (key, value) in rows {
+                text.push_str(&format!("  {key}: {value}\n"));
+            }
+            text.push('\n');
+        }
+        text
+    }
+}
+
 /// Central mutable state shared between GUI and audio/control threads.
 #[derive(Debug)]
 pub struct SharedState {
@@ -189,6 +310,10 @@ pub struct SharedState {
     pub show_log_window: bool,
     /// Whether the About window is open.
     pub show_about_window: bool,
+    /// Whether the Status diagnostics window is open.
+    pub show_status_window: bool,
+    /// Live snapshot behind the Status window, published by the engine.
+    pub diagnostics: Diagnostics,
     /// Whether the Waveform pop-out window is open.
     pub show_waveform_window: bool,
     /// Waveform window zoom level (independent from inspector).
@@ -288,6 +413,8 @@ impl Default for SharedState {
             audio_devices: Vec::new(),
             show_log_window: false,
             show_about_window: false,
+            show_status_window: false,
+            diagnostics: Diagnostics::default(),
             show_waveform_window: false,
             waveform_window_zoom: 1.0,
             waveform_window_scroll: 0.0,
@@ -454,6 +581,8 @@ pub enum ShowMode {
 pub struct CuePoolApp {
     state: SharedStateHandle,
     take_editor: crate::take_editor::TakeEditor,
+    /// Status window "Copied!" feedback: when the clipboard copy happened.
+    status_copied_at: Option<std::time::Instant>,
 }
 
 impl Default for CuePoolApp {
@@ -467,6 +596,7 @@ impl CuePoolApp {
         Self {
             state: Arc::new(Mutex::new(SharedState::new())),
             take_editor: Default::default(),
+            status_copied_at: None,
         }
     }
 
@@ -478,6 +608,7 @@ impl CuePoolApp {
                 ..SharedState::default()
             })),
             take_editor: Default::default(),
+            status_copied_at: None,
         }
     }
 
@@ -630,7 +761,7 @@ impl CuePoolApp {
                     let modal_size = egui::vec2(320.0, 120.0);
                     let modal_rect = egui::Rect::from_center_size(screen_rect.center(), modal_size);
                     ui.painter().rect_filled(modal_rect, 8.0, ui.visuals().panel_fill);
-                    ui.painter().rect_stroke(modal_rect, 8.0, egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color), egui::StrokeKind::Inside);
+                    ui.painter().rect_stroke(modal_rect, 8.0, egui::Stroke::new(1.0_f32, ui.visuals().widgets.noninteractive.bg_stroke.color), egui::StrokeKind::Inside);
 
                     ui.scope_builder(egui::UiBuilder::new().max_rect(modal_rect.shrink(16.0)), |ui| {
                         ui.vertical_centered(|ui| {
@@ -999,6 +1130,28 @@ impl CuePoolApp {
             });
         }
 
+        // Status window (live diagnostics for bug reports)
+        let mut show_status = if let Ok(state) = self.state.lock() {
+            state.show_status_window
+        } else {
+            false
+        };
+        if show_status {
+            egui::Window::new("Status")
+                .collapsible(false)
+                .resizable(true)
+                .default_size([460.0, 600.0])
+                .open(&mut show_status)
+                .show(ctx, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        crate::status_panel::show(ui, &self.state, &mut self.status_copied_at);
+                    });
+                });
+        }
+        if let Ok(mut state) = self.state.lock() {
+            state.show_status_window = show_status;
+        }
+
         // About window
         let mut show_about = if let Ok(state) = self.state.lock() {
             state.show_about_window
@@ -1212,6 +1365,12 @@ impl CuePoolApp {
             });
 
             ui.menu_button("Help", |ui| {
+                if ui.button("Status…").clicked() {
+                    if let Ok(mut state) = self.state.lock() {
+                        state.show_status_window = true;
+                    }
+                    ui.close();
+                }
                 if ui.button("About CuePool").clicked() {
                     if let Ok(mut state) = self.state.lock() {
                         state.show_about_window = true;

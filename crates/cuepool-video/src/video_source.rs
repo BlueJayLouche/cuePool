@@ -62,7 +62,10 @@ pub struct VideoSource {
     /// First hw download succeeded — distinguishes "hwaccel never worked"
     /// (reopen in software) from a one-off mid-stream failure (skip frame).
     hw_checked: bool,
-    decode_path: &'static str,
+    /// The hw label chosen at open ("hardware (d3d11va)" etc.), or
+    /// "software". Only truthful via `decode_path()`, which gates on
+    /// `hw_checked` — a created device proves nothing until a hw frame lands.
+    hw_label: &'static str,
     eof: bool,
     /// `send_eof` has been issued; remaining calls just drain delayed frames.
     eof_sent: bool,
@@ -322,8 +325,14 @@ impl VideoSource {
         rgb_frame.set_width(dst_width);
         rgb_frame.set_height(dst_height);
 
-        let decode_path = hw.map_or("software", |(_, _, label)| label);
-        log::info!("Video decode: {decode_path}");
+        let hw_label = hw.map_or("software", |(_, _, label)| label);
+        if hw.is_some() {
+            // "attempting": a created device proves nothing until a hw frame
+            // lands (codecs without hwaccel, e.g. Hap, never use it).
+            log::info!("Video decode: attempting {hw_label}");
+        } else {
+            log::info!("Video decode: software");
+        }
 
         Ok(Self {
             path: path.to_string(),
@@ -341,7 +350,7 @@ impl VideoSource {
             rgb_frame,
             hw_pix_fmt,
             hw_checked: false,
-            decode_path,
+            hw_label,
             eof: false,
             eof_sent: false,
         })
@@ -374,6 +383,9 @@ impl VideoSource {
                         self.sw_frame.as_mut_ptr(),
                         self.decoded_frame.as_ptr(),
                     );
+                }
+                if !self.hw_checked {
+                    log::info!("Video decode: {} engaged", self.hw_label);
                 }
                 self.hw_checked = true;
                 return convert_frame(
@@ -484,7 +496,12 @@ impl VideoSource {
     }
 
     /// Which decode path was chosen at open: `hardware (<api>)` or `software`.
-    pub fn decode_path(&self) -> &'static str { self.decode_path }
+    /// The active decode path. Truthful once frames have flowed: a
+    /// created-but-unused hw device (e.g. Hap has no hwaccel) reports
+    /// "software" until the first hw frame actually downloads.
+    pub fn decode_path(&self) -> &'static str {
+        if self.hw_checked { self.hw_label } else { "software" }
+    }
     pub fn width(&self) -> u32 { self.width }
     pub fn height(&self) -> u32 { self.height }
     pub fn dst_width(&self) -> u32 { self.dst_width }

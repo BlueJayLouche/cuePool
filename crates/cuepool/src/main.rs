@@ -8,7 +8,7 @@
 
 use cuepool_audio::{AudioEngine, FileDecoder, SampleProvider};
 use cuepool_core::{CanvasFit, LockExt, MidiTrigger, MidiTriggerKind, SerializedColour, Timespan};
-use cuepool_gui::{AppCommand, CuePoolApp, SharedStateHandle};
+use cuepool_gui::{AppCommand, CuePoolApp, OutputDiagnostics, SharedStateHandle, VideoDiagnostics};
 use cuepool_gui::app::CueState;
 use cuepool_protocols::midi::mtc::{MtcFrameRate, MtcReceiver, MtcState};
 use cuepool_protocols::midi::{MidiEvent, MidiManager};
@@ -392,6 +392,33 @@ impl App {
             style.interaction.selectable_labels = false;
             style.interaction.multi_widget_text_select = false;
         });
+
+        // Static diagnostics for the Status window (Help → Status…): filled
+        // once here; the live counters refresh ~once per second in the tick.
+        {
+            let info = adapter.get_info();
+            let ffmpeg = cuepool_video::ffmpeg_version();
+            let mut state = cuepool.state().lock_unpoisoned();
+            let d = &mut state.diagnostics;
+            d.app_version = env!("CARGO_PKG_VERSION").into();
+            d.os = std::env::consts::OS.into();
+            d.arch = std::env::consts::ARCH.into();
+            d.gpu_name = info.name;
+            d.gpu_backend = format!("{:?}", info.backend);
+            d.gpu_driver = info.driver;
+            d.gpu_driver_info = info.driver_info;
+            d.ffmpeg_version = format!(
+                "libavutil {}.{}.{}",
+                ffmpeg >> 16,
+                (ffmpeg >> 8) & 0xff,
+                ffmpeg & 0xff,
+            );
+            for var in ["QPLAYER_PRESENT_MODE", "QPLAYER_FPS_DEBUG", "QPLAYER_NO_HWACCEL"] {
+                if let Ok(value) = std::env::var(var) {
+                    d.env_overrides.push((var.into(), value));
+                }
+            }
+        }
 
         Self {
             instance,
@@ -1945,11 +1972,12 @@ impl App {
         let stop_flag = Arc::clone(&self.video_stop_flag);
         let pause_flag = Arc::clone(&self.video_pause_flag);
         let proxy = self.event_loop_proxy.clone();
+        let diag_state = Arc::clone(self.cuepool.state());
 
         std::thread::Builder::new()
             .name("video-decode".into())
             .spawn(move || {
-                video_decode_thread(&path, start_before, stop_flag, pause_flag, frame_tx, proxy);
+                video_decode_thread(&path, start_before, stop_flag, pause_flag, frame_tx, proxy, diag_state);
             })
             .expect("spawn video decode thread");
     }
@@ -2003,6 +2031,7 @@ impl App {
         self.canvas_has_frame = false;
         self.current_video_qid = None;
         self.video_fade = None;
+        self.cuepool.state().lock_unpoisoned().diagnostics.video = None;
     }
 
     fn stop_all(&mut self) {
@@ -3303,7 +3332,7 @@ impl App {
                         }
                     }
                     self.canvas_has_frame = true;
-                } else if self.fps_debug && self.video_peek.is_none() {
+                } else if self.video_peek.is_none() {
                     self.dbg_starved += 1;
                 }
             }
@@ -3467,7 +3496,7 @@ impl App {
             }
         }
 
-        if self.fps_debug && !self.output_windows.is_empty() {
+        if !self.output_windows.is_empty() {
             self.dbg_presented += 1;
             self.dbg_present_time += present_start.elapsed();
         }
@@ -3538,6 +3567,7 @@ impl ApplicationHandler<AppEvent> for App {
                             self.video_clock = None;
                             self.video_peek = None;
                             self.canvas_has_frame = false;
+                            self.cuepool.state().lock_unpoisoned().diagnostics.video = None;
                             // Blank the canvas texture too: with a text overlay
                             // active the canvas still renders, and the clip's
                             // last frame must not linger behind the text.
@@ -3881,20 +3911,52 @@ impl ApplicationHandler<AppEvent> for App {
             self.request_output_redraw(); // just expired — repaint once to restore
         }
 
-        if self.fps_debug && self.dbg_last_log.elapsed() >= std::time::Duration::from_secs(1) {
+        if self.dbg_last_log.elapsed() >= std::time::Duration::from_secs(1) {
             let secs = self.dbg_last_log.elapsed().as_secs_f64();
             let avg_cycle_ms = if self.dbg_presented > 0 {
                 self.dbg_present_time.as_secs_f64() * 1000.0 / self.dbg_presented as f64
             } else {
                 0.0
             };
-            eprintln!(
-                "VIDEO DIAG: {} window(s) | starved {:.0}/s | presented {:.0}/s | avg present-cycle {:.1} ms",
-                self.output_windows.len(),
-                self.dbg_starved as f64 / secs,
-                self.dbg_presented as f64 / secs,
-                avg_cycle_ms,
-            );
+            let starved_per_sec = self.dbg_starved as f64 / secs;
+            let presented_per_sec = self.dbg_presented as f64 / secs;
+            if self.fps_debug {
+                eprintln!(
+                    "VIDEO DIAG: {} window(s) | starved {:.0}/s | presented {:.0}/s | avg present-cycle {:.1} ms",
+                    self.output_windows.len(),
+                    starved_per_sec,
+                    presented_per_sec,
+                    avg_cycle_ms,
+                );
+            }
+            // Publish the same counters (plus a fresh output snapshot) to the
+            // Status window. The output list is rebuilt here rather than
+            // patched on create/destroy, so every mutation site stays in sync
+            // for free.
+            let outputs = self
+                .output_windows
+                .iter()
+                .map(|out| OutputDiagnostics {
+                    name: out.output_config.name.clone(),
+                    size: (out.config.width, out.config.height),
+                    present_mode: format!("{:?}", out.config.present_mode),
+                    format: format!("{:?}", out.config.format),
+                    refresh: out
+                        .window
+                        .current_monitor()
+                        .and_then(|m| m.refresh_rate_millihertz())
+                        .map(|mhz| format!("{:.2} Hz", mhz as f64 / 1000.0))
+                        .unwrap_or_else(|| "?".into()),
+                    fullscreen: out.window.fullscreen().is_some(),
+                })
+                .collect();
+            let mut state = self.cuepool.state().lock_unpoisoned();
+            let d = &mut state.diagnostics;
+            d.presented_per_sec = presented_per_sec;
+            d.starved_per_sec = starved_per_sec;
+            d.avg_present_ms = avg_cycle_ms;
+            d.outputs = outputs;
+            drop(state);
             self.dbg_starved = 0;
             self.dbg_presented = 0;
             self.dbg_present_time = std::time::Duration::ZERO;
@@ -4034,6 +4096,7 @@ fn video_decode_thread(
     pause_flag: Arc<AtomicBool>,
     frame_tx: std::sync::mpsc::SyncSender<VideoFrame>,
     proxy: winit::event_loop::EventLoopProxy<AppEvent>,
+    diag_state: SharedStateHandle,
 ) {
     let mut source = match VideoSource::open(path) {
         Ok(s) => s,
@@ -4042,6 +4105,14 @@ fn video_decode_thread(
             return;
         }
     };
+
+    // Publish what's decoding to the Status window (Help → Status…).
+    diag_state.lock_unpoisoned().diagnostics.video = Some(VideoDiagnostics {
+        path: path.to_string(),
+        width: source.width(),
+        height: source.height(),
+        decode_path: source.decode_path().to_string(),
+    });
 
     if let Some(t) = start_before {
         // Seek to the keyframe at/before t, then scan forward for the frame
@@ -4083,9 +4154,17 @@ fn video_decode_thread(
     // after VIDEO_QUEUE_CAP frames anyway, and keeping it topped up (without
     // dropping frames) is what makes frame-stepping through a pause possible.
     let _ = &pause_flag;
+    // Re-publish the decode path once frames actually flow: at open it's
+    // tentative (hw device created ≠ hw decode engaged — e.g. Hap has none).
+    let mut diag_path_pending = true;
     while !stop_flag.load(Ordering::Relaxed) {
         match source.read_frame() {
             Some(frame) => {
+                if std::mem::take(&mut diag_path_pending) {
+                    if let Some(v) = diag_state.lock_unpoisoned().diagnostics.video.as_mut() {
+                        v.decode_path = source.decode_path().to_string();
+                    }
+                }
                 if !send_video_frame(&frame_tx, &stop_flag, frame) {
                     return;
                 }
