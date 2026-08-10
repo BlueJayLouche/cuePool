@@ -605,7 +605,9 @@ impl CuePoolApp {
         egui::Panel::right("inspector")
             .default_size(280.0)
             .show_inside(ui, |ui| {
-                crate::inspector::show(ui, &self.state);
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    crate::inspector::show(ui, &self.state);
+                });
             });
 
         // Main cue list (central: fills what the panels above left over).
@@ -659,6 +661,7 @@ impl CuePoolApp {
                 .default_size([380.0, 520.0])
                 .open(&mut show_settings)
                 .show(ctx, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
                     if let Ok(mut state) = self.state.lock() {
                         let devices = state.audio_devices.clone();
                         let current_device = state.audio_device_name.clone();
@@ -818,6 +821,7 @@ impl CuePoolApp {
                             });
                         });
                     }
+                    });
                 });
             if let Ok(mut state) = self.state.lock() {
                 state.show_settings_window = show_settings;
@@ -908,7 +912,9 @@ impl CuePoolApp {
                 .default_size([520.0, 640.0])
                 .open(&mut show_projection)
                 .show(ctx, |ui| {
-                    crate::projection_panel::show(ui, &self.state);
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        crate::projection_panel::show(ui, &self.state);
+                    });
                 });
         }
         if let Ok(mut state) = self.state.lock() {
