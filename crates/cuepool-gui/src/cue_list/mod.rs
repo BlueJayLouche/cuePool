@@ -6,7 +6,7 @@ use cuepool_core::Cue;
 use rust_decimal::Decimal;
 
 pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
-    let (cues, selected_id, show_mode, active_positions) = {
+    let (cues, selected_id, show_mode, active_positions, tc_fps) = {
         let Ok(state) = state.lock() else { return };
         let active_positions: std::collections::HashMap<rust_decimal::Decimal, (f32, Option<f32>, bool)> =
             state.active_cues.iter().map(|ac| (ac.qid, (ac.position_secs, ac.length_secs, ac.paused))).collect();
@@ -15,6 +15,7 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
             state.selected_cue_id,
             state.show_mode,
             active_positions,
+            state.show_file.show_settings.timecode_fps,
         )
     };
 
@@ -58,6 +59,7 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
     const COL_QID: f32 = 48.0;
     const COL_NAME: f32 = 140.0;
     const COL_TRIGGER: f32 = 70.0;
+    const COL_FIRE: f32 = 96.0;
     const COL_DURATION: f32 = 60.0;
     const COL_LOOP: f32 = 24.0;
     const COL_TYPE: f32 = 40.0;
@@ -76,6 +78,8 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
         ui.add_sized([COL_QID, 18.0], egui::Label::new(RichText::new("#").strong()));
         ui.add_sized([COL_NAME, 18.0], egui::Label::new(RichText::new("Name").strong()));
         ui.add_sized([COL_TRIGGER, 18.0], egui::Label::new(RichText::new("Trigger").strong()));
+        ui.add_sized([COL_FIRE, 18.0], egui::Label::new(RichText::new("Fire").strong()))
+            .on_hover_text("Alternate firing methods (hotkey / MIDI / wall clock / timecode) — edit in the inspector's Triggers tab");
         ui.add_sized([COL_DURATION, 18.0], egui::Label::new(RichText::new("Duration").strong()));
         ui.add_sized([COL_LOOP, 18.0], egui::Label::new(RichText::new("Loop").strong()));
         ui.add_sized([COL_TYPE, 18.0], egui::Label::new(RichText::new("Type").strong()));
@@ -137,7 +141,9 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
                             ui.add_sized([COL_DRAG, 18.0], |ui: &mut egui::Ui| {
                                 ui.label(egui::RichText::new("≡").monospace().size(14.0))
                             });
-                        });
+                        })
+                        .response
+                        .on_hover_text("Drag to reorder — drop on a Group cue to join it, on the strip below to ungroup");
                     }
 
                     // Q# column. The TextEdit buffer is rebuilt from the model every
@@ -235,7 +241,7 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
                     // Trigger column — constrain width so the combo doesn't expand the row
                     if show_mode == crate::app::ShowMode::Edit {
                         let mut trigger = base.trigger;
-                        ui.add_sized([COL_TRIGGER, 18.0], |ui: &mut egui::Ui| {
+                        let response = ui.add_sized([COL_TRIGGER, 18.0], |ui: &mut egui::Ui| {
                             egui::ComboBox::from_id_salt(egui::Id::new(("trigger", qid)))
                                 .selected_text(format!("{:?}", trigger))
                                 .width(COL_TRIGGER - 4.0)
@@ -252,6 +258,9 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
                                 })
                                 .response
                         });
+                        response.on_hover_text(
+                            "When this cue fires: Go = on Go, WithLast = with the previous cue, AfterLast = when it ends",
+                        );
                         if trigger != base.trigger {
                             queue_cmd(state, AppCommand::UpdateCueTrigger { qid, trigger });
                         }
@@ -260,7 +269,19 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
                         let trigger_short = &trigger_label[..trigger_label.len().min(3)];
                         ui.add_sized([COL_TRIGGER, 18.0], |ui: &mut egui::Ui| {
                             ui.label(RichText::new(trigger_short).monospace().size(10.0))
-                        });
+                        })
+                        .on_hover_text(trigger_label);
+                    }
+
+                    // Fire column — badges for the cue's alternate triggers
+                    // (hotkey / MIDI / wall clock / timecode), edited in the
+                    // inspector's Triggers tab. Empty when none are configured.
+                    {
+                        let badges = trigger_badges(&base.triggers);
+                        ui.add_sized([COL_FIRE, 18.0], |ui: &mut egui::Ui| {
+                            ui.label(RichText::new(badges.join(" ")).monospace().size(10.0).weak())
+                        })
+                        .on_hover_text(describe_triggers(&base.triggers, tc_fps));
                     }
 
                     // Duration / Progress column
@@ -301,20 +322,26 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
                     });
 
                     // Loop column
-                    let loop_short = match base.loop_mode {
-                        cuepool_core::LoopMode::OneShot => "1",
-                        cuepool_core::LoopMode::Looped => &format!("{}", base.loop_count),
-                        cuepool_core::LoopMode::LoopedInfinite => "∞",
-                        cuepool_core::LoopMode::HoldLast => "H",
+                    let (loop_short, loop_desc) = match base.loop_mode {
+                        cuepool_core::LoopMode::OneShot => ("1".to_string(), "Plays once".to_string()),
+                        cuepool_core::LoopMode::Looped => {
+                            (format!("{}", base.loop_count), format!("Loops {}×", base.loop_count))
+                        }
+                        cuepool_core::LoopMode::LoopedInfinite => ("∞".to_string(), "Loops forever".to_string()),
+                        cuepool_core::LoopMode::HoldLast => {
+                            ("H".to_string(), "Holds the last frame/value when it ends".to_string())
+                        }
                     };
                     ui.add_sized([COL_LOOP, 18.0], |ui: &mut egui::Ui| {
                         ui.label(RichText::new(loop_short).monospace().size(10.0))
-                    });
+                    })
+                    .on_hover_text(loop_desc);
 
                     // Type column
                     ui.add_sized([COL_TYPE, 18.0], |ui: &mut egui::Ui| {
                         ui.label(RichText::new(cue_type).monospace().size(10.0))
-                    });
+                    })
+                    .on_hover_text(format!("{} cue", cue_type_name(cue)));
 
                     // Colour swatch
                     ui.add_sized([COL_COLOUR, 18.0], |ui: &mut egui::Ui| {
@@ -324,7 +351,8 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
                         );
                         ui.painter().rect_filled(rect, 4.0, colour);
                         response
-                    });
+                    })
+                    .on_hover_text("Cue colour tag");
                 });
             });
 
@@ -478,6 +506,88 @@ fn cue_type_label(cue: &Cue) -> &'static str {
         Cue::Lighting { .. } => "LX",
         Cue::DmxShow { .. } => "DMX",
         Cue::PixelMap { .. } => "PXM",
+    }
+}
+
+/// Full cue-type name for the Type-column badge tooltip.
+fn cue_type_name(cue: &Cue) -> &'static str {
+    match cue {
+        Cue::Group { .. } => "Group",
+        Cue::Sound { .. } => "Sound",
+        Cue::Video { .. } => "Video",
+        Cue::Stop { .. } => "Stop",
+        Cue::Volume { .. } => "Volume",
+        Cue::Dummy { .. } => "Dummy",
+        Cue::TimeCode { .. } => "TimeCode",
+        Cue::Osc { .. } => "OSC",
+        Cue::Text { .. } => "Text",
+        Cue::Image { .. } => "Image",
+        Cue::Goto { .. } => "Goto",
+        Cue::Lighting { .. } => "Lighting",
+        Cue::DmxShow { .. } => "DMX Show",
+        Cue::PixelMap { .. } => "Pixel Map",
+    }
+}
+
+/// Fire-column badges, one per configured alternate trigger.
+fn trigger_badges(triggers: &cuepool_core::CueTriggers) -> Vec<&'static str> {
+    let mut badges = Vec::new();
+    if triggers.hotkey.is_some() {
+        badges.push("key");
+    }
+    if triggers.midi.is_some() {
+        badges.push("midi");
+    }
+    if triggers.wall_clock.is_some() {
+        badges.push("clk");
+    }
+    if triggers.timecode.is_some() {
+        badges.push("tc");
+    }
+    badges
+}
+
+/// Fire-column tooltip: the full config of every configured trigger.
+fn describe_triggers(triggers: &cuepool_core::CueTriggers, tc_fps: f32) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(hotkey) = &triggers.hotkey {
+        parts.push(format!("Hotkey '{}'", hotkey.key));
+    }
+    if let Some(midi) = &triggers.midi {
+        let what = match midi.kind {
+            cuepool_core::MidiTriggerKind::NoteOn | cuepool_core::MidiTriggerKind::NoteOff => "note",
+            cuepool_core::MidiTriggerKind::CC => "CC",
+        };
+        let mut s = format!("MIDI {:?} ch{} {} {}", midi.kind, midi.channel, what, midi.note_or_cc);
+        if matches!(midi.kind, cuepool_core::MidiTriggerKind::NoteOn) {
+            s.push_str(&format!(" vel ≥ {}", midi.velocity_min));
+        }
+        parts.push(s);
+    }
+    if let Some(clock) = &triggers.wall_clock {
+        let mut s = format!("Wall clock {}", clock.time);
+        let mut opts: Vec<&str> = Vec::new();
+        if matches!(clock.mode, cuepool_core::ClockMode::TwelveHour) {
+            opts.push("12h");
+        }
+        if matches!(clock.repeat, cuepool_core::RepeatMode::Once) {
+            opts.push("once");
+        }
+        if !opts.is_empty() {
+            s.push_str(&format!(" ({})", opts.join(", ")));
+        }
+        parts.push(s);
+    }
+    if let Some(tc) = &triggers.timecode {
+        parts.push(format!(
+            "Timecode ≥ {}",
+            crate::transport::format_timecode(tc.time.as_secs_f64(), tc_fps)
+        ));
+    }
+    if parts.is_empty() {
+        "No alternate triggers — set them in the inspector's Triggers tab".to_string()
+    } else {
+        parts.join(" · ")
     }
 }
 

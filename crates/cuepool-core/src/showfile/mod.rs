@@ -43,6 +43,28 @@ fn default_file_format_version() -> i32 {
     FILE_FORMAT_VERSION
 }
 
+/// Which sections "Import from Project…" copies into the open show.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ImportSections {
+    pub projection: bool,
+    pub lighting: bool,
+    pub show_settings: bool,
+}
+
+/// Replace the checked sections of `target` wholesale with `source`'s.
+/// Cues are never imported.
+pub fn apply_import(target: &mut ShowFile, source: &ShowFile, sections: ImportSections) {
+    if sections.projection {
+        target.projection = source.projection.clone();
+    }
+    if sections.lighting {
+        target.lighting = source.lighting.clone();
+    }
+    if sections.show_settings {
+        target.show_settings = source.show_settings.clone();
+    }
+}
+
 impl ShowFile {
     /// Choose the next QID for a new cue.
     ///
@@ -328,5 +350,46 @@ mod tests {
         println!("{}", json);
         let de: ShowFile = serde_json::from_str(&json).unwrap();
         assert_eq!(sf, de);
+    }
+
+    #[test]
+    fn test_apply_import_replaces_checked_sections_only() {
+        let source = ShowFile {
+            show_settings: ShowSettings { title: "Source".into(), ..Default::default() },
+            projection: crate::ProjectionConfig { canvas_width: 3840, ..Default::default() },
+            lighting: crate::LightingConfig { dest_ip: "10.0.0.9".into(), ..Default::default() },
+            cues: vec![crate::Cue::Group {
+                base: crate::CueBase { qid: rust_decimal::Decimal::from(1), ..Default::default() },
+            }],
+            ..Default::default()
+        };
+        let target = ShowFile {
+            show_settings: ShowSettings { title: "Target".into(), ..Default::default() },
+            cues: vec![crate::Cue::Group {
+                base: crate::CueBase { qid: rust_decimal::Decimal::from(7), ..Default::default() },
+            }],
+            ..Default::default()
+        };
+
+        // Import projection only: projection comes from source, everything
+        // else (including cues) stays the target's.
+        let mut t = target.clone();
+        apply_import(&mut t, &source, ImportSections { projection: true, ..Default::default() });
+        assert_eq!(t.projection, source.projection);
+        assert_eq!(t.lighting, target.lighting);
+        assert_eq!(t.show_settings.title, "Target");
+        assert_eq!(t.cues, target.cues);
+
+        // Import lighting + settings: both replaced, projection untouched.
+        let mut t = target.clone();
+        apply_import(
+            &mut t,
+            &source,
+            ImportSections { lighting: true, show_settings: true, ..Default::default() },
+        );
+        assert_eq!(t.lighting, source.lighting);
+        assert_eq!(t.show_settings.title, "Source");
+        assert_eq!(t.projection, target.projection);
+        assert_eq!(t.cues, target.cues, "cues are never imported");
     }
 }

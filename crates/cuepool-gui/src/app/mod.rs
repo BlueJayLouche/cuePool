@@ -382,6 +382,18 @@ pub struct SharedState {
     /// Live DMX programming: while on, edits to a Lighting cue's looks in the
     /// inspector stream straight to the fixtures (session-only, not saved).
     pub lighting_live: bool,
+    /// Pending "Import from Project…" modal: source show + chosen sections.
+    pub import_request: Option<ImportRequest>,
+}
+
+/// State of the "Import from <file>" modal (File → Import from Project…).
+#[derive(Debug, Clone)]
+pub struct ImportRequest {
+    /// Source file display name (window title).
+    pub name: String,
+    /// Parsed source show — only the checked sections are copied.
+    pub show: ShowFile,
+    pub sections: cuepool_core::ImportSections,
 }
 
 /// State for the progress overlay modal.
@@ -447,6 +459,7 @@ impl Default for SharedState {
             available_monitors: Vec::new(),
             identify_outputs: false,
             lighting_live: false,
+            import_request: None,
         }
     }
 }
@@ -1179,6 +1192,59 @@ impl CuePoolApp {
             state.show_about_window = show_about;
         }
 
+        // Import-from-project modal (File → Import from Project…)
+        let import = self.state.lock().ok().and_then(|s| s.import_request.clone());
+        if let Some(mut request) = import {
+            egui::Window::new(format!("Import from {}", request.name))
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .show(ctx, |ui| {
+                    ui.label("Replace these sections of the current project:");
+                    ui.checkbox(&mut request.sections.projection, "Projection mapping");
+                    ui.checkbox(&mut request.sections.lighting, "Lighting patch");
+                    ui.checkbox(&mut request.sections.show_settings, "Show settings");
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        let any_checked = request.sections.projection
+                            || request.sections.lighting
+                            || request.sections.show_settings;
+                        if ui.add_enabled(any_checked, egui::Button::new("Import")).clicked() {
+                            if let Ok(mut state) = self.state.lock() {
+                                let snapshot = Snapshot::from_state(&state);
+                                state.undo_redo.push(snapshot);
+                                cuepool_core::apply_import(
+                                    &mut state.show_file,
+                                    &request.show,
+                                    request.sections,
+                                );
+                                state.dirty = true;
+                                // Wholesale projection/patch replace: same reset as
+                                // New/Open — stops cues and rebuilds output windows.
+                                // (The lighting engine re-reads show_file.lighting
+                                // every tick on its own.)
+                                if request.sections.projection || request.sections.lighting {
+                                    state.project_generation =
+                                        state.project_generation.wrapping_add(1);
+                                }
+                                state.import_request = None;
+                            }
+                        }
+                        if ui.button("Cancel").clicked() {
+                            if let Ok(mut state) = self.state.lock() {
+                                state.import_request = None;
+                            }
+                        }
+                    });
+                });
+            // Persist checkbox edits unless Import/Cancel cleared the request.
+            if let Ok(mut state) = self.state.lock() {
+                if state.import_request.is_some() {
+                    state.import_request = Some(request);
+                }
+            }
+        }
+
         // Process any commands queued during the frame
         self.process_commands(ctx);
     }
@@ -1201,6 +1267,42 @@ impl CuePoolApp {
                     {
                         if let Ok(mut state) = self.state.lock() {
                             state.command_queue.push(AppCommand::OpenProject { path });
+                        }
+                    }
+                    ui.close();
+                }
+                if ui
+                    .button("Import from Project…")
+                    .on_hover_text("Copy projection, lighting patch and/or show settings from another .qproj (cues are never imported)")
+                    .clicked()
+                {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("CuePool project", &["qproj"])
+                        .pick_file()
+                    {
+                        // Same deserialize path as OpenProject, minus the replace.
+                        match std::fs::read_to_string(&path)
+                            .map_err(|e| e.to_string())
+                            .and_then(|data| serde_json::from_str::<ShowFile>(&data).map_err(|e| e.to_string()))
+                        {
+                            Ok(show) => {
+                                let name = path
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().to_string())
+                                    .unwrap_or_else(|| path.display().to_string());
+                                if let Ok(mut state) = self.state.lock() {
+                                    state.import_request = Some(ImportRequest {
+                                        name,
+                                        show,
+                                        sections: cuepool_core::ImportSections {
+                                            projection: true,
+                                            lighting: true,
+                                            show_settings: true,
+                                        },
+                                    });
+                                }
+                            }
+                            Err(e) => log::error!("Import from {} failed: {}", path.display(), e),
                         }
                     }
                     ui.close();

@@ -21,7 +21,10 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
     ui.separator();
 
     ui.horizontal(|ui| {
-        changed |= ui.checkbox(&mut lighting.enabled, "Enabled").changed();
+        changed |= ui
+            .checkbox(&mut lighting.enabled, "Enabled")
+            .on_hover_text("Output DMX over the network at the refresh rate below")
+            .changed();
         egui::ComboBox::from_id_salt("lx_protocol")
             .selected_text(match lighting.protocol {
                 LightingProtocol::Sacn => "sACN (E1.31)",
@@ -34,11 +37,16 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
                 changed |= ui
                     .selectable_value(&mut lighting.protocol, LightingProtocol::ArtNet, "Art-Net")
                     .clicked();
-            });
+            })
+            .response
+            .on_hover_text("DMX output protocol");
     });
     ui.horizontal(|ui| {
         ui.label("Destination IP:");
-        changed |= ui.text_edit_singleline(&mut lighting.dest_ip).changed();
+        changed |= ui
+            .text_edit_singleline(&mut lighting.dest_ip)
+            .on_hover_text("Unicast destination override — empty = sACN multicast / Art-Net broadcast")
+            .changed();
     });
     ui.label(
         egui::RichText::new("Empty = sACN multicast / Art-Net broadcast")
@@ -49,11 +57,13 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
         ui.label("Refresh (fps):");
         changed |= ui
             .add(egui::DragValue::new(&mut lighting.fps).speed(1).range(1.0..=60.0))
+            .on_hover_text("DMX frames per second")
             .changed();
         ui.label("Look priority:")
             .on_hover_text("sACN-style merge priority of lighting-cue looks vs DMX Show cues (default 100)");
         changed |= ui
             .add(egui::DragValue::new(&mut lighting.look_priority).speed(1).range(0..=255))
+            .on_hover_text("sACN-style merge priority of lighting-cue looks vs DMX Show cues (default 100)")
             .changed();
     });
 
@@ -79,7 +89,11 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
                     }
                 }
             }
-            if ui.button("+ Add Fixture").clicked() {
+            if ui
+                .button("+ Add Fixture")
+                .on_hover_text("Patch a new fixture at the next free address")
+                .clicked()
+            {
                 let id = lighting.next_fixture_id();
                 // Next free address after the last fixture in its universe.
                 let (universe, address) = lighting
@@ -109,8 +123,9 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
     let mut remove: Option<usize> = None;
     for (i, fixture) in lighting.fixtures.iter_mut().enumerate() {
         ui.horizontal(|ui| {
-            ui.label(format!("{}", fixture.id));
+            ui.label(format!("{}", fixture.id)).on_hover_text("Fixture ID");
             ui.add(egui::TextEdit::singleline(&mut fixture.name).desired_width(110.0))
+                .on_hover_text("Fixture name")
                 .changed()
                 .then(|| changed = true);
             let selected = profiles
@@ -129,14 +144,16 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
                             changed = true;
                         }
                     }
-                });
-            ui.label("U:");
+                })
+                .response
+                .on_hover_text("Fixture profile (channel layout)");
+            ui.label("U:").on_hover_text("DMX universe");
             let mut u = fixture.universe as i32;
             if ui.add(egui::DragValue::new(&mut u).speed(1).range(1..=63999)).changed() {
                 fixture.universe = u.max(1) as u16;
                 changed = true;
             }
-            ui.label("Ch:");
+            ui.label("Ch:").on_hover_text("Starting DMX channel (1–512)");
             let mut a = fixture.address as i32;
             if ui.add(egui::DragValue::new(&mut a).speed(1).range(1..=512)).changed() {
                 fixture.address = a.clamp(1, 512) as u16;
@@ -146,8 +163,10 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
                 .iter()
                 .find(|p| p.id == fixture.profile_id)
                 .map_or(0, |p| p.footprint());
-            ui.label(egui::RichText::new(format!("({footprint} ch)")).small().weak());
-            ui.label("IP:");
+            ui.label(egui::RichText::new(format!("({footprint} ch)")).small().weak())
+                .on_hover_text("DMX footprint of the selected profile");
+            ui.label("IP:")
+                .on_hover_text("Per-fixture unicast override — empty = use the global destination");
             ui.add(
                 egui::TextEdit::singleline(&mut fixture.dest_ip)
                     .desired_width(100.0)
@@ -155,7 +174,7 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
             )
             .changed()
             .then(|| changed = true);
-            if ui.small_button("✕").clicked() {
+            if ui.small_button("✕").on_hover_text("Remove this fixture").clicked() {
                 remove = Some(i);
             }
         });
@@ -232,7 +251,11 @@ fn segments_editor(
         .small()
         .weak(),
     );
-    if ui.button("+ Add Segment").clicked() {
+    if ui
+        .button("+ Add Segment")
+        .on_hover_text("Add a pixel-map segment: samples a source region into fixture channels")
+        .clicked()
+    {
         let id = lighting.next_segment_id();
         lighting.segments.push(PixelMapSegment::new(id));
         changed = true;
@@ -243,9 +266,13 @@ fn segments_editor(
     for (i, seg) in lighting.segments.iter_mut().enumerate() {
         ui.separator();
         ui.horizontal(|ui| {
-            changed |= ui.checkbox(&mut seg.enabled, "").changed();
+            changed |= ui
+                .checkbox(&mut seg.enabled, "")
+                .on_hover_text("Sample this segment live; its channels override cue looks")
+                .changed();
             changed |= ui
                 .add(egui::TextEdit::singleline(&mut seg.name).desired_width(110.0))
+                .on_hover_text("Segment name")
                 .changed();
             let selected = profiles
                 .iter()
@@ -260,8 +287,10 @@ fn segments_editor(
                             changed = true;
                         }
                     }
-                });
-            if ui.small_button("✕").clicked() {
+                })
+                .response
+                .on_hover_text("Fixture profile for each grid cell");
+            if ui.small_button("✕").on_hover_text("Remove this segment").clicked() {
                 remove = Some(i);
             }
         });
@@ -281,8 +310,11 @@ fn segments_editor(
                             changed = true;
                         }
                     }
-                });
-            ui.label("Region:");
+                })
+                .response
+                .on_hover_text("What feeds the segment: 'PixelMap' is fed by PixelMap cues, 'Canvas' mirrors the projector picture");
+            ui.label("Region:")
+                .on_hover_text("Source region as a 0–1 fraction of the source (x, y, w, h)");
             for (label, v) in ["x", "y", "w", "h"].into_iter().zip(seg.region.iter_mut()) {
                 ui.label(label);
                 changed |= ui
@@ -291,7 +323,8 @@ fn segments_editor(
             }
         });
         ui.horizontal(|ui| {
-            ui.label("Grid:");
+            ui.label("Grid:")
+                .on_hover_text("Fixture grid: cols × rows cells, patched to consecutive channels");
             let mut cols = seg.cols as i32;
             if ui.add(egui::DragValue::new(&mut cols).speed(1).range(1..=512)).changed() {
                 seg.cols = cols.max(1) as u32;
@@ -303,13 +336,13 @@ fn segments_editor(
                 seg.rows = rows.max(1) as u32;
                 changed = true;
             }
-            ui.label("U:");
+            ui.label("U:").on_hover_text("DMX universe");
             let mut u = seg.universe as i32;
             if ui.add(egui::DragValue::new(&mut u).speed(1).range(1..=63999)).changed() {
                 seg.universe = u.max(1) as u16;
                 changed = true;
             }
-            ui.label("Ch:");
+            ui.label("Ch:").on_hover_text("Starting DMX channel (1–512)");
             let mut a = seg.address as i32;
             if ui.add(egui::DragValue::new(&mut a).speed(1).range(1..=512)).changed() {
                 seg.address = a.clamp(1, 512) as u16;
@@ -327,7 +360,8 @@ fn segments_editor(
             );
         });
         ui.horizontal(|ui| {
-            ui.label("Scan:");
+            ui.label("Scan:")
+                .on_hover_text("Scan order: how grid cells map to consecutive DMX channels");
             egui::ComboBox::from_id_salt(("lx_seg_corner", i))
                 .selected_text(seg.order.start_corner.label())
                 .show_ui(ui, |ui| {
@@ -336,7 +370,9 @@ fn segments_editor(
                             changed = true;
                         }
                     }
-                });
+                })
+                .response
+                .on_hover_text("Grid corner where channel 1 starts");
             egui::ComboBox::from_id_salt(("lx_seg_axis", i))
                 .selected_text(seg.order.primary.label())
                 .show_ui(ui, |ui| {
@@ -345,17 +381,24 @@ fn segments_editor(
                             changed = true;
                         }
                     }
-                });
-            changed |= ui.checkbox(&mut seg.order.serpentine, "Serpentine").changed();
+                })
+                .response
+                .on_hover_text("Scan along rows first or columns first");
+            changed |= ui
+                .checkbox(&mut seg.order.serpentine, "Serpentine")
+                .on_hover_text("Alternate the scan direction each row/column (zig-zag wiring)")
+                .changed();
         });
         ui.horizontal(|ui| {
             ui.label("Brightness:");
             changed |= ui
                 .add(egui::Slider::new(&mut seg.color.brightness, 0.0..=1.0))
+                .on_hover_text("Output brightness for this segment")
                 .changed();
             ui.label("Gamma:");
             changed |= ui
                 .add(egui::DragValue::new(&mut seg.gamma).speed(0.05).range(0.2..=4.0))
+                .on_hover_text("Gamma applied to the sampled colour")
                 .changed();
             ui.label("White:");
             egui::ComboBox::from_id_salt(("lx_seg_white", i))
@@ -371,7 +414,9 @@ fn segments_editor(
                             changed = true;
                         }
                     }
-                });
+                })
+                .response
+                .on_hover_text("White-channel derivation from the sampled RGB");
             changed |= ui
                 .checkbox(&mut seg.color.derive_amber_uv, "Derive A/UV")
                 .on_hover_text(
@@ -454,7 +499,11 @@ fn profiles_editor(ui: &mut egui::Ui, lighting: &mut cuepool_core::LightingConfi
     };
 
     ui.horizontal(|ui| {
-        if ui.button("+ New Profile").clicked() {
+        if ui
+            .button("+ New Profile")
+            .on_hover_text("Create an editable fixture profile (starts as RGB)")
+            .clicked()
+        {
             let id = free_user_id(lighting);
             let name = format!("User Profile {}", id.trim_start_matches("user_"));
             lighting.profiles.push(FixtureProfile {
@@ -521,11 +570,13 @@ fn profiles_editor(ui: &mut egui::Ui, lighting: &mut cuepool_core::LightingConfi
         ui.horizontal(|ui| {
             changed |= ui
                 .add(egui::TextEdit::singleline(&mut profile.name).desired_width(160.0))
+                .on_hover_text("Profile name")
                 .changed();
             ui.label(egui::RichText::new(format!("({} ch)", profile.channels.len())).small().weak());
             if in_use.contains(profile.id.as_str()) {
-                ui.label(egui::RichText::new("in use").small().weak());
-            } else if ui.small_button("✕").clicked() {
+                ui.label(egui::RichText::new("in use").small().weak())
+                    .on_hover_text("Patched fixtures use this profile — it can't be deleted");
+            } else if ui.small_button("✕").on_hover_text("Delete this profile").clicked() {
                 remove = Some(i);
             }
         });
@@ -588,7 +639,7 @@ fn profiles_editor(ui: &mut egui::Ui, lighting: &mut cuepool_core::LightingConfi
                 ("Go", ChannelRole::Gobo),
                 ("S", ChannelRole::Static(255)),
             ] {
-                if ui.small_button(label).clicked() {
+                if ui.small_button(label).on_hover_text(role.describe()).clicked() {
                     push(role);
                 }
             }
@@ -597,7 +648,10 @@ fn profiles_editor(ui: &mut egui::Ui, lighting: &mut cuepool_core::LightingConfi
         if let Some(ChannelRole::Static(v)) = profile.channels.last_mut() {
             ui.horizontal(|ui| {
                 ui.label("static value:");
-                changed |= ui.add(egui::DragValue::new(v).speed(1).range(0..=255)).changed();
+                changed |= ui
+                    .add(egui::DragValue::new(v).speed(1).range(0..=255))
+                    .on_hover_text("Constant DMX value sent on the Static channel")
+                    .changed();
             });
         }
     }

@@ -57,10 +57,6 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
     ui.horizontal(|ui| {
         ui.heading("Outputs");
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.button("3×1 Edge Blend Preset").clicked() {
-                *projection = cuepool_core::ProjectionConfig::preset_3x1_edgeblend();
-                changed = true;
-            }
             if ui.button("Default Single Output").clicked() {
                 *projection = cuepool_core::ProjectionConfig::default_single();
                 changed = true;

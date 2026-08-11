@@ -49,7 +49,7 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
         let go_btn = Button::new(RichText::new("▶ GO").strong().color(Color32::WHITE))
             .fill(Color32::from_rgb(0, 180, 0))
             .min_size(button_size);
-        if ui.add(go_btn).clicked() {
+        if ui.add(go_btn).on_hover_text("Fire the selected cue (Space)").clicked() {
             if let Ok(mut state) = state.lock() {
                 state.command_queue.push(AppCommand::Go);
             }
@@ -58,7 +58,7 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
         let stop_btn = Button::new(RichText::new("⏹ STOP").strong())
             .fill(Color32::from_rgb(200, 0, 0))
             .min_size(button_size);
-        if ui.add(stop_btn).clicked() {
+        if ui.add(stop_btn).on_hover_text("Stop all cues (Esc)").clicked() {
             if let Ok(mut state) = state.lock() {
                 state.command_queue.push(AppCommand::Stop);
             }
@@ -66,7 +66,7 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
 
         let pause_btn = Button::new(RichText::new("⏸ PAUSE"))
             .min_size(button_size);
-        if ui.add(pause_btn).clicked() {
+        if ui.add(pause_btn).on_hover_text("Pause/resume the show clock").clicked() {
             if let Ok(mut state) = state.lock() {
                 state.command_queue.push(AppCommand::Pause);
             }
@@ -115,7 +115,11 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
 
         let preload_btn = Button::new(RichText::new("PRELOAD"))
             .min_size(Vec2::new(70.0, 32.0));
-        if ui.add(preload_btn).clicked() {
+        if ui
+            .add(preload_btn)
+            .on_hover_text("Load the selected cue's media into memory so Go starts instantly")
+            .clicked()
+        {
             if let Ok(mut state) = state.lock() {
                 state.command_queue.push(AppCommand::Preload);
             }
@@ -143,7 +147,8 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
                     .monospace()
                     .small()
                     .weak(),
-            );
+            )
+            .on_hover_text("Next armed timecode trigger");
         }
 
         // MTC readout (timecode from e.g. Pro Tools over RTP-MIDI). Shown once
@@ -200,7 +205,11 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
         let mode_btn = Button::new(RichText::new(mode_label).strong().color(Color32::WHITE))
             .fill(mode_color)
             .min_size(Vec2::new(100.0, 32.0));
-        if ui.add(mode_btn).clicked() {
+        if ui
+            .add(mode_btn)
+            .on_hover_text("Toggle Show/Edit mode — cue editing is locked in Show mode")
+            .clicked()
+        {
             if let Ok(mut state) = state.lock() {
                 let snapshot = crate::app::Snapshot::from_state(&state);
                 state.undo_redo.push(snapshot);

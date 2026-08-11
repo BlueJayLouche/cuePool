@@ -203,12 +203,17 @@ impl TakeEditor {
                 {
                     self.save();
                 }
-                if ui.add_enabled(!recording, egui::Button::new("Reload")).clicked() {
+                if ui
+                    .add_enabled(!recording, egui::Button::new("Reload"))
+                    .on_hover_text("Discard edits and re-read the take from disk")
+                    .clicked()
+                {
                     let path = self.path.clone();
                     self.open_file(path);
                 }
                 if ui
                     .add_enabled(self.undo.is_some() && !recording, egui::Button::new("Undo"))
+                    .on_hover_text("Undo the last edit (single level)")
                     .clicked()
                 {
                     if let Some(prev) = self.undo.take() {
