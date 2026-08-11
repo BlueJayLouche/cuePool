@@ -167,6 +167,10 @@ pub struct OutputDiagnostics {
     /// Monitor refresh, e.g. "59.94 Hz" ("?" when the monitor won't say).
     pub refresh: String,
     pub fullscreen: bool,
+    /// Presents completed per second by this output's render thread. The field
+    /// diagnostic for vsync starvation: an output pinned below its monitor
+    /// refresh is the one stuttering.
+    pub presented_per_sec: f64,
 }
 
 /// The currently-decoding video source, published by the decode thread.
@@ -196,9 +200,9 @@ pub struct Diagnostics {
     /// Set `QPLAYER_*` overrides as (name, value); empty when none are set.
     pub env_overrides: Vec<(String, String)>,
     pub outputs: Vec<OutputDiagnostics>,
+    /// Sum of all outputs' presented/s.
     pub presented_per_sec: f64,
     pub starved_per_sec: f64,
-    pub avg_present_ms: f64,
     pub video: Option<VideoDiagnostics>,
 }
 
@@ -233,6 +237,7 @@ impl Diagnostics {
             outputs.push((format!("{p} Surface Format"), out.format.clone()));
             outputs.push((format!("{p} Monitor Refresh"), out.refresh.clone()));
             outputs.push((format!("{p} Fullscreen"), if out.fullscreen { "yes" } else { "no" }.into()));
+            outputs.push((format!("{p} Presented/s"), format!("{:.0}", out.presented_per_sec)));
         }
         sections.push(("Outputs", outputs));
 
@@ -248,9 +253,8 @@ impl Diagnostics {
 
         sections.push(("Render Loop", vec![
             ("Output Count".into(), self.outputs.len().to_string()),
-            ("Presented/s".into(), format!("{:.0}", self.presented_per_sec)),
+            ("Presented/s (all outputs)".into(), format!("{:.0}", self.presented_per_sec)),
             ("Starved/s".into(), format!("{:.0}", self.starved_per_sec)),
-            ("Avg Present-Cycle".into(), format!("{:.1} ms", self.avg_present_ms)),
         ]));
 
         let env = if self.env_overrides.is_empty() {

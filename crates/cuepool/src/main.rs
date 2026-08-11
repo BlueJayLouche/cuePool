@@ -1,10 +1,12 @@
 //! CuePool binary — custom winit event loop with dual windows.
 //!
 //! - Control window: egui UI (replaces eframe)
-//! - Video output window: wgpu fullscreen blit (lazy-created on first video)
+//! - Video output windows: one render thread per output, each blocking on its
+//!   own display's vsync (Fifo) — ungenlocked outputs never serialize.
 //! - Audio engine: cpal output with master clock for A/V sync
-//! - Video decode: background thread that sleeps until frame PTS, then sends
-//!   frame to main thread via winit user event.
+//! - Video decode: background thread feeding a bounded channel; the main-thread
+//!   tick picks the frame due against the wall-clock video clock and uploads it
+//!   to the shared canvas texture the render threads sample.
 
 use cuepool_audio::{AudioEngine, FileDecoder, SampleProvider};
 use cuepool_core::{CanvasFit, LockExt, MidiTrigger, MidiTriggerKind, SerializedColour, Timespan};
@@ -17,8 +19,8 @@ use cuepool_protocols::osc::{OscEvent, OscManager};
 use cuepool_video::{VideoFrame, VideoSource};
 use std::net::Ipv4Addr;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
@@ -117,14 +119,79 @@ struct PendingStop {
     fade_type: cuepool_core::FadeType,
 }
 
-/// One projector output window: winit window + wgpu surface + slice renderer.
+/// One projector output window. The main (winit) thread owns the window itself
+/// (events, fullscreen toggles); the surface, its config and the slice renderer
+/// live on a dedicated render thread that blocks on THIS display's vsync
+/// (Fifo), so ungenlocked outputs never serialize against each other.
 struct OutputWindow {
     id: WindowId,
     window: Arc<Window>,
-    surface: wgpu::Surface<'static>,
-    config: wgpu::SurfaceConfiguration,
-    renderer: cuepool_video::ProjectionRenderer,
+    /// Baked snapshot: display name (identify/diagnostics) and the fallback
+    /// used when the live projection outputs list has no entry for this window.
     output_config: cuepool_core::ProjectorOutput,
+    /// Latest window size forwarded to the render thread (packed `w<<32 | h`).
+    size: Arc<AtomicU64>,
+    /// Stop signal for the render thread.
+    stop: Arc<AtomicBool>,
+    /// Presents completed by the render thread (drained ~1 Hz for diagnostics).
+    presented: Arc<AtomicU32>,
+    present_mode: wgpu::PresentMode,
+    format: wgpu::TextureFormat,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for OutputWindow {
+    /// Signal the render thread and join it BEFORE the window/surface can die,
+    /// so no thread presents into a torn-down surface. The thread is blocked
+    /// at most one vsync (~20 ms at 50 Hz), so the join is bounded.
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+fn pack_size(w: u32, h: u32) -> u64 {
+    ((w as u64) << 32) | h as u64
+}
+
+fn unpack_size(packed: u64) -> (u32, u32) {
+    ((packed >> 32) as u32, packed as u32)
+}
+
+/// Frame content published by the main thread for the output render threads.
+/// Everything needed to draw one output frame, snapped under one brief lock.
+/// The canvas/overlay TEXTURES are shared GPU resources — new video frames
+/// land in them via queue uploads, so a stable `generation` still shows fresh
+/// content; `generation` only bumps when a field here changes.
+struct OutputFrameState {
+    canvas_view: Option<wgpu::TextureView>,
+    overlay_view: Option<wgpu::TextureView>,
+    canvas_size: [u32; 2],
+    /// Anything to show (video frame, still image, or text overlay).
+    has_content: bool,
+    /// Stop-cue picture fade (1.0 = full brightness).
+    opacity: f32,
+    identify: bool,
+    /// Live projection outputs (source rect / edge blend edits apply live).
+    outputs: Vec<cuepool_core::ProjectorOutput>,
+    generation: u64,
+}
+
+impl Default for OutputFrameState {
+    fn default() -> Self {
+        Self {
+            canvas_view: None,
+            overlay_view: None,
+            canvas_size: [0, 0],
+            has_content: false,
+            opacity: 1.0,
+            identify: false,
+            outputs: Vec::new(),
+            generation: 0,
+        }
+    }
 }
 
 /// True when the parts of the projection that window creation bakes in differ:
@@ -177,14 +244,20 @@ struct App {
     current_text_qid: Option<rust_decimal::Decimal>,
     /// GPU YUV420→RGB converter (lazily built; planes uploaded + matrix in-shader).
     yuv_converter: Option<cuepool_video::YuvConverter>,
-    /// A new YUV frame's planes are uploaded and awaiting the convert pass, which
-    /// is folded into the first output's encoder (no separate submit).
-    pending_yuv_convert: bool,
     output_windows: Vec<OutputWindow>,
     /// Projection settings the open output windows were built from (effective
     /// outputs). `about_to_wait` rebuilds the windows when the live show file
     /// diverges from this structurally.
     output_windows_built_from: Option<cuepool_core::ProjectionConfig>,
+    /// Frame content shared with the per-output render threads. Published by
+    /// `publish_output_frame` each tick; render threads lock it briefly to
+    /// re-snapshot when the generation bumps.
+    frame_state: Arc<Mutex<OutputFrameState>>,
+    /// Set when the canvas/overlay texture is (re)created or dropped, so the
+    /// next publish regenerates the views in the bundle.
+    frame_views_dirty: bool,
+    /// Last projection outputs published to the render threads (change detect).
+    published_outputs: Vec<cuepool_core::ProjectorOutput>,
 
     // ── egui ──
     egui_ctx: egui::Context,
@@ -211,10 +284,6 @@ struct App {
     show_paused_offset: f64,
     /// A frame-step was requested while paused: present one video frame.
     video_step_pending: bool,
-    /// Set by the first output RedrawRequested of each loop iteration, cleared
-    /// in about_to_wait: render_video presents ALL outputs in one pass, so the
-    /// N redraw events per iteration must collapse into a single render.
-    video_cycle_rendered: bool,
     triggered_timecodes: Vec<rust_decimal::Decimal>,
     /// TimeCode cues with a duration currently occupying time.
     active_timecodes: Vec<(rust_decimal::Decimal, std::time::Instant)>,
@@ -222,9 +291,9 @@ struct App {
     // ── video playback ──
     event_loop_proxy: winit::event_loop::EventLoopProxy<AppEvent>,
     /// Receiver for decoded frames. The decode thread is a bounded producer (its
-    /// send blocks when the channel is full); the render loop selects the frame
-    /// whose PTS is due against `video_clock`. Backpressure keeps decode a few
-    /// frames ahead so the due frame is ready when the clock reaches it.
+    /// send blocks when the channel is full); the main-thread tick selects the
+    /// frame whose PTS is due against `video_clock`. Backpressure keeps decode a
+    /// few frames ahead so the due frame is ready when the clock reaches it.
     video_frame_rx: Option<std::sync::mpsc::Receiver<VideoFrame>>,
     /// Whether a frame has been uploaded to the canvas (drives `has_video`).
     canvas_has_frame: bool,
@@ -262,8 +331,6 @@ struct App {
     /// Frame-pacing diagnostics, printed once/sec when QPLAYER_FPS_DEBUG is set.
     fps_debug: bool,
     dbg_starved: u32,
-    dbg_presented: u32,
-    dbg_present_time: std::time::Duration,
     dbg_last_log: std::time::Instant,
 
     // ── protocols ──
@@ -285,9 +352,6 @@ struct App {
     mtc_drift: Option<f64>,
     /// Last frame rate we warned about (rate-limits the non-25fps warning).
     mtc_warned_fps: Option<MtcFrameRate>,
-    /// Keep output redraws flowing briefly after an MTC-hold hard sync so the
-    /// freshly sought frame actually presents before throttling back down.
-    mtc_hold_redraw_until: Option<Instant>,
 
     // ── lighting ──
     lighting: LightingEngine,
@@ -473,9 +537,11 @@ impl App {
             text_overlay: None,
             current_text_qid: None,
             yuv_converter: None,
-            pending_yuv_convert: false,
             output_windows: Vec::new(),
             output_windows_built_from: None,
+            frame_state: Arc::new(Mutex::new(OutputFrameState::default())),
+            frame_views_dirty: false,
+            published_outputs: Vec::new(),
             video_frame_rx: None,
             canvas_has_frame: false,
             video_clock: None,
@@ -493,8 +559,6 @@ impl App {
             identify_until: None,
             fps_debug: std::env::var("QPLAYER_FPS_DEBUG").is_ok(),
             dbg_starved: 0,
-            dbg_presented: 0,
-            dbg_present_time: std::time::Duration::ZERO,
             dbg_last_log: std::time::Instant::now(),
             osc_manager,
             osc_rx,
@@ -506,7 +570,6 @@ impl App {
             mtc_follow: None,
             mtc_drift: None,
             mtc_warned_fps: None,
-            mtc_hold_redraw_until: None,
             last_window_title: String::new(),
             autosave_running,
             active_cues: Vec::new(),
@@ -517,7 +580,6 @@ impl App {
             show_pause_started: None,
             show_paused_offset: 0.0,
             video_step_pending: false,
-            video_cycle_rendered: false,
             triggered_timecodes: Vec::new(),
             active_timecodes: Vec::new(),
             modifiers: winit::keyboard::ModifiersState::empty(),
@@ -728,27 +790,16 @@ impl App {
             if let Some(srgb) = caps.formats.iter().copied().find(|f| f.is_srgb()) {
                 config.format = srgb;
             }
-            // Present mode: the FIRST output keeps Fifo (vsync) — its blocking
-            // acquire paces the whole render loop to the display refresh. On
-            // Windows, further Fifo surfaces serialize their vsync waits behind
-            // it and DWM favours the foreground window, starving the others —
-            // so secondaries present non-blocking (Mailbox, else Immediate;
-            // flip-model presents stay vsync-aligned, no tearing). macOS
-            // presents don't serialize this way and keeps Fifo everywhere.
-            // Override with QPLAYER_PRESENT_MODE=fifo|fifo_relaxed|mailbox|
-            // immediate to force one mode on every output.
-            let secondary = cfg!(windows) && !self.output_windows.is_empty();
+            // Present mode: EVERY output blocks on its own display's vsync
+            // (Fifo). Each output renders on its own thread now, so a blocking
+            // acquire paces only that thread — ungenlocked projectors no longer
+            // serialize their vsync waits against each other. Override with
+            // QPLAYER_PRESENT_MODE=fifo|fifo_relaxed|mailbox|immediate to force
+            // one mode on every output.
             let want = match std::env::var("QPLAYER_PRESENT_MODE").as_deref() {
                 Ok("mailbox") => wgpu::PresentMode::Mailbox,
                 Ok("immediate") => wgpu::PresentMode::Immediate,
                 Ok("fifo_relaxed") => wgpu::PresentMode::FifoRelaxed,
-                Ok("fifo") => wgpu::PresentMode::Fifo,
-                _ if secondary && caps.present_modes.contains(&wgpu::PresentMode::Mailbox) => {
-                    wgpu::PresentMode::Mailbox
-                }
-                _ if secondary && caps.present_modes.contains(&wgpu::PresentMode::Immediate) => {
-                    wgpu::PresentMode::Immediate
-                }
                 _ => wgpu::PresentMode::Fifo,
             };
             config.present_mode = if caps.present_modes.contains(&want) {
@@ -783,13 +834,48 @@ impl App {
             );
 
             let video_id = window.id();
+            let size_atomic = Arc::new(AtomicU64::new(pack_size(size.width, size.height)));
+            let stop = Arc::new(AtomicBool::new(false));
+            let presented = Arc::new(AtomicU32::new(0));
+            let present_mode = config.present_mode;
+            let format = config.format;
+            let join = {
+                let frame_state = Arc::clone(&self.frame_state);
+                let thread_size = Arc::clone(&size_atomic);
+                let thread_stop = Arc::clone(&stop);
+                let thread_presented = Arc::clone(&presented);
+                let device = self.device.clone();
+                let queue = self.queue.clone();
+                let fallback_output = output.clone();
+                std::thread::Builder::new()
+                    .name(format!("output-render-{}", output.name))
+                    .spawn(move || {
+                        output_render_thread(
+                            surface,
+                            config,
+                            renderer,
+                            device,
+                            queue,
+                            frame_state,
+                            thread_size,
+                            thread_stop,
+                            thread_presented,
+                            out_idx,
+                            fallback_output,
+                        );
+                    })
+                    .expect("spawn output render thread")
+            };
             self.output_windows.push(OutputWindow {
                 id: video_id,
                 window,
-                surface,
-                config,
-                renderer,
                 output_config: output.clone(),
+                size: size_atomic,
+                stop,
+                presented,
+                present_mode,
+                format,
+                join: Some(join),
             });
 
             if let Some(ids) = self.window_ids.as_mut() {
@@ -1118,7 +1204,6 @@ impl App {
                     }
                 }
                 self.current_text_qid = shown.then_some(qid);
-                self.request_output_redraw();
             }
             cuepool_core::Cue::Image { path, fit, .. } => {
                 log::info!("Go ImageCue Q{}: {}", qid, path);
@@ -1130,12 +1215,11 @@ impl App {
                     }
                 }
                 // A still replaces video output: clear video playback state so the
-                // render loop doesn't try to PTS-match against stale frames.
+                // render threads don't try to PTS-match against stale frames.
                 self.video_clock = None;
                 self.video_frame_rx = None;
                 self.video_peek = None;
                 self.current_video_qid = Some(qid);
-                self.request_output_redraw();
             }
             cuepool_core::Cue::Goto { target_qid, .. } => {
                 log::info!("Go GotoCue Q{} -> arm Q{}", qid, target_qid);
@@ -1310,6 +1394,7 @@ impl App {
         if let Some(canvas) = self.canvas_texture.as_mut() {
             if canvas.width != projection.canvas_width || canvas.height != projection.canvas_height {
                 canvas.resize(&self.device, projection.canvas_width, projection.canvas_height);
+                self.frame_views_dirty = true;
             }
         } else {
             self.canvas_texture = Some(cuepool_video::CanvasTexture::new(
@@ -1317,6 +1402,7 @@ impl App {
                 projection.canvas_width,
                 projection.canvas_height,
             ));
+            self.frame_views_dirty = true;
         }
         self.sync_text_overlay(projection.canvas_width, projection.canvas_height);
     }
@@ -1337,9 +1423,11 @@ impl App {
         if let Some(overlay) = self.text_overlay.as_mut() {
             if overlay.width != width || overlay.height != height {
                 overlay.resize(&self.device, width, height);
+                self.frame_views_dirty = true;
             }
         } else {
             self.text_overlay = Some(cuepool_video::CanvasTexture::new(&self.device, width, height));
+            self.frame_views_dirty = true;
         }
     }
 
@@ -1692,7 +1780,6 @@ impl App {
         } else if self.current_text_qid == Some(stop_qid) {
             // Text cues live on the overlay, not in the audio-backed active list.
             self.clear_text_overlay();
-            self.request_output_redraw();
             handled = true;
         }
 
@@ -1710,7 +1797,6 @@ impl App {
                 } else {
                     self.stop_video_playback();
                 }
-                self.request_output_redraw();
             }
             handled = true;
         }
@@ -1977,7 +2063,8 @@ impl App {
         // Stop-cue fade still in flight.
         self.video_fade = None;
 
-        // Create/resize the shared projection canvas.
+        // Create/resize the shared projection canvas. `resize` always recreates
+        // the texture, so the published views must be regenerated either way.
         let projection = {
             let state = self.cuepool.state().lock_unpoisoned();
             state.show_file.projection.clone()
@@ -1991,6 +2078,7 @@ impl App {
                 projection.canvas_height,
             ));
         }
+        self.frame_views_dirty = true;
         self.sync_text_overlay(projection.canvas_width, projection.canvas_height);
 
         self.spawn_video_decode(path, None);
@@ -2011,10 +2099,10 @@ impl App {
         // opens instead of failing — audio resolved but video didn't.
         let path = self.resolve_path(path).unwrap_or_else(|| path.to_string());
         // Bounded channel = backpressure: the decode thread can't outrun the consumer
-        // (the vsync-paced render loop), so decode runs at the display refresh rate
-        // — no free-running wall clock to drift against vsync. The small buffer absorbs
-        // decode jitter. Pacing is the display, not the audio clock, so it can't freeze
-        // if the audio device sleeps.
+        // (the main-thread tick matching PTS against the wall-clock video clock), so
+        // decode runs at real-time rate — no free-running decoder to drift against
+        // the clock. The small buffer absorbs decode jitter. Pacing is the wall
+        // clock, not the audio clock, so it can't freeze if the audio device sleeps.
         let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<VideoFrame>(VIDEO_QUEUE_CAP);
         self.video_frame_rx = Some(frame_rx);
         let stop_flag = Arc::clone(&self.video_stop_flag);
@@ -2042,15 +2130,6 @@ impl App {
     /// and close its output windows (which would otherwise keep playing with the
     /// old projection geometry). The windows reopen with the new project's geometry
     /// when the next video/image/text cue plays, or via the projection-output menu.
-    /// Ask every output window to repaint once. Output windows are event-driven
-    /// (not redrawn every tick), so anything that changes their contents without a
-    /// following VideoFrame must call this: Stop (→ black) and Text/Image stills.
-    fn request_output_redraw(&self) {
-        for out in &self.output_windows {
-            out.window.request_redraw();
-        }
-    }
-
     fn reset_for_project_change(&mut self) {
         self.stop_all();
         self.lighting.shutdown();
@@ -2066,6 +2145,7 @@ impl App {
         self.canvas_texture = None;
         self.text_overlay = None;
         self.current_text_qid = None;
+        self.frame_views_dirty = true;
     }
 
     /// Stop video/image playback: signal the decode thread, drop the frame
@@ -2106,8 +2186,8 @@ impl App {
             tex.upload_rgba(&self.queue, &vec![0u8; (w * h * 4) as usize]);
         }
         self.clear_text_overlay();
-        // Output is event-driven now — explicitly repaint so it clears to black.
-        self.request_output_redraw();
+        // The render threads present every vsync, so the cleared/black state
+        // shows on the next publish without any explicit repaint request.
     }
 
     /// Persist settings and hard-exit the process. A graceful `event_loop.exit()`
@@ -2295,9 +2375,6 @@ impl App {
             // snap to the target if off, then freeze there.
             if (target - current).abs() > mtc_follow::DEADBAND_SECS {
                 self.mtc_hard_sync(target);
-                // Keep redraws flowing briefly so the sought frame presents
-                // (holding throttles output redraws like a pause).
-                self.mtc_hold_redraw_until = Some(Instant::now() + Duration::from_millis(1000));
             }
             if let Some(f) = self.mtc_follow.as_mut() {
                 f.hold_position = Some(target);
@@ -2326,7 +2403,6 @@ impl App {
                     }
                 }
                 self.video_step_pending = true;
-                self.request_output_redraw();
                 return;
             }
             log::debug!("Frame step: no decoded frame available yet");
@@ -2384,7 +2460,6 @@ impl App {
                     }
                     self.video_peek = Some(f);
                     self.video_step_pending = true;
-                    self.request_output_redraw();
                 }
                 Err(_) => log::warn!("Frame step back: no frame delivered after seek"),
             }
@@ -3314,87 +3389,101 @@ impl App {
         // in about_to_wait later this same iteration.
     }
 
-    /// Render the video output windows.
-    fn render_video(&mut self) {
-        let projection = {
-            let state = self.cuepool.state().lock_unpoisoned();
-            state.show_file.projection.clone()
-        };
-
-        // Show the frame whose PTS is due at the current playback time. `video_clock`
-        // is a wall clock = real time (the audio runs on the same real time), so this
-        // keeps A/V in sync and plays correct-speed on any display refresh. Frames
-        // late vs the clock are dropped to catch up; when ahead, the last frame is
-        // held and re-presented at vsync.
+    /// Consume decoded frames whose PTS is due and upload the newest to the
+    /// canvas. Runs on the main thread each tick (was the front half of
+    /// render_video); the render threads then sample the shared canvas texture
+    /// on their own vsync.
+    ///
+    /// `video_clock` is a wall clock = real time (the audio runs on the same
+    /// real time), so this keeps A/V in sync and plays correct-speed on any
+    /// display refresh. Frames late vs the clock are dropped to catch up; when
+    /// ahead, the last frame is held (the render threads re-present it).
+    fn consume_due_video_frames(&mut self) {
         let stepping = std::mem::take(&mut self.video_step_pending);
-        if !self.paused || stepping {
-            // While paused-and-stepping, the target is the frozen position —
-            // clock.elapsed() keeps growing through the pause and would drain
-            // every buffered frame. +1µs absorbs the f64→Duration rounding of
-            // the step's clock adjustment so the frame it made due isn't held.
-            let target = self
-                .video_paused_position()
-                .map(|t| if stepping { t + Duration::from_micros(1) } else { t });
-            if let Some(target) = target {
-                let mut newest_due: Option<VideoFrame> = None;
-                loop {
-                    if self.video_peek.is_none() {
-                        self.video_peek =
-                            self.video_frame_rx.as_ref().and_then(|rx| rx.try_recv().ok());
-                    }
-                    match self.video_peek.as_ref() {
-                        Some(f) if Duration::from_secs_f64(f.pts.max(0.0)) <= target => {
-                            newest_due = self.video_peek.take();
-                        }
-                        _ => break, // next frame not due yet, or channel empty
-                    }
+        if self.paused && !stepping {
+            return;
+        }
+        // While paused-and-stepping, the target is the frozen position —
+        // clock.elapsed() keeps growing through the pause and would drain
+        // every buffered frame. +1µs absorbs the f64→Duration rounding of
+        // the step's clock adjustment so the frame it made due isn't held.
+        let Some(target) = self
+            .video_paused_position()
+            .map(|t| if stepping { t + Duration::from_micros(1) } else { t })
+        else {
+            return;
+        };
+        let mut newest_due: Option<VideoFrame> = None;
+        loop {
+            if self.video_peek.is_none() {
+                self.video_peek =
+                    self.video_frame_rx.as_ref().and_then(|rx| rx.try_recv().ok());
+            }
+            match self.video_peek.as_ref() {
+                Some(f) if Duration::from_secs_f64(f.pts.max(0.0)) <= target => {
+                    newest_due = self.video_peek.take();
                 }
-                if let Some(frame) = newest_due {
-                    self.last_video_pts = Some(frame.pts);
-                    match frame.pixels {
-                        cuepool_video::FramePixels::Rgba(_) => {
-                            if let Some(canvas) = self.canvas_texture.as_ref() {
-                                canvas.upload_frame(&self.queue, &frame, projection.fit);
-                            }
-                        }
-                        _ => {
-                            // GPU path: upload decoded planes now; the convert pass is
-                            // recorded into the first output's encoder below (no CPU
-                            // swscale, no 23 MB RGBA copy, no separate submit).
-                            if self.yuv_converter.is_none() {
-                                self.yuv_converter = Some(cuepool_video::YuvConverter::new(
-                                    &self.device,
-                                    wgpu::TextureFormat::Rgba8Unorm,
-                                ));
-                            }
-                            if let (Some(canvas), Some(conv)) =
-                                (self.canvas_texture.as_ref(), self.yuv_converter.as_mut())
-                            {
-                                conv.upload(
-                                    &self.device,
-                                    &self.queue,
-                                    &frame,
-                                    [canvas.width, canvas.height],
-                                    projection.fit,
-                                );
-                                self.pending_yuv_convert = true;
-                            }
-                        }
-                    }
-                    self.canvas_has_frame = true;
-                } else if self.video_peek.is_none() {
-                    self.dbg_starved += 1;
+                _ => break, // next frame not due yet, or channel empty
+            }
+        }
+        let Some(frame) = newest_due else {
+            if self.video_peek.is_none() {
+                self.dbg_starved += 1;
+            }
+            return;
+        };
+        self.last_video_pts = Some(frame.pts);
+        match frame.pixels {
+            cuepool_video::FramePixels::Rgba(_) => {
+                let fit = self.cuepool.state().lock_unpoisoned().show_file.projection.fit;
+                if let Some(canvas) = self.canvas_texture.as_ref() {
+                    canvas.upload_frame(&self.queue, &frame, fit);
+                }
+            }
+            _ => {
+                // GPU path: upload decoded planes, then run the YUV→RGB convert
+                // as its own standalone submit (no CPU swscale, no 23 MB RGBA
+                // copy). It used to fold into the first output's encoder; with
+                // per-output render threads there is no shared encoder, and the
+                // queue serializes this before any later sampling pass anyway.
+                if self.yuv_converter.is_none() {
+                    self.yuv_converter = Some(cuepool_video::YuvConverter::new(
+                        &self.device,
+                        wgpu::TextureFormat::Rgba8Unorm,
+                    ));
+                }
+                let fit = self.cuepool.state().lock_unpoisoned().show_file.projection.fit;
+                if let (Some(canvas), Some(conv)) =
+                    (self.canvas_texture.as_ref(), self.yuv_converter.as_mut())
+                {
+                    conv.upload(
+                        &self.device,
+                        &self.queue,
+                        &frame,
+                        [canvas.width, canvas.height],
+                        fit,
+                    );
+                    let mut encoder =
+                        self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("canvas-yuv-convert"),
+                        });
+                    conv.encode(&mut encoder, &canvas.render_view());
+                    self.queue.submit(std::iter::once(encoder.finish()));
                 }
             }
         }
+        self.canvas_has_frame = true;
+    }
 
-        let canvas_view = self.canvas_texture.as_ref().map(|c| c.view());
-        let canvas_render_view = self.canvas_texture.as_ref().map(|c| c.render_view());
-        let overlay_view = self.text_overlay.as_ref().map(|t| t.view());
-
+    /// Publish the current frame state to the per-output render threads.
+    /// Runs each tick; the bundle only changes (generation bump) when one of
+    /// its fields actually changed — the video frames themselves flow through
+    /// the shared canvas texture, not the bundle.
+    fn publish_output_frame(&mut self) {
         // Stop-cue picture fade: ramp the canvas to black over the fade time,
-        // then stop playback for good. Must run before has_video is computed
-        // so the completed fade renders as the black clear-pass.
+        // then stop playback for good. Must run before has_content is computed
+        // so the completed fade publishes as the black clear-pass. The render
+        // threads present every vsync, so the ramp animates on its own.
         let video_opacity = match self.video_fade {
             Some((start, duration)) => {
                 let t = (start.elapsed().as_secs_f32() / duration).clamp(0.0, 1.0);
@@ -3402,169 +3491,60 @@ impl App {
                     self.stop_video_playback();
                     0.0
                 } else {
-                    // Keep repainting while the ramp is animating.
-                    self.request_output_redraw();
                     1.0 - t
                 }
             }
             None => 1.0,
         };
 
-        let has_video = self.current_video_qid.is_some()
+        let has_content = self.current_video_qid.is_some()
             || self.canvas_has_frame
             || self.current_text_qid.is_some();
-
         let identify = self.identify_until.is_some_and(|t| std::time::Instant::now() < t);
-        let present_start = std::time::Instant::now();
-        let mut vsync_paced = false;
-        for (out_i, out) in self.output_windows.iter_mut().enumerate() {
-            let size = out.window.inner_size();
-            if size.width == 0 || size.height == 0 {
-                continue;
-            }
-            if size.width != out.config.width || size.height != out.config.height {
-                out.config.width = size.width;
-                out.config.height = size.height;
-                out.surface.configure(&self.device, &out.config);
-            }
 
-            use wgpu::CurrentSurfaceTexture::{Lost, Occluded, Outdated, Suboptimal, Success};
-            let surface_texture = match out.surface.get_current_texture() {
-                Success(o) | Suboptimal(o) => o,
-                // Output window covered/minimized — skip quietly (decode + audio keep
-                // running on their own threads, so playback is unaffected).
-                Occluded => continue,
-                Lost | Outdated => {
-                    log::debug!("Output surface lost/outdated, reconfiguring");
-                    out.surface.configure(&self.device, &out.config);
-                    match out.surface.get_current_texture() {
-                        Success(o) | Suboptimal(o) => o,
-                        err => {
-                            log::warn!("Output surface acquire failed after reconfigure: {err:?}");
-                            continue;
-                        }
-                    }
-                }
-                err => {
-                    log::warn!("Output surface acquire failed: {err:?}");
-                    continue;
-                }
-            };
-            let view = surface_texture
-                .texture
-                .create_view(&wgpu::TextureViewDescriptor::default());
-
-            let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("output-encoder"),
-            });
-
-            if identify {
-                let color = IDENTIFY_COLORS[out_i % IDENTIFY_COLORS.len()];
-                encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("identify-pass"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &view,
-                        resolve_target: None,
-                        depth_slice: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(color),
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })],
-                    depth_stencil_attachment: None,
-                    occlusion_query_set: None,
-                    timestamp_writes: None,
-                    multiview_mask: None,
-                });
-            } else if has_video {
-                if let (Some(canvas_view), Some(overlay_view)) =
-                    (canvas_view.as_ref(), overlay_view.as_ref())
-                {
-                    // Fold the pending YUV→RGB pass into this output's encoder so it
-                    // runs once (before the first output samples the canvas) without
-                    // its own submit. Subsequent outputs read the converted canvas.
-                    if self.pending_yuv_convert {
-                        if let (Some(rv), Some(conv)) =
-                            (canvas_render_view.as_ref(), self.yuv_converter.as_ref())
-                        {
-                            conv.encode(&mut encoder, rv);
-                        }
-                        self.pending_yuv_convert = false;
-                    }
-                    // Source rect + edge blend (incl. gamma) come from the live show
-                    // file every frame, so projection-panel edits apply without a
-                    // window rebuild. The window's baked config is only a fallback
-                    // for when the live list has no entry for this window.
-                    let output =
-                        projection.outputs.get(out_i).unwrap_or(&out.output_config);
-                    out.renderer.render(
-                        &self.device,
-                        &self.queue,
-                        &mut encoder,
-                        canvas_view,
-                        overlay_view,
-                        &view,
-                        output,
-                        [projection.canvas_width, projection.canvas_height],
-                        video_opacity,
-                    );
-                } else {
-                    encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        label: Some("output-clear-pass"),
-                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: &view,
-                            resolve_target: None,
-                            depth_slice: None,
-                            ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                                store: wgpu::StoreOp::Store,
-                            },
-                        })],
-                        depth_stencil_attachment: None,
-                        occlusion_query_set: None,
-                        timestamp_writes: None,
-                        multiview_mask: None,
-                    });
-                }
+        // Live projection outputs ride the bundle (cheap change-detect against
+        // the last publish), so projection-panel edits apply without a rebuild.
+        let outputs_changed = {
+            let state = self.cuepool.state().lock_unpoisoned();
+            let live = &state.show_file.projection.outputs;
+            if *live != self.published_outputs {
+                self.published_outputs = live.clone();
+                true
             } else {
-                encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("output-clear-pass"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &view,
-                        resolve_target: None,
-                        depth_slice: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })],
-                    depth_stencil_attachment: None,
-                    occlusion_query_set: None,
-                    timestamp_writes: None,
-                    multiview_mask: None,
-                });
+                false
             }
+        };
 
-            self.queue.submit(std::iter::once(encoder.finish()));
-            surface_texture.present();
-            if out.config.present_mode == wgpu::PresentMode::Fifo {
-                vsync_paced = true;
-            }
+        let mut frame = self.frame_state.lock_unpoisoned();
+        let mut changed = false;
+        if std::mem::take(&mut self.frame_views_dirty) {
+            frame.canvas_view = self.canvas_texture.as_ref().map(|c| c.view());
+            frame.overlay_view = self.text_overlay.as_ref().map(|t| t.view());
+            frame.canvas_size = self
+                .canvas_texture
+                .as_ref()
+                .map(|c| [c.width, c.height])
+                .unwrap_or([0, 0]);
+            changed = true;
         }
-
-        if !self.output_windows.is_empty() {
-            self.dbg_presented += 1;
-            self.dbg_present_time += present_start.elapsed();
+        if outputs_changed {
+            frame.outputs = self.published_outputs.clone();
+            changed = true;
         }
-
-        // Vsync pacing: the Fifo present itself is the throttle. We rely on the
-        // swapchain backpressure plus a continuous redraw request in about_to_wait
-        // to keep the loop running at exactly the display refresh.
-        // If no Fifo surface presented (pacer occluded, or every output forced
-        // non-blocking), throttle by hand so the continuous-redraw loop can't
-        // free-spin. ponytail: flat 8ms — any throttle beats precision here.
-        if !vsync_paced && self.current_video_qid.is_some() && !self.paused {
-            std::thread::sleep(Duration::from_millis(8));
+        if frame.opacity != video_opacity {
+            frame.opacity = video_opacity;
+            changed = true;
+        }
+        if frame.has_content != has_content {
+            frame.has_content = has_content;
+            changed = true;
+        }
+        if frame.identify != identify {
+            frame.identify = identify;
+            changed = true;
+        }
+        if changed {
+            frame.generation += 1;
         }
     }
 }
@@ -3632,9 +3612,6 @@ impl ApplicationHandler<AppEvent> for App {
                                     &self.queue,
                                     &vec![0u8; (canvas.width * canvas.height * 4) as usize],
                                 );
-                            }
-                            for out in &self.output_windows {
-                                out.window.request_redraw();
                             }
                         }
                     }
@@ -3804,36 +3781,20 @@ impl ApplicationHandler<AppEvent> for App {
                     self.modifiers = modifiers.state();
                 }
                 WindowEvent::Resized(size) => {
-                    if size.width > 0 && size.height > 0 {
-                        if let Some(out) = self.output_windows.iter_mut().find(|out| out.id == window_id) {
-                            out.config.width = size.width;
-                            out.config.height = size.height;
-                            out.surface.configure(&self.device, &out.config);
-                            // Repaint after resize/fullscreen-toggle — output is
-                            // event-driven, so a held still would otherwise blank out.
-                            out.window.request_redraw();
-                        }
+                    // Forward the new size to the render thread; it reconfigures
+                    // its own surface before the next acquire.
+                    if let Some(out) = self.output_windows.iter().find(|out| out.id == window_id) {
+                        out.size.store(pack_size(size.width, size.height), Ordering::Relaxed);
                     }
                 }
-                // Output windows render continuously while a video is playing.
-                // The bounded channel and Fifo swapchain backpressure keep this
-                // loop locked to the display refresh, one frame per vsync.
-                // One render per iteration: every output requests a redraw each
-                // cycle and render_video presents ALL outputs, so without the
-                // guard N windows would stack N passes × N blocking presents.
-                WindowEvent::RedrawRequested if !self.video_cycle_rendered => {
-                    self.video_cycle_rendered = true;
-                    self.render_video();
-                }
+                // Output windows are presented by their own render threads;
+                // RedrawRequested carries no work for them.
                 _ => {}
             }
         }
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        // New iteration: the next output RedrawRequested may render again.
-        self.video_cycle_rendered = false;
-
         // Quit confirmed by the in-app modal — hard-exit (see hard_exit for why).
         if self.cuepool.state().lock().map(|s| s.quit).unwrap_or(false) {
             self.hard_exit();
@@ -3976,84 +3937,64 @@ impl ApplicationHandler<AppEvent> for App {
                 );
             }
         }
-        if self.identify_until.is_some_and(|t| std::time::Instant::now() < t) {
-            self.request_output_redraw(); // keep flashing even with no video playing
-        } else if self.identify_until.take().is_some() {
-            self.request_output_redraw(); // just expired — repaint once to restore
-        }
+
+        // Decode-frame consumption (PTS due-selection → canvas upload) and the
+        // frame-state publish for the render threads. The render threads do
+        // the vsync-blocked presenting; this just keeps the canvas current.
+        self.consume_due_video_frames();
+        self.publish_output_frame();
 
         if self.dbg_last_log.elapsed() >= std::time::Duration::from_secs(1) {
             let secs = self.dbg_last_log.elapsed().as_secs_f64();
-            let avg_cycle_ms = if self.dbg_presented > 0 {
-                self.dbg_present_time.as_secs_f64() * 1000.0 / self.dbg_presented as f64
-            } else {
-                0.0
-            };
             let starved_per_sec = self.dbg_starved as f64 / secs;
-            let presented_per_sec = self.dbg_presented as f64 / secs;
-            if self.fps_debug {
-                eprintln!(
-                    "VIDEO DIAG: {} window(s) | starved {:.0}/s | presented {:.0}/s | avg present-cycle {:.1} ms",
-                    self.output_windows.len(),
-                    starved_per_sec,
-                    presented_per_sec,
-                    avg_cycle_ms,
-                );
-            }
-            // Publish the same counters (plus a fresh output snapshot) to the
-            // Status window. The output list is rebuilt here rather than
-            // patched on create/destroy, so every mutation site stays in sync
-            // for free.
-            let outputs = self
+            // Publish the counters (plus a fresh output snapshot) to the Status
+            // window. The output list is rebuilt here rather than patched on
+            // create/destroy, so every mutation site stays in sync for free.
+            // Per-output presented/s comes from each render thread's counter —
+            // the field diagnostic for vsync-starvation on one output.
+            let mut total_presented = 0.0;
+            let outputs: Vec<OutputDiagnostics> = self
                 .output_windows
                 .iter()
-                .map(|out| OutputDiagnostics {
-                    name: out.output_config.name.clone(),
-                    size: (out.config.width, out.config.height),
-                    present_mode: format!("{:?}", out.config.present_mode),
-                    format: format!("{:?}", out.config.format),
-                    refresh: out
-                        .window
-                        .current_monitor()
-                        .and_then(|m| m.refresh_rate_millihertz())
-                        .map(|mhz| format!("{:.2} Hz", mhz as f64 / 1000.0))
-                        .unwrap_or_else(|| "?".into()),
-                    fullscreen: out.window.fullscreen().is_some(),
+                .map(|out| {
+                    let presented_per_sec =
+                        out.presented.swap(0, Ordering::Relaxed) as f64 / secs;
+                    total_presented += presented_per_sec;
+                    OutputDiagnostics {
+                        name: out.output_config.name.clone(),
+                        size: unpack_size(out.size.load(Ordering::Relaxed)),
+                        present_mode: format!("{:?}", out.present_mode),
+                        format: format!("{:?}", out.format),
+                        refresh: out
+                            .window
+                            .current_monitor()
+                            .and_then(|m| m.refresh_rate_millihertz())
+                            .map(|mhz| format!("{:.2} Hz", mhz as f64 / 1000.0))
+                            .unwrap_or_else(|| "?".into()),
+                        fullscreen: out.window.fullscreen().is_some(),
+                        presented_per_sec,
+                    }
                 })
                 .collect();
+            if self.fps_debug {
+                let per_output = outputs
+                    .iter()
+                    .map(|o| format!("'{}' {:.0}/s", o.name, o.presented_per_sec))
+                    .collect::<Vec<_>>()
+                    .join(" | ");
+                eprintln!(
+                    "VIDEO DIAG: starved {:.0}/s | presented {}",
+                    starved_per_sec, per_output,
+                );
+            }
             let mut state = self.cuepool.state().lock_unpoisoned();
             let d = &mut state.diagnostics;
-            d.presented_per_sec = presented_per_sec;
+            d.presented_per_sec = total_presented;
             d.starved_per_sec = starved_per_sec;
-            d.avg_present_ms = avg_cycle_ms;
             d.outputs = outputs;
             drop(state);
             self.dbg_starved = 0;
-            self.dbg_presented = 0;
-            self.dbg_present_time = std::time::Duration::ZERO;
             self.dbg_last_log = std::time::Instant::now();
-        }
-
-        // Video output: continuous redraw so the Fifo swapchain backpressure paces
-        // us to the display refresh. When paused we stop requesting, so the last
-        // held frame stays on screen and decode blocks on the full channel.
-        // An MTC-follow hold throttles the same way — except right after a
-        // hard sync, when redraws must keep flowing until the sought frame presents.
-        let mtc_holding = self
-            .mtc_follow
-            .as_ref()
-            .is_some_and(|f| f.hold_position.is_some())
-            && self
-                .mtc_hold_redraw_until
-                .is_none_or(|t| Instant::now() >= t);
-        if self.current_video_qid.is_some()
-            && !self.paused
-            && !mtc_holding
-            && !self.output_windows.is_empty()
-        {
-            for out in &self.output_windows {
-                out.window.request_redraw();
-            }
         }
 
         // The control window redraws on a ~60 Hz throttle so its (non-vsync) UI
@@ -4064,6 +4005,14 @@ impl ApplicationHandler<AppEvent> for App {
                 window.request_redraw();
             }
         }
+
+        // Main-loop pacing: nothing on this thread blocks on vsync anymore —
+        // each output blocks on its own vsync in its render thread — so
+        // ControlFlow::Poll would free-spin. Wake at ~250 Hz for decode
+        // consumption, fades and UI; OS events still wake the loop instantly.
+        event_loop.set_control_flow(ControlFlow::WaitUntil(
+            std::time::Instant::now() + std::time::Duration::from_millis(4),
+        ));
     }
 }
 
@@ -4132,9 +4081,185 @@ fn resolve_goto_target(
     }
 }
 
-/// Blocking send with backpressure: waits until the vsync-paced consumer takes
+/// Per-output render thread: owns the surface, its config and the projection
+/// renderer, and loops acquire → encode → submit → present. With Fifo the
+/// acquire blocks on THIS display's vsync, so every output runs at its own
+/// refresh without serializing against the others (the ungenlocked-projector
+/// fix). Frame content comes from the shared `OutputFrameState` bundle,
+/// re-snapshotted only when its generation bumps; the video frames themselves
+/// flow through the shared canvas texture via queue uploads.
+#[allow(clippy::too_many_arguments)]
+fn output_render_thread(
+    surface: wgpu::Surface<'static>,
+    mut config: wgpu::SurfaceConfiguration,
+    renderer: cuepool_video::ProjectionRenderer,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    frame_state: Arc<Mutex<OutputFrameState>>,
+    size: Arc<AtomicU64>,
+    stop: Arc<AtomicBool>,
+    presented: Arc<AtomicU32>,
+    out_index: usize,
+    fallback_output: cuepool_core::ProjectorOutput,
+) {
+    // Local snapshot of the bundle, refreshed when its generation advances.
+    let mut generation = 0u64;
+    let mut canvas_view: Option<wgpu::TextureView> = None;
+    let mut overlay_view: Option<wgpu::TextureView> = None;
+    let mut canvas_size = [0u32; 2];
+    let mut has_content = false;
+    let mut opacity = 1.0f32;
+    let mut identify = false;
+    let mut outputs: Vec<cuepool_core::ProjectorOutput> = Vec::new();
+
+    while !stop.load(Ordering::Relaxed) {
+        // Resizes (incl. fullscreen toggles) are forwarded from the winit thread.
+        let (w, h) = unpack_size(size.load(Ordering::Relaxed));
+        if w > 0 && h > 0 && (w != config.width || h != config.height) {
+            config.width = w;
+            config.height = h;
+            surface.configure(&device, &config);
+        }
+        if w == 0 || h == 0 {
+            // Minimized to zero size — nothing to present; don't spin.
+            std::thread::sleep(Duration::from_millis(8));
+            continue;
+        }
+
+        use wgpu::CurrentSurfaceTexture::{Lost, Occluded, Outdated, Suboptimal, Success};
+        let surface_texture = match surface.get_current_texture() {
+            Success(o) | Suboptimal(o) => o,
+            // Output window covered/minimized — skip quietly (decode + audio keep
+            // running on their own threads, so playback is unaffected). Sleep so
+            // the non-blocking Occluded return can't free-spin this thread.
+            Occluded => {
+                std::thread::sleep(Duration::from_millis(8));
+                continue;
+            }
+            Lost | Outdated => {
+                log::debug!("Output surface lost/outdated, reconfiguring");
+                surface.configure(&device, &config);
+                match surface.get_current_texture() {
+                    Success(o) | Suboptimal(o) => o,
+                    err => {
+                        log::warn!("Output surface acquire failed after reconfigure: {err:?}");
+                        continue;
+                    }
+                }
+            }
+            err => {
+                log::warn!("Output surface acquire failed: {err:?}");
+                std::thread::sleep(Duration::from_millis(8));
+                continue;
+            }
+        };
+
+        // Re-snapshot the published frame state when it advanced.
+        {
+            let frame = frame_state.lock_unpoisoned();
+            if frame.generation != generation {
+                generation = frame.generation;
+                canvas_view = frame.canvas_view.clone();
+                overlay_view = frame.overlay_view.clone();
+                canvas_size = frame.canvas_size;
+                has_content = frame.has_content;
+                opacity = frame.opacity;
+                identify = frame.identify;
+                outputs = frame.outputs.clone();
+            }
+        }
+
+        let view = surface_texture
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("output-encoder"),
+        });
+
+        if identify {
+            let color = IDENTIFY_COLORS[out_index % IDENTIFY_COLORS.len()];
+            encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("identify-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(color),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                occlusion_query_set: None,
+                timestamp_writes: None,
+                multiview_mask: None,
+            });
+        } else if has_content {
+            if let (Some(canvas_view), Some(overlay_view)) =
+                (canvas_view.as_ref(), overlay_view.as_ref())
+            {
+                // Source rect + edge blend (incl. gamma) come from the published
+                // live outputs, so projection-panel edits apply without a window
+                // rebuild. The baked config is only a fallback for when the live
+                // list has no entry for this window.
+                let output = outputs.get(out_index).unwrap_or(&fallback_output);
+                renderer.render(
+                    &device,
+                    &queue,
+                    &mut encoder,
+                    canvas_view,
+                    overlay_view,
+                    &view,
+                    output,
+                    canvas_size,
+                    opacity,
+                );
+            } else {
+                encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("output-clear-pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        depth_slice: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    occlusion_query_set: None,
+                    timestamp_writes: None,
+                    multiview_mask: None,
+                });
+            }
+        } else {
+            encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("output-clear-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                occlusion_query_set: None,
+                timestamp_writes: None,
+                multiview_mask: None,
+            });
+        }
+
+        queue.submit(std::iter::once(encoder.finish()));
+        surface_texture.present();
+        presented.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Blocking send with backpressure: waits until the clock-paced consumer takes
 /// a frame, polling so it stays responsive to the stop signal. The bounded
-/// channel is what paces decode to exactly what the display consumes.
+/// channel is what paces decode to what playback actually consumes.
 /// Returns `false` when the thread should exit (stopped or disconnected).
 fn send_video_frame(
     frame_tx: &std::sync::mpsc::SyncSender<VideoFrame>,
