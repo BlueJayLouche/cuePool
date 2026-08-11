@@ -127,6 +127,35 @@ struct OutputWindow {
     output_config: cuepool_core::ProjectorOutput,
 }
 
+/// True when the parts of the projection that window creation bakes in differ:
+/// output count and monitor assignment. Everything else travels per-frame now:
+/// source rect and edge blend ride the live uniforms, and the canvas texture is
+/// resized on playback start, so geometry/canvas edits must NOT rebuild windows
+/// (a DragValue edit would otherwise storm window recreation and bury the GUI).
+/// ponytail: `pixel_perfect` (the sampler filter baked at renderer creation)
+/// goes stale when a geometry edit flips whether output size == source size —
+/// a filtering nit, not a correctness bug; upgrade path is a manual rebuild via
+/// "Open Projection Output Windows".
+fn projection_structure_changed(
+    built: &cuepool_core::ProjectionConfig,
+    live: &cuepool_core::ProjectionConfig,
+) -> bool {
+    // Same fallback as create_output_windows: no configured outputs = one default.
+    let default;
+    let live_outputs: &[cuepool_core::ProjectorOutput] = if live.outputs.is_empty() {
+        default = cuepool_core::ProjectorOutput::default_single();
+        std::slice::from_ref(&default)
+    } else {
+        live.outputs.as_slice()
+    };
+    if built.outputs.len() != live_outputs.len() {
+        return true;
+    }
+    built.outputs.iter().zip(live_outputs).any(|(b, l)| {
+        b.monitor_id != l.monitor_id || b.fullscreen_monitor != l.fullscreen_monitor
+    })
+}
+
 struct App {
     // ── wgpu core ──
     instance: wgpu::Instance,
@@ -152,6 +181,10 @@ struct App {
     /// is folded into the first output's encoder (no separate submit).
     pending_yuv_convert: bool,
     output_windows: Vec<OutputWindow>,
+    /// Projection settings the open output windows were built from (effective
+    /// outputs). `about_to_wait` rebuilds the windows when the live show file
+    /// diverges from this structurally.
+    output_windows_built_from: Option<cuepool_core::ProjectionConfig>,
 
     // ── egui ──
     egui_ctx: egui::Context,
@@ -442,6 +475,7 @@ impl App {
             yuv_converter: None,
             pending_yuv_convert: false,
             output_windows: Vec::new(),
+            output_windows_built_from: None,
             video_frame_rx: None,
             canvas_has_frame: false,
             video_clock: None,
@@ -600,6 +634,13 @@ impl App {
             projection.outputs.clone()
         };
 
+        // Snapshot what these windows are being built from (fallback applied), for
+        // the structural-divergence check in about_to_wait.
+        self.output_windows_built_from = Some(cuepool_core::ProjectionConfig {
+            outputs: outputs.clone(),
+            ..projection
+        });
+
         let monitors: Vec<_> = event_loop.available_monitors().collect();
 
         // Resolve each output to a physical monitor by saved position descriptor
@@ -754,6 +795,13 @@ impl App {
             if let Some(ids) = self.window_ids.as_mut() {
                 ids.video.push(video_id);
             }
+        }
+
+        // Freshly created (fullscreen) output windows grab the foreground — on
+        // Windows they bury the control window, and auto-rebuilds make that a
+        // surprise. Pull the GUI back to the front.
+        if let Some(control) = &self.control_window {
+            control.focus_window();
         }
     }
 
@@ -2010,6 +2058,7 @@ impl App {
         self.pixmap_yuv = None;
         self.pixel_sampler = None;
         self.output_windows.clear();
+        self.output_windows_built_from = None;
         if let Some(ids) = self.window_ids.as_mut() {
             ids.video.clear();
         }
@@ -2470,6 +2519,7 @@ impl App {
                 AppCommand::ToggleVideoWindow => {
                     if !self.output_windows.is_empty() {
                         self.output_windows.clear();
+                        self.output_windows_built_from = None;
                         if let Some(ids) = self.window_ids.as_mut() {
                             ids.video.clear();
                         }
@@ -3441,6 +3491,12 @@ impl App {
                         }
                         self.pending_yuv_convert = false;
                     }
+                    // Source rect + edge blend (incl. gamma) come from the live show
+                    // file every frame, so projection-panel edits apply without a
+                    // window rebuild. The window's baked config is only a fallback
+                    // for when the live list has no entry for this window.
+                    let output =
+                        projection.outputs.get(out_i).unwrap_or(&out.output_config);
                     out.renderer.render(
                         &self.device,
                         &self.queue,
@@ -3448,7 +3504,7 @@ impl App {
                         canvas_view,
                         overlay_view,
                         &view,
-                        &out.output_config,
+                        output,
                         [projection.canvas_width, projection.canvas_height],
                         video_opacity,
                     );
@@ -3789,6 +3845,21 @@ impl ApplicationHandler<AppEvent> for App {
         if project_generation != self.last_project_generation {
             self.last_project_generation = project_generation;
             self.reset_for_project_change();
+        }
+
+        // Structural projection edits (output count, monitor assignment) only take
+        // effect when the output windows are rebuilt — do it here instead of making
+        // the operator hit "Open Projection Output Windows". Cheap field compares,
+        // no-op when nothing changed.
+        let rebuild_outputs = {
+            let state = self.cuepool.state().lock_unpoisoned();
+            self.output_windows_built_from
+                .as_ref()
+                .is_some_and(|built| projection_structure_changed(built, &state.show_file.projection))
+        };
+        if rebuild_outputs {
+            log::info!("Projection structure changed — rebuilding output windows");
+            self.create_output_windows(event_loop);
         }
 
         self.process_midi_events(event_loop);
