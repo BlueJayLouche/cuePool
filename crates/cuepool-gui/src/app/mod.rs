@@ -35,11 +35,18 @@ impl Snapshot {
     }
 
     pub fn apply(self, state: &mut SharedState) {
+        let audio_changed = state.show_file.show_settings.audio_output_driver
+            != self.show_file.show_settings.audio_output_driver
+            || state.show_file.show_settings.audio_output_device
+                != self.show_file.show_settings.audio_output_device;
         state.show_file = self.show_file;
         state.project_path = self.project_path;
         state.selected_cue_id = self.selected_cue_id;
         state.show_mode = self.show_mode;
         state.dirty = self.dirty;
+        if audio_changed {
+            queue_audio_settings_apply(state);
+        }
     }
 }
 
@@ -304,6 +311,8 @@ pub struct SharedState {
     pub show_settings_window: bool,
     /// Current audio output device name.
     pub audio_device_name: String,
+    /// Why audio playback is disabled, if output configuration failed.
+    pub audio_error: Option<String>,
     /// Cached waveform peaks: path → Vec<(min, max)>.
     pub waveform_cache: std::collections::HashMap<String, Vec<(f32, f32)>>,
     /// Paths currently being processed for waveform generation.
@@ -426,6 +435,7 @@ impl Default for SharedState {
             recent_files: Vec::new(),
             show_settings_window: false,
             audio_device_name: String::new(),
+            audio_error: None,
             waveform_cache: std::collections::HashMap::new(),
             pending_waveforms: std::collections::HashSet::new(),
             waveform_zoom: 1.0,
@@ -528,7 +538,9 @@ pub enum AppCommand {
     MoveSelectedCueDown,
     MoveCue { from_idx: usize, to_idx: usize, parent: Option<Decimal> },
     SetLimiterThreshold(f32),
+    SetAudioDriver(cuepool_core::AudioOutputDriver),
     SetAudioDevice(String),
+    ApplyAudioSettings,
     ToggleVideoWindow,
     ToggleVideoFullscreen,
     ToggleProjectionWindow,
@@ -561,6 +573,40 @@ pub enum AppCommand {
     FrameStep,
     /// Step one video frame back while paused (show clock follows).
     FrameStepBack,
+}
+
+fn audio_driver_command(
+    current: cuepool_core::AudioOutputDriver,
+    selected: cuepool_core::AudioOutputDriver,
+) -> Option<AppCommand> {
+    (current != selected).then_some(AppCommand::SetAudioDriver(selected))
+}
+
+fn queue_audio_settings_apply(state: &mut SharedState) {
+    if !state
+        .command_queue
+        .iter()
+        .any(|command| matches!(command, AppCommand::ApplyAudioSettings))
+    {
+        state.command_queue.push(AppCommand::ApplyAudioSettings);
+    }
+}
+
+fn apply_project_import(
+    state: &mut SharedState,
+    source: &ShowFile,
+    sections: cuepool_core::ImportSections,
+) {
+    let snapshot = Snapshot::from_state(state);
+    state.undo_redo.push(snapshot);
+    cuepool_core::apply_import(&mut state.show_file, source, sections);
+    state.dirty = true;
+    if sections.projection || sections.lighting {
+        state.project_generation = state.project_generation.wrapping_add(1);
+    }
+    if sections.show_settings {
+        queue_audio_settings_apply(state);
+    }
 }
 
 /// DMX recorder status, published by the engine each tick.
@@ -806,6 +852,7 @@ impl CuePoolApp {
         if show_settings {
             let mut settings_changed = false;
             let mut limiter_cmd: Option<AppCommand> = None;
+            let mut audio_driver_cmd: Option<AppCommand> = None;
             let mut audio_device_cmd: Option<AppCommand> = None;
             egui::Window::new("Project Settings")
                 .collapsible(false)
@@ -817,6 +864,7 @@ impl CuePoolApp {
                     if let Ok(mut state) = self.state.lock() {
                         let devices = state.audio_devices.clone();
                         let current_device = state.audio_device_name.clone();
+                        let audio_error = state.audio_error.clone();
                         let threshold = state.command_queue.iter().rev().find_map(|cmd| {
                             if let AppCommand::SetLimiterThreshold(t) = cmd { Some(*t) } else { None }
                         }).unwrap_or(0.95);
@@ -846,6 +894,33 @@ impl CuePoolApp {
                             settings_changed |= ui.checkbox(&mut settings.exclusive_mode, "Exclusive Mode").changed();
 
                             ui.horizontal(|ui| {
+                                ui.label("Output Driver:");
+                                egui::ComboBox::from_id_salt("audio_driver")
+                                    .selected_text(settings.audio_output_driver.to_string())
+                                    .show_ui(ui, |ui| {
+                                        for driver in [
+                                            cuepool_core::AudioOutputDriver::WASAPI,
+                                            cuepool_core::AudioOutputDriver::Wave,
+                                            cuepool_core::AudioOutputDriver::DirectSound,
+                                            cuepool_core::AudioOutputDriver::ASIO,
+                                        ] {
+                                            if ui
+                                                .selectable_label(
+                                                    driver == settings.audio_output_driver,
+                                                    driver.to_string(),
+                                                )
+                                                .clicked()
+                                            {
+                                                audio_driver_cmd = audio_driver_command(
+                                                    settings.audio_output_driver,
+                                                    driver,
+                                                );
+                                            }
+                                        }
+                                    });
+                            });
+
+                            ui.horizontal(|ui| {
                                 ui.label("Output Device:");
                                 egui::ComboBox::from_id_salt("audio_device")
                                     .selected_text(&current_device)
@@ -858,6 +933,13 @@ impl CuePoolApp {
                                         }
                                     });
                             });
+
+                            if let Some(error) = &audio_error {
+                                ui.colored_label(
+                                    egui::Color32::LIGHT_RED,
+                                    format!("Audio playback disabled: {error}"),
+                                );
+                            }
 
                             ui.label("Master Limiter Threshold:");
                             let mut db = 20.0 * threshold.log10();
@@ -981,6 +1063,9 @@ impl CuePoolApp {
                     state.dirty = true;
                 }
                 if let Some(cmd) = limiter_cmd {
+                    state.command_queue.push(cmd);
+                }
+                if let Some(cmd) = audio_driver_cmd {
                     state.command_queue.push(cmd);
                 }
                 if let Some(cmd) = audio_device_cmd {
@@ -1219,22 +1304,7 @@ impl CuePoolApp {
                             || request.sections.show_settings;
                         if ui.add_enabled(any_checked, egui::Button::new("Import")).clicked() {
                             if let Ok(mut state) = self.state.lock() {
-                                let snapshot = Snapshot::from_state(&state);
-                                state.undo_redo.push(snapshot);
-                                cuepool_core::apply_import(
-                                    &mut state.show_file,
-                                    &request.show,
-                                    request.sections,
-                                );
-                                state.dirty = true;
-                                // Wholesale projection/patch replace: same reset as
-                                // New/Open — stops cues and rebuilds output windows.
-                                // (The lighting engine re-reads show_file.lighting
-                                // every tick on its own.)
-                                if request.sections.projection || request.sections.lighting {
-                                    state.project_generation =
-                                        state.project_generation.wrapping_add(1);
-                                }
+                                apply_project_import(&mut state, &request.show, request.sections);
                                 state.import_request = None;
                             }
                         }
@@ -1943,7 +2013,7 @@ impl CuePoolApp {
                         }
                     }
                 }
-                // Go, Stop, Pause, SetLimiterThreshold, SetAudioDevice are handled by main.rs
+                // Transport and audio-output commands are handled by main.rs.
                 other => {
                     unhandled.push(other);
                 }
@@ -2158,6 +2228,65 @@ mod tests {
             });
         }
         assert_eq!(show.cues.len(), 500);
+    }
+
+    #[test]
+    fn selecting_current_audio_driver_is_a_no_op() {
+        let current = cuepool_core::AudioOutputDriver::ASIO;
+        assert!(audio_driver_command(current, current).is_none());
+        assert!(matches!(
+            audio_driver_command(current, cuepool_core::AudioOutputDriver::WASAPI),
+            Some(AppCommand::SetAudioDriver(
+                cuepool_core::AudioOutputDriver::WASAPI
+            ))
+        ));
+    }
+
+    #[test]
+    fn settings_only_import_applies_audio_without_project_reset() {
+        let mut state = SharedState::new();
+        state.project_generation = 7;
+        let mut source = ShowFile::default();
+        source.show_settings.audio_output_driver = cuepool_core::AudioOutputDriver::ASIO;
+        source.show_settings.audio_output_device = "Dante Virtual Soundcard (x64)".into();
+
+        apply_project_import(
+            &mut state,
+            &source,
+            cuepool_core::ImportSections {
+                show_settings: true,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(state.project_generation, 7);
+        assert!(state
+            .command_queue
+            .iter()
+            .any(|command| matches!(command, AppCommand::ApplyAudioSettings)));
+    }
+
+    #[test]
+    fn undo_queues_audio_apply_when_output_settings_change() {
+        let mut state = SharedState::new();
+        state.show_file.show_settings.audio_output_driver = cuepool_core::AudioOutputDriver::ASIO;
+        state.show_file.show_settings.audio_output_device = "ASIO device".into();
+        state.undo_redo.push(Snapshot::from_state(&state));
+        state.show_file.show_settings.audio_output_driver =
+            cuepool_core::AudioOutputDriver::WASAPI;
+        state.show_file.show_settings.audio_output_device = "WASAPI device".into();
+
+        let current = Snapshot::from_state(&state);
+        state.undo_redo.undo(current).unwrap().apply(&mut state);
+
+        assert_eq!(
+            state.show_file.show_settings.audio_output_driver,
+            cuepool_core::AudioOutputDriver::ASIO
+        );
+        assert!(state
+            .command_queue
+            .iter()
+            .any(|command| matches!(command, AppCommand::ApplyAudioSettings)));
     }
 
     #[test]
