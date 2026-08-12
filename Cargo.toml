@@ -21,7 +21,7 @@ flate2 = "1"
 roxmltree = "0.20"
 
 # Audio / Video
-cpal = "0.15"
+cpal = "0.18.1"
 rubato = "0.16"
 symphonia = { version = "0.5", features = ["all"] }
 ffmpeg-next = "8.1"
@@ -40,7 +40,7 @@ rosc = "0.10"
 tokio = { version = "1.42", features = ["rt-multi-thread", "sync", "net", "time", "fs"] }
 
 # MIDI
-midir = "0.10"
+midir = "0.11"
 
 # Threading / Sync
 crossbeam = "0.8"

@@ -75,10 +75,14 @@ fn named_output_devices(
             source,
         })?
         .map(|device| {
-            let name = device.name().map_err(|source| AudioError::DeviceName {
-                driver: driver.name(),
-                source,
-            })?;
+            let name = device
+                .description()
+                .map_err(|source| AudioError::DeviceName {
+                    driver: driver.name(),
+                    source,
+                })?
+                .name()
+                .to_string();
             Ok((name, device))
         })
         .collect()
@@ -190,7 +194,10 @@ impl AudioEngine {
             let engine = match host.default_output_device() {
                 Some(device) => {
                     // The legacy default path opened unnamed devices before driver selection.
-                    let device_name = device.name().unwrap_or_else(|_| "Unknown".into());
+                    let device_name = device
+                        .description()
+                        .map(|description| description.name().to_string())
+                        .unwrap_or_else(|_| "Unknown".into());
                     Self::open(driver, &device, device_name.clone()).map_err(|source| {
                         AudioError::OpenDevice {
                             driver: driver.name(),
@@ -268,11 +275,14 @@ impl AudioEngine {
         device: &cpal::Device,
         device_name: String,
     ) -> Result<Self, AudioError> {
-        let all_configs: Vec<_> = device.supported_output_configs()?.collect();
+        let all_configs: Vec<_> = device
+            .supported_output_configs()
+            .map_err(AudioError::SupportedConfigs)?
+            .collect();
         // Prefer F32, then the integer formats exposed by CPAL's ASIO backend.
         // Within that format choose eight channels, then a larger configuration
-        // before falling back below eight, and 48 kHz. Dante can expose I16/I32
-        // depending on its ASIO encoding.
+        // before falling back below eight, and 48 kHz. Dante can expose
+        // I16/I24/I32 depending on its ASIO encoding.
         let config = select_output_config(&all_configs)
             .ok_or_else(|| AudioError::NoSupportedFormat {
                 available: all_configs
@@ -283,7 +293,7 @@ impl AudioEngine {
             })?;
 
         let sample_format = config.sample_format();
-        let sample_rate = TARGET_RATE.clamp(config.min_sample_rate().0, config.max_sample_rate().0);
+        let sample_rate = TARGET_RATE.clamp(config.min_sample_rate(), config.max_sample_rate());
         let buffer_size = cpal::BufferSize::Default;
         let channels = config.channels();
         let scratch_samples = if sample_format == cpal::SampleFormat::F32 {
@@ -294,7 +304,7 @@ impl AudioEngine {
 
         let config = cpal::StreamConfig {
             channels,
-            sample_rate: cpal::SampleRate(sample_rate),
+            sample_rate,
             buffer_size,
         };
 
@@ -316,8 +326,9 @@ impl AudioEngine {
         let limiter_clone = Arc::clone(&limiter);
 
         let mut scratch = vec![0.0; scratch_samples];
+        let mut oversized_callback_logged = false;
         let stream = device.build_output_stream_raw(
-            &config,
+            config,
             sample_format,
             move |data: &mut cpal::Data, _info: &cpal::OutputCallbackInfo| {
                 match sample_format {
@@ -331,6 +342,16 @@ impl AudioEngine {
                     cpal::SampleFormat::I32 => render_converted::<i32>(
                         data,
                         &mut scratch,
+                        &mut oversized_callback_logged,
+                        &mixer_clone,
+                        &limiter_thresh_clone,
+                        &limiter_clone,
+                        &metering_clone,
+                    ),
+                    cpal::SampleFormat::I24 => render_converted::<cpal::I24>(
+                        data,
+                        &mut scratch,
+                        &mut oversized_callback_logged,
                         &mixer_clone,
                         &limiter_thresh_clone,
                         &limiter_clone,
@@ -339,6 +360,7 @@ impl AudioEngine {
                     cpal::SampleFormat::I16 => render_converted::<i16>(
                         data,
                         &mut scratch,
+                        &mut oversized_callback_logged,
                         &mixer_clone,
                         &limiter_thresh_clone,
                         &limiter_clone,
@@ -351,9 +373,10 @@ impl AudioEngine {
                 log::error!("Audio stream error: {}", err);
             },
             None,
-        )?;
+        );
+        let stream = stream.map_err(AudioError::Cpal)?;
 
-        stream.play()?;
+        stream.play().map_err(AudioError::Play)?;
 
         log::info!(
             "Audio engine started: {} / {} @ {} Hz, {} channels",
@@ -501,18 +524,19 @@ fn sample_format_rank(format: cpal::SampleFormat) -> Option<u8> {
     match format {
         cpal::SampleFormat::F32 => Some(0),
         cpal::SampleFormat::I32 => Some(1),
-        cpal::SampleFormat::I16 => Some(2),
+        cpal::SampleFormat::I24 => Some(2),
+        cpal::SampleFormat::I16 => Some(3),
         _ => None,
     }
 }
 
 fn config_preference(config: &cpal::SupportedStreamConfigRange) -> Option<(u8, (bool, u16), u64)> {
-    let rate_distance = if (config.min_sample_rate().0..=config.max_sample_rate().0)
+    let rate_distance = if (config.min_sample_rate()..=config.max_sample_rate())
         .contains(&TARGET_RATE)
     {
         0
     } else {
-        (config.min_sample_rate().0 as i64 - TARGET_RATE as i64).unsigned_abs() + 1
+        (config.min_sample_rate() as i64 - TARGET_RATE as i64).unsigned_abs() + 1
     };
     Some((
         sample_format_rank(config.sample_format())?,
@@ -567,6 +591,7 @@ fn render_master(
 fn render_converted<T>(
     data: &mut cpal::Data,
     scratch: &mut [f32],
+    oversized_callback_logged: &mut bool,
     mixer: &Mixer,
     limiter_threshold: &AtomicF32,
     limiter: &std::sync::Mutex<Limiter>,
@@ -577,13 +602,30 @@ fn render_converted<T>(
     let output = data
         .as_slice_mut::<T>()
         .expect("CPAL converted output buffer");
+    let scratch_len = scratch.len();
     let Some(scratch) = scratch.get_mut(..output.len()) else {
+        if !std::mem::replace(oversized_callback_logged, true) {
+            log::error!(
+                "Audio {format} callback needs {needed} samples, but the conversion scratch buffer holds {scratch_len}; output silenced",
+                format = T::FORMAT,
+                needed = output.len(),
+            );
+        }
         output.fill(T::EQUILIBRIUM);
         return;
     };
     render_master(scratch, mixer, limiter_threshold, limiter, metering);
-    for (output, sample) in output.iter_mut().zip(scratch) {
-        *output = T::from_sample(*sample);
+    convert_samples(output, scratch);
+}
+
+fn convert_samples<T: SizedSample + FromSample<f32>>(output: &mut [T], input: &[f32]) {
+    for (output, sample) in output.iter_mut().zip(input) {
+        let sample = if T::FORMAT == cpal::SampleFormat::I24 {
+            sample.clamp(-1.0, 1.0 - 1.0 / 8_388_608.0)
+        } else {
+            *sample
+        };
+        *output = T::from_sample(sample);
     }
 }
 
@@ -615,13 +657,13 @@ pub enum AudioError {
     HostUnavailable {
         driver: &'static str,
         #[source]
-        source: cpal::HostUnavailable,
+        source: cpal::Error,
     },
     #[error("could not enumerate {driver} output devices: {source}")]
     EnumerateDevices {
         driver: &'static str,
         #[source]
-        source: cpal::DevicesError,
+        source: cpal::Error,
     },
     #[error("no {driver} output device is available; available devices: {available}")]
     NoOutputDevice {
@@ -638,7 +680,7 @@ pub enum AudioError {
     DeviceName {
         driver: &'static str,
         #[source]
-        source: cpal::DeviceNameError,
+        source: cpal::Error,
     },
     #[error("configured {driver} output device '{device}' could not open: {reason}; available devices: {available}")]
     OpenDevice {
@@ -647,14 +689,14 @@ pub enum AudioError {
         available: String,
         reason: String,
     },
-    #[error("no supported output sample format (F32, I32, or I16); device formats: {available}")]
+    #[error("no supported output sample format (F32, I32, I24, or I16); device formats: {available}")]
     NoSupportedFormat { available: String },
     #[error("cpal error: {0}")]
-    Cpal(#[from] cpal::BuildStreamError),
+    Cpal(cpal::Error),
     #[error("cpal supported configs error: {0}")]
-    SupportedConfigs(#[from] cpal::SupportedStreamConfigsError),
+    SupportedConfigs(cpal::Error),
     #[error("cpal play error: {0}")]
-    Play(#[from] cpal::PlayStreamError),
+    Play(cpal::Error),
 }
 
 #[cfg(test)]
@@ -717,7 +759,43 @@ mod tests {
     fn asio_native_integer_formats_are_supported() {
         assert_eq!(sample_format_rank(cpal::SampleFormat::F32), Some(0));
         assert_eq!(sample_format_rank(cpal::SampleFormat::I32), Some(1));
-        assert_eq!(sample_format_rank(cpal::SampleFormat::I16), Some(2));
+        assert_eq!(sample_format_rank(cpal::SampleFormat::I24), Some(2));
+        assert_eq!(sample_format_rank(cpal::SampleFormat::I16), Some(3));
+    }
+
+    #[test]
+    fn i24_is_selected_over_i16() {
+        let configs = [
+            cpal::SupportedStreamConfigRange::new(
+                8,
+                48_000,
+                48_000,
+                SupportedBufferSize::Range { min: 64, max: 1024 },
+                cpal::SampleFormat::I16,
+            ),
+            cpal::SupportedStreamConfigRange::new(
+                2,
+                44_100,
+                44_100,
+                SupportedBufferSize::Range { min: 64, max: 1024 },
+                cpal::SampleFormat::I24,
+            ),
+        ];
+
+        assert_eq!(
+            select_output_config(&configs).unwrap().sample_format(),
+            cpal::SampleFormat::I24
+        );
+    }
+
+    #[test]
+    fn float_samples_saturate_when_converted_to_cpal_i24() {
+        let mut output = [cpal::I24::default(); 5];
+        convert_samples(&mut output, &[1.0, 1.5, 2.0, -1.0, -1.5]);
+        assert_eq!(
+            output.map(cpal::I24::inner),
+            [8_388_607, 8_388_607, 8_388_607, -8_388_608, -8_388_608]
+        );
     }
 
     #[test]
@@ -736,8 +814,8 @@ mod tests {
         ) -> cpal::SupportedStreamConfigRange {
             cpal::SupportedStreamConfigRange::new(
                 channels,
-                cpal::SampleRate(min_rate),
-                cpal::SampleRate(max_rate),
+                min_rate,
+                max_rate,
                 SupportedBufferSize::Range { min: 64, max: 1024 },
                 format,
             )
@@ -758,13 +836,13 @@ mod tests {
                 .iter()
                 .filter(|config| config.sample_format() == format)
                 .min_by_key(|config| {
-                    let rate_distance = if (config.min_sample_rate().0
-                        ..=config.max_sample_rate().0)
+                    let rate_distance = if (config.min_sample_rate()
+                        ..=config.max_sample_rate())
                         .contains(&TARGET_RATE)
                     {
                         0
                     } else {
-                        (config.min_sample_rate().0 as i64 - TARGET_RATE as i64).unsigned_abs() + 1
+                        (config.min_sample_rate() as i64 - TARGET_RATE as i64).unsigned_abs() + 1
                     };
                     (channel_preference(config.channels()), rate_distance)
                 })
