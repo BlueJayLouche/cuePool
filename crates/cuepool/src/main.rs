@@ -4,9 +4,11 @@
 //! - Video output windows: one render thread per output, each blocking on its
 //!   own display's vsync (Fifo) — ungenlocked outputs never serialize.
 //! - Audio engine: cpal output with master clock for A/V sync
-//! - Video decode: background thread feeding a bounded channel; the main-thread
-//!   tick picks the frame due against the wall-clock video clock and uploads it
-//!   to the shared canvas texture the render threads sample.
+//! - Video decode: background thread feeding a bounded channel; a consume
+//!   thread picks the frame due against the wall-clock video clock and uploads
+//!   it to the shared canvas texture the render threads sample. All non-egui
+//!   GPU work lives on the consume thread (Windows/NVIDIA WSI stalls any
+//!   thread that submits behind vsync-blocked swapchains).
 
 use cuepool_audio::{AudioEngine, FileDecoder, SampleProvider};
 use cuepool_core::{CanvasFit, LockExt, MidiTrigger, MidiTriggerKind, SerializedColour, Timespan};
@@ -160,13 +162,16 @@ fn unpack_size(packed: u64) -> (u32, u32) {
     ((packed >> 32) as u32, packed as u32)
 }
 
-/// Frame content published by the main thread for the output render threads.
+/// Frame content published by the consume thread for the output render threads.
 /// Everything needed to draw one output frame, snapped under one brief lock.
 /// The canvas/overlay TEXTURES are shared GPU resources — new video frames
 /// land in them via queue uploads, so a stable `generation` still shows fresh
 /// content; `generation` only bumps when a field here changes.
 struct OutputFrameState {
     canvas_view: Option<wgpu::TextureView>,
+    /// Linear (non-sRGB) canvas view, read by the winit thread's pixel sampler
+    /// (canvas-source lighting segments). Not used by the render threads.
+    canvas_render_view: Option<wgpu::TextureView>,
     overlay_view: Option<wgpu::TextureView>,
     canvas_size: [u32; 2],
     /// Anything to show (video frame, still image, or text overlay).
@@ -183,6 +188,7 @@ impl Default for OutputFrameState {
     fn default() -> Self {
         Self {
             canvas_view: None,
+            canvas_render_view: None,
             overlay_view: None,
             canvas_size: [0, 0],
             has_content: false,
@@ -190,6 +196,131 @@ impl Default for OutputFrameState {
             identify: false,
             outputs: Vec::new(),
             generation: 0,
+        }
+    }
+}
+
+/// Video playback control shared between the winit thread and the video
+/// consume thread. The winit thread owns user-driven mutations (play, stop,
+/// pause, seek, step, MTC nudges); the consume thread owns the decode-channel
+/// drain, the canvas/overlay textures, and the frame-state publish.
+///
+/// Lock order: this is a LEAF lock — never held while taking the GUI state
+/// lock or the frame bundle lock, and those two are never held while taking
+/// this one. The 1 s step-back `recv_timeout` happens AFTER the request is
+/// taken out and the guard dropped.
+struct VideoControl {
+    /// Current decode channel receiver, installed by `spawn_video_decode` on
+    /// the winit thread and taken out by the consume thread. A new receiver
+    /// means a new stream: the consume thread drops its peeked frame.
+    frame_rx: Option<std::sync::mpsc::Receiver<VideoFrame>>,
+    /// Wall-clock playback anchor (real time = A/V sync reference).
+    clock: Option<Instant>,
+    /// Set while paused, to freeze `clock` across the pause.
+    pause_started: Option<Instant>,
+    /// Mirror of `App::paused`.
+    paused: bool,
+    /// A frame-step was requested while paused: consume one video frame.
+    step_pending: bool,
+    /// PTS of the frame the consume thread has peeked but not yet shown
+    /// (read by `frame_step` on the winit thread).
+    peek_pts: Option<f64>,
+    /// PTS of the most recently consumed frame (frame-step-back anchor).
+    last_pts: Option<f64>,
+    /// Frame-step-back request: the frozen position to snap to once the
+    /// re-seeked decode thread delivers its first frame.
+    step_back: Option<f64>,
+    /// The clock delta a completed step-back applied; the winit thread folds
+    /// it into the show clock (`show_paused_offset`) on its next tick.
+    step_back_delta: Option<f64>,
+    /// Stop-cue picture fade: (start, duration_secs). The winit thread stops
+    /// playback when it completes; the consume thread only reads it for opacity.
+    fade: Option<(Instant, f32)>,
+    /// MTC-hold position mirror (the MTC master owns the position).
+    hold_position: Option<f64>,
+    /// Mirrors of `App::current_video_qid.is_some()` / `current_text_qid.is_some()`.
+    video_active: bool,
+    text_active: bool,
+    /// A frame has been uploaded to the canvas (written by the consume thread,
+    /// cleared by the winit thread on stop/start).
+    canvas_has_frame: bool,
+    /// Identify flash state, refreshed by the winit thread each tick.
+    identify: bool,
+    /// Canvas fit mode for frame uploads, pushed by the winit thread.
+    fit: CanvasFit,
+    /// Live projection outputs, pushed by the winit thread when they change.
+    outputs: Vec<cuepool_core::ProjectorOutput>,
+    outputs_gen: u64,
+    /// Decode-starvation counter (consume → winit diagnostics; swapped out ~1 Hz).
+    starved: u32,
+}
+
+impl Default for VideoControl {
+    fn default() -> Self {
+        Self {
+            frame_rx: None,
+            clock: None,
+            pause_started: None,
+            paused: false,
+            step_pending: false,
+            peek_pts: None,
+            last_pts: None,
+            step_back: None,
+            step_back_delta: None,
+            fade: None,
+            hold_position: None,
+            video_active: false,
+            text_active: false,
+            canvas_has_frame: false,
+            identify: false,
+            fit: CanvasFit::default(),
+            outputs: Vec::new(),
+            outputs_gen: 0,
+            starved: 0,
+        }
+    }
+}
+
+/// Cue-driven canvas/overlay work for the consume thread (rare; the video
+/// frames themselves flow through the decode channel). Keeps every non-egui
+/// GPU call off the winit thread: on Windows+NVIDIA Vulkan WSI, a main-thread
+/// `write_texture`/submit stalls 20-60 ms behind the vsync-blocked render
+/// threads, which dragged the whole event loop to ~10 Hz.
+enum CanvasCommand {
+    /// (Re)create the canvas at this size; the overlay follows its dims.
+    /// `force` recreates even at matching dims (video start clears the last
+    /// frame); otherwise matching dims keep the existing content.
+    Resize { w: u32, h: u32, force: bool },
+    /// Drop both textures (project reset).
+    Drop,
+    /// Blank the canvas to black (text cue with nothing underneath, EOF blank).
+    BlankCanvas,
+    /// Decode a still image file onto the canvas (resolved path).
+    Image(String, CanvasFit),
+    /// Rasterized text block onto the overlay; None clears it.
+    Overlay(Option<(VideoFrame, CanvasFit)>),
+}
+
+/// Raise the Windows timer resolution to 1 ms for the process lifetime.
+/// winit does not do this itself: without it, `ControlFlow::WaitUntil` and
+/// `thread::sleep` quantize to the 15.6 ms default, capping the main-loop tick
+/// and the consume thread's frame pacing at ~64 Hz (and wrecking 50 Hz
+/// cadences). Direct winmm FFI — no crate dependency.
+#[cfg(windows)]
+mod win_timer {
+    #[link(name = "winmm")]
+    unsafe extern "C" {
+        fn timeBeginPeriod(period: u32) -> u32;
+        fn timeEndPeriod(period: u32) -> u32;
+    }
+    pub fn raise() {
+        unsafe {
+            timeBeginPeriod(1);
+        }
+    }
+    pub fn release() {
+        unsafe {
+            timeEndPeriod(1);
         }
     }
 }
@@ -236,27 +367,25 @@ struct App {
     control_config: Option<wgpu::SurfaceConfiguration>,
 
     // ── projection output windows ──
-    canvas_texture: Option<cuepool_video::CanvasTexture>,
-    /// Text layer composited over the canvas in the projection shader.
-    /// Same size as the canvas; transparent where no text.
-    text_overlay: Option<cuepool_video::CanvasTexture>,
     /// The Text cue currently shown on the overlay.
     current_text_qid: Option<rust_decimal::Decimal>,
-    /// GPU YUV420→RGB converter (lazily built; planes uploaded + matrix in-shader).
-    yuv_converter: Option<cuepool_video::YuvConverter>,
     output_windows: Vec<OutputWindow>,
     /// Projection settings the open output windows were built from (effective
     /// outputs). `about_to_wait` rebuilds the windows when the live show file
     /// diverges from this structurally.
     output_windows_built_from: Option<cuepool_core::ProjectionConfig>,
     /// Frame content shared with the per-output render threads. Published by
-    /// `publish_output_frame` each tick; render threads lock it briefly to
-    /// re-snapshot when the generation bumps.
+    /// the consume thread; render threads lock it briefly to re-snapshot when
+    /// the generation bumps.
     frame_state: Arc<Mutex<OutputFrameState>>,
-    /// Set when the canvas/overlay texture is (re)created or dropped, so the
-    /// next publish regenerates the views in the bundle.
-    frame_views_dirty: bool,
-    /// Last projection outputs published to the render threads (change detect).
+    /// Playback control shared with the consume thread (see `VideoControl`).
+    video_control: Arc<Mutex<VideoControl>>,
+    /// Cue-driven canvas/overlay work for the consume thread (rare).
+    canvas_cmd_tx: std::sync::mpsc::Sender<CanvasCommand>,
+    /// Stop signal + handle for the consume thread (joined on graceful exit).
+    consume_stop: Arc<AtomicBool>,
+    consume_join: Option<std::thread::JoinHandle<()>>,
+    /// Last projection outputs pushed to the consume thread (change detect).
     published_outputs: Vec<cuepool_core::ProjectorOutput>,
 
     // ── egui ──
@@ -282,39 +411,20 @@ struct App {
     /// Seconds subtracted from the raw show clock (accumulated pause time,
     /// minus any frame-step advances made while paused).
     show_paused_offset: f64,
-    /// A frame-step was requested while paused: present one video frame.
-    video_step_pending: bool,
     triggered_timecodes: Vec<rust_decimal::Decimal>,
     /// TimeCode cues with a duration currently occupying time.
     active_timecodes: Vec<(rust_decimal::Decimal, std::time::Instant)>,
 
     // ── video playback ──
     event_loop_proxy: winit::event_loop::EventLoopProxy<AppEvent>,
-    /// Receiver for decoded frames. The decode thread is a bounded producer (its
-    /// send blocks when the channel is full); the main-thread tick selects the
-    /// frame whose PTS is due against `video_clock`. Backpressure keeps decode a
-    /// few frames ahead so the due frame is ready when the clock reaches it.
-    video_frame_rx: Option<std::sync::mpsc::Receiver<VideoFrame>>,
-    /// Whether a frame has been uploaded to the canvas (drives `has_video`).
-    canvas_has_frame: bool,
-    /// Monotonic playback clock for the current video. A wall clock = real time,
-    /// which the audio also runs on, so PTS-matching against it keeps A/V in sync
-    /// and plays correct-speed on any display refresh. Frames late vs the clock are
-    /// dropped to catch up; when ahead, the current frame is held.
-    video_clock: Option<std::time::Instant>,
-    /// Set while paused, to freeze `video_clock` across the pause.
-    video_pause_started: Option<std::time::Instant>,
-    /// Next decoded frame, peeked from the channel but not yet due for display.
-    video_peek: Option<VideoFrame>,
-    /// PTS of the most recently presented frame (anchor for frame-step-back).
-    last_video_pts: Option<f64>,
+    /// The decode channel, clock, pause/step/fade state and frame consumption
+    /// live in `video_control` (shared with the consume thread, which owns the
+    /// canvas upload + convert + publish path). The decode thread is a bounded
+    /// producer; backpressure keeps decode a few frames ahead of the clock.
     video_stop_flag: Arc<AtomicBool>,
     video_pause_flag: Arc<AtomicBool>,
     /// QID of the cue whose video is currently playing (for loop sync).
     current_video_qid: Option<rust_decimal::Decimal>,
-    /// Stop-cue picture fade: (start, duration_secs). While set, the canvas is
-    /// rendered at a linearly falling opacity; playback stops when it hits 0.
-    video_fade: Option<(std::time::Instant, f32)>,
     /// Last `SharedState.project_generation` we acted on. A change means a project
     /// was loaded, so the output windows must rebuild for its projection settings.
     last_project_generation: u64,
@@ -330,7 +440,9 @@ struct App {
     identify_until: Option<std::time::Instant>,
     /// Frame-pacing diagnostics, printed once/sec when QPLAYER_FPS_DEBUG is set.
     fps_debug: bool,
-    dbg_starved: u32,
+    /// about_to_wait iterations since the last 1 Hz diagnostics flush — the
+    /// main-loop liveness diagnostic (a GPU-stalled loop shows up here).
+    dbg_ticks: u32,
     dbg_last_log: std::time::Instant,
 
     // ── protocols ──
@@ -517,6 +629,26 @@ impl App {
             }
         }
 
+        // Video consume thread: owns the decode-channel drain, canvas/overlay
+        // textures, YUV convert and the frame-state publish — every non-egui
+        // GPU call. Keeps the winit thread (egui + window lifecycle) free of
+        // the Windows/NVIDIA WSI stall behind the vsync-blocked render threads.
+        let video_control = Arc::new(Mutex::new(VideoControl::default()));
+        let frame_state = Arc::new(Mutex::new(OutputFrameState::default()));
+        let (canvas_cmd_tx, canvas_cmd_rx) = std::sync::mpsc::channel::<CanvasCommand>();
+        let consume_stop = Arc::new(AtomicBool::new(false));
+        let consume_join = {
+            let device = device.clone();
+            let queue = queue.clone();
+            let control = Arc::clone(&video_control);
+            let frame = Arc::clone(&frame_state);
+            let stop = Arc::clone(&consume_stop);
+            std::thread::Builder::new()
+                .name("video-consume".into())
+                .spawn(move || video_consume_thread(device, queue, control, frame, canvas_cmd_rx, stop))
+                .expect("spawn video consume thread")
+        };
+
         Self {
             instance,
             adapter,
@@ -533,32 +665,25 @@ impl App {
             window_ids: None,
             audio_engine,
             event_loop_proxy: proxy,
-            canvas_texture: None,
-            text_overlay: None,
             current_text_qid: None,
-            yuv_converter: None,
             output_windows: Vec::new(),
             output_windows_built_from: None,
-            frame_state: Arc::new(Mutex::new(OutputFrameState::default())),
-            frame_views_dirty: false,
+            frame_state,
+            video_control,
+            canvas_cmd_tx,
+            consume_stop,
+            consume_join: Some(consume_join),
             published_outputs: Vec::new(),
-            video_frame_rx: None,
-            canvas_has_frame: false,
-            video_clock: None,
-            video_pause_started: None,
-            video_peek: None,
-            last_video_pts: None,
             video_stop_flag: Arc::new(AtomicBool::new(false)),
             video_pause_flag: Arc::new(AtomicBool::new(false)),
             current_video_qid: None,
-            video_fade: None,
             last_project_generation: 0,
             last_control_redraw: std::time::Instant::now(),
             last_monitor_set: Vec::new(),
             last_monitor_check: std::time::Instant::now(),
             identify_until: None,
             fps_debug: std::env::var("QPLAYER_FPS_DEBUG").is_ok(),
-            dbg_starved: 0,
+            dbg_ticks: 0,
             dbg_last_log: std::time::Instant::now(),
             osc_manager,
             osc_rx,
@@ -579,7 +704,6 @@ impl App {
             show_start_clock: None,
             show_pause_started: None,
             show_paused_offset: 0.0,
-            video_step_pending: false,
             triggered_timecodes: Vec::new(),
             active_timecodes: Vec::new(),
             modifiers: winit::keyboard::ModifiersState::empty(),
@@ -1179,47 +1303,54 @@ impl App {
                 // Text renders on the overlay layer, over whatever video/image
                 // is playing. With nothing underneath, blank the canvas so a
                 // stale last frame doesn't reappear behind the text.
-                if self.current_video_qid.is_none() && !self.canvas_has_frame {
-                    if let Some(canvas) = self.canvas_texture.as_ref() {
-                        canvas.upload_rgba(
-                            &self.queue,
-                            &vec![0u8; (canvas.width * canvas.height * 4) as usize],
-                        );
-                    }
+                let blank = self.current_video_qid.is_none()
+                    && !self.video_control.lock_unpoisoned().canvas_has_frame;
+                if blank {
+                    let _ = self.canvas_cmd_tx.send(CanvasCommand::BlankCanvas);
                 }
+                let (cw, ch) = {
+                    let state = self.cuepool.state().lock_unpoisoned();
+                    (state.show_file.projection.canvas_width, state.show_file.projection.canvas_height)
+                };
                 let mut shown = false;
-                if let Some(overlay) = self.text_overlay.as_ref() {
-                    match self.rasterize_text_block(
-                        text, *font_size, *font_colour, family, overlay.width, overlay.height, *fit,
-                    ) {
-                        Some(frame) => {
-                            overlay.upload_frame(&self.queue, &frame, *fit);
-                            shown = true;
-                        }
-                        // Empty text: clear the overlay.
-                        None => overlay.upload_rgba(
-                            &self.queue,
-                            &vec![0u8; (overlay.width * overlay.height * 4) as usize],
-                        ),
+                match self.rasterize_text_block(
+                    text, *font_size, *font_colour, family, cw, ch, *fit,
+                ) {
+                    // Rasterizing is CPU/egui work; the texture upload rides the
+                    // consume thread (queued after the Resize above, so the
+                    // overlay exists by then).
+                    Some(frame) => {
+                        let _ = self
+                            .canvas_cmd_tx
+                            .send(CanvasCommand::Overlay(Some((frame, *fit))));
+                        shown = true;
+                    }
+                    // Empty text: clear the overlay.
+                    None => {
+                        let _ = self.canvas_cmd_tx.send(CanvasCommand::Overlay(None));
                     }
                 }
-                self.current_text_qid = shown.then_some(qid);
+                self.set_current_text_qid(shown.then_some(qid));
             }
             cuepool_core::Cue::Image { path, fit, .. } => {
                 log::info!("Go ImageCue Q{}: {}", qid, path);
                 self.ensure_outputs_and_canvas(event_loop);
-                if let Some(canvas) = self.canvas_texture.as_ref() {
-                    let resolved = self.resolve_path(path).unwrap_or_else(|| path.to_string());
-                    if let Err(e) = canvas.upload_image(&self.queue, &resolved, *fit) {
-                        log::error!("Image cue Q{} failed: {e}", qid);
-                    }
-                }
                 // A still replaces video output: clear video playback state so the
-                // render threads don't try to PTS-match against stale frames.
-                self.video_clock = None;
-                self.video_frame_rx = None;
-                self.video_peek = None;
-                self.current_video_qid = Some(qid);
+                // consume thread stops PTS-matching against stale frames (its
+                // receiver drop also retires the decode thread). Cleared BEFORE
+                // sending the upload command so no late video frame lands over it.
+                {
+                    let mut ctl = self.video_control.lock_unpoisoned();
+                    ctl.clock = None;
+                    ctl.frame_rx = None;
+                    ctl.peek_pts = None;
+                    ctl.last_pts = None;
+                }
+                self.set_current_video_qid(Some(qid));
+                let resolved = self.resolve_path(path).unwrap_or_else(|| path.to_string());
+                let _ = self
+                    .canvas_cmd_tx
+                    .send(CanvasCommand::Image(resolved, *fit));
             }
             cuepool_core::Cue::Goto { target_qid, .. } => {
                 log::info!("Go GotoCue Q{} -> arm Q{}", qid, target_qid);
@@ -1382,53 +1513,36 @@ impl App {
         }
     }
 
-    /// Create output windows and a canvas texture if none exist (for Text/Image cues).
+    /// Create output windows if none exist, and make sure the consume thread's
+    /// canvas/overlay match the projection canvas size (for Text/Image cues).
     fn ensure_outputs_and_canvas(&mut self, event_loop: &ActiveEventLoop) {
         if self.output_windows.is_empty() {
             self.create_output_windows(event_loop);
         }
-        let projection = {
+        let (w, h) = {
             let state = self.cuepool.state().lock_unpoisoned();
-            state.show_file.projection.clone()
+            (state.show_file.projection.canvas_width, state.show_file.projection.canvas_height)
         };
-        if let Some(canvas) = self.canvas_texture.as_mut() {
-            if canvas.width != projection.canvas_width || canvas.height != projection.canvas_height {
-                canvas.resize(&self.device, projection.canvas_width, projection.canvas_height);
-                self.frame_views_dirty = true;
-            }
-        } else {
-            self.canvas_texture = Some(cuepool_video::CanvasTexture::new(
-                &self.device,
-                projection.canvas_width,
-                projection.canvas_height,
-            ));
-            self.frame_views_dirty = true;
-        }
-        self.sync_text_overlay(projection.canvas_width, projection.canvas_height);
+        let _ = self.canvas_cmd_tx.send(CanvasCommand::Resize { w, h, force: false });
     }
 
     /// Blank the text overlay and forget the active Text cue.
     fn clear_text_overlay(&mut self) {
-        self.current_text_qid = None;
-        if let Some(overlay) = self.text_overlay.as_ref() {
-            overlay.upload_rgba(
-                &self.queue,
-                &vec![0u8; (overlay.width * overlay.height * 4) as usize],
-            );
-        }
+        self.set_current_text_qid(None);
+        let _ = self.canvas_cmd_tx.send(CanvasCommand::Overlay(None));
     }
 
-    /// Keep the text overlay texture matching the canvas size.
-    fn sync_text_overlay(&mut self, width: u32, height: u32) {
-        if let Some(overlay) = self.text_overlay.as_mut() {
-            if overlay.width != width || overlay.height != height {
-                overlay.resize(&self.device, width, height);
-                self.frame_views_dirty = true;
-            }
-        } else {
-            self.text_overlay = Some(cuepool_video::CanvasTexture::new(&self.device, width, height));
-            self.frame_views_dirty = true;
-        }
+    /// Set the current video cue and mirror its presence to the consume thread
+    /// (drives the published `has_content`).
+    fn set_current_video_qid(&mut self, qid: Option<rust_decimal::Decimal>) {
+        self.current_video_qid = qid;
+        self.video_control.lock_unpoisoned().video_active = qid.is_some();
+    }
+
+    /// Set the current Text cue and mirror its presence to the consume thread.
+    fn set_current_text_qid(&mut self, qid: Option<rust_decimal::Decimal>) {
+        self.current_text_qid = qid;
+        self.video_control.lock_unpoisoned().text_active = qid.is_some();
     }
 
     /// Resolve a Text cue's font path to an egui font family, registering the
@@ -1793,7 +1907,8 @@ impl App {
                     // audio fade); playback stops when the ramp reaches zero.
                     // ponytail: picture ramp is always linear; fade_type only
                     // shapes the audio.
-                    self.video_fade = Some((std::time::Instant::now(), fade_out_time));
+                    self.video_control.lock_unpoisoned().fade =
+                        Some((std::time::Instant::now(), fade_out_time));
                 } else {
                     self.stop_video_playback();
                 }
@@ -2050,36 +2165,34 @@ impl App {
         }
         // A newly-started video should always play, even if the system was paused.
         self.video_pause_flag.store(false, Ordering::Relaxed);
-        self.current_video_qid = Some(qid);
-        self.canvas_has_frame = false;
-        // Start the playback clock now; PTS are matched against it (and frames late
-        // vs the clock are skipped, so video catches up to audio even if decode
-        // open / first-frame took a while).
-        self.video_clock = Some(std::time::Instant::now());
-        self.video_pause_started = None;
-        self.video_peek = None;
-        self.last_video_pts = None;
-        // A new video always starts at full brightness, cancelling any
-        // Stop-cue fade still in flight.
-        self.video_fade = None;
+        self.set_current_video_qid(Some(qid));
 
-        // Create/resize the shared projection canvas. `resize` always recreates
-        // the texture, so the published views must be regenerated either way.
         let projection = {
             let state = self.cuepool.state().lock_unpoisoned();
             state.show_file.projection.clone()
         };
-        if let Some(canvas) = self.canvas_texture.as_mut() {
-            canvas.resize(&self.device, projection.canvas_width, projection.canvas_height);
-        } else {
-            self.canvas_texture = Some(cuepool_video::CanvasTexture::new(
-                &self.device,
-                projection.canvas_width,
-                projection.canvas_height,
-            ));
+        {
+            let mut ctl = self.video_control.lock_unpoisoned();
+            // Start the playback clock now; PTS are matched against it (and frames
+            // late vs the clock are skipped, so video catches up to audio even if
+            // decode open / first-frame took a while).
+            ctl.clock = Some(std::time::Instant::now());
+            ctl.pause_started = None;
+            ctl.peek_pts = None;
+            ctl.last_pts = None;
+            ctl.canvas_has_frame = false;
+            // A new video always starts at full brightness, cancelling any
+            // Stop-cue fade still in flight.
+            ctl.fade = None;
+            ctl.fit = projection.fit;
         }
-        self.frame_views_dirty = true;
-        self.sync_text_overlay(projection.canvas_width, projection.canvas_height);
+        // (Re)create the consume thread's canvas at the projection size; `force`
+        // clears the previous clip's last frame even when the dims match.
+        let _ = self.canvas_cmd_tx.send(CanvasCommand::Resize {
+            w: projection.canvas_width,
+            h: projection.canvas_height,
+            force: true,
+        });
 
         self.spawn_video_decode(path, None);
     }
@@ -2099,12 +2212,14 @@ impl App {
         // opens instead of failing — audio resolved but video didn't.
         let path = self.resolve_path(path).unwrap_or_else(|| path.to_string());
         // Bounded channel = backpressure: the decode thread can't outrun the consumer
-        // (the main-thread tick matching PTS against the wall-clock video clock), so
+        // (the consume thread matching PTS against the wall-clock video clock), so
         // decode runs at real-time rate — no free-running decoder to drift against
         // the clock. The small buffer absorbs decode jitter. Pacing is the wall
         // clock, not the audio clock, so it can't freeze if the audio device sleeps.
         let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<VideoFrame>(VIDEO_QUEUE_CAP);
-        self.video_frame_rx = Some(frame_rx);
+        // Installing a new receiver also tells the consume thread to drop its
+        // peeked frame (new stream, stale PTS).
+        self.video_control.lock_unpoisoned().frame_rx = Some(frame_rx);
         let stop_flag = Arc::clone(&self.video_stop_flag);
         let pause_flag = Arc::clone(&self.video_pause_flag);
         let proxy = self.event_loop_proxy.clone();
@@ -2142,24 +2257,26 @@ impl App {
             ids.video.clear();
         }
         // Drop the canvas so it is recreated at the new project's canvas size.
-        self.canvas_texture = None;
-        self.text_overlay = None;
-        self.current_text_qid = None;
-        self.frame_views_dirty = true;
+        self.set_current_text_qid(None);
+        let _ = self.canvas_cmd_tx.send(CanvasCommand::Drop);
     }
 
     /// Stop video/image playback: signal the decode thread, drop the frame
     /// channel (its send fails with Disconnected and the thread exits), and
-    /// clear presentation state so the next redraw goes black.
+    /// clear presentation state so the next published frame goes black.
     fn stop_video_playback(&mut self) {
         self.video_stop_flag.store(true, Ordering::Relaxed);
-        self.video_frame_rx = None;
-        self.video_clock = None;
-        self.video_peek = None;
-        self.last_video_pts = None;
-        self.canvas_has_frame = false;
-        self.current_video_qid = None;
-        self.video_fade = None;
+        {
+            let mut ctl = self.video_control.lock_unpoisoned();
+            ctl.frame_rx = None;
+            ctl.clock = None;
+            ctl.peek_pts = None;
+            ctl.last_pts = None;
+            ctl.canvas_has_frame = false;
+            ctl.fade = None;
+            ctl.hold_position = None;
+        }
+        self.set_current_video_qid(None);
         self.cuepool.state().lock_unpoisoned().diagnostics.video = None;
     }
 
@@ -2174,6 +2291,7 @@ impl App {
         self.active_timecodes.clear();
         self.reset_show_clock();
         self.paused = false;
+        self.video_control.lock_unpoisoned().paused = false;
         // Halt any in-flight lighting fade; levels hold (blackout is a cue's job).
         self.lighting.stop_fade();
         // Recorded DMX shows stop dead — their channels release to the looks.
@@ -2202,6 +2320,8 @@ impl App {
             .map(|s| s.recent_files.clone())
             .unwrap_or_default();
         save_settings(&AppSettings { recent_files });
+        #[cfg(windows)]
+        win_timer::release();
         std::process::exit(0);
     }
 
@@ -2214,7 +2334,11 @@ impl App {
         }
         self.video_pause_flag.store(true, Ordering::Relaxed);
         self.paused = true;
-        self.video_pause_started = Some(std::time::Instant::now());
+        {
+            let mut ctl = self.video_control.lock_unpoisoned();
+            ctl.paused = true;
+            ctl.pause_started = Some(std::time::Instant::now());
+        }
         // Freeze the show clock — timecode must not advance (or fire) mid-pause.
         if self.show_pause_started.is_none() {
             self.show_pause_started = Some(self.audio_engine.playback_time());
@@ -2233,9 +2357,13 @@ impl App {
         self.paused = false;
         // Advance the playback clock past the paused interval so video resumes where
         // it left off instead of jumping forward.
-        if let Some(t) = self.video_pause_started.take() {
-            if let Some(c) = self.video_clock.as_mut() {
-                *c += t.elapsed();
+        {
+            let mut ctl = self.video_control.lock_unpoisoned();
+            ctl.paused = false;
+            if let Some(t) = ctl.pause_started.take() {
+                if let Some(c) = ctl.clock.as_mut() {
+                    *c += t.elapsed();
+                }
             }
         }
         // Unfreeze the show clock: the paused interval joins the offset.
@@ -2258,15 +2386,16 @@ impl App {
 
     /// The frozen playback position while paused. `clock.elapsed()` keeps
     /// growing through a pause (the interval is only re-added on resume), so
-    /// position math while paused must anchor on `video_pause_started`.
+    /// position math while paused must anchor on `pause_started`.
     /// While an MTC-follow cue is holding (MTC stopped), the hold position
     /// wins over the wall clock — the MTC master owns the position.
     fn video_paused_position(&self) -> Option<Duration> {
         if let Some(h) = self.mtc_follow.as_ref().and_then(|f| f.hold_position) {
             return Some(Duration::from_secs_f64(h.max(0.0)));
         }
-        let clock = self.video_clock?;
-        Some(match self.video_pause_started {
+        let ctl = self.video_control.lock_unpoisoned();
+        let clock = ctl.clock?;
+        Some(match ctl.pause_started {
             Some(paused_at) => paused_at.duration_since(clock),
             None => clock.elapsed(),
         })
@@ -2275,7 +2404,8 @@ impl App {
     /// Shift the video position by `delta_secs` (pure presentation-clock slew;
     /// the decoder is untouched). Positive = further into the clip.
     fn nudge_video_clock(&mut self, delta_secs: f64) {
-        let Some(c) = self.video_clock.as_mut() else { return };
+        let mut ctl = self.video_control.lock_unpoisoned();
+        let Some(c) = ctl.clock.as_mut() else { return };
         if delta_secs >= 0.0 {
             if let Some(shifted) = c.checked_sub(Duration::from_secs_f64(delta_secs)) {
                 *c = shifted;
@@ -2288,7 +2418,7 @@ impl App {
     /// Re-anchor the playback clock so the current position is exactly `target`.
     fn mtc_reanchor(&mut self, target: f64) {
         if let Some(c) = Instant::now().checked_sub(Duration::from_secs_f64(target.max(0.0))) {
-            self.video_clock = Some(c);
+            self.video_control.lock_unpoisoned().clock = Some(c);
         }
     }
 
@@ -2300,7 +2430,6 @@ impl App {
         let path = follow.path.clone();
         log::info!("[MTC] Hard sync Q{} to {:.2}s", follow.qid, target);
         self.spawn_video_decode(&path, Some(target));
-        self.video_peek = None;
         self.mtc_reanchor(target);
     }
 
@@ -2370,6 +2499,7 @@ impl App {
             if let Some(f) = self.mtc_follow.as_mut() {
                 f.hold_position = None;
             }
+            self.video_control.lock_unpoisoned().hold_position = None;
         } else {
             // Running-but-not-playing (full-frame locate) or fully stopped:
             // snap to the target if off, then freeze there.
@@ -2379,6 +2509,7 @@ impl App {
             if let Some(f) = self.mtc_follow.as_mut() {
                 f.hold_position = Some(target);
             }
+            self.video_control.lock_unpoisoned().hold_position = Some(target);
         }
     }
 
@@ -2388,26 +2519,41 @@ impl App {
         if !self.paused {
             return;
         }
-        if let Some(clock) = self.video_clock {
-            if self.video_peek.is_none() {
-                self.video_peek = self.video_frame_rx.as_ref().and_then(|rx| rx.try_recv().ok());
-            }
-            let pos = self.video_paused_position().unwrap_or_default().as_secs_f64();
-            if let Some(f) = self.video_peek.as_ref() {
-                let delta = f.pts - pos;
+        let mut ctl = self.video_control.lock_unpoisoned();
+        if ctl.clock.is_some() {
+            // The next frame's PTS comes from the consume thread's peek mirror
+            // (it owns the channel now). Right after a pause the peek may not
+            // be filled yet — the step just works on the next keypress.
+            // Position math is inlined from the guard: `video_paused_position`
+            // would re-lock this same mutex (non-reentrant).
+            let pos = ctl
+                .hold_position
+                .map(|h| Duration::from_secs_f64(h.max(0.0)))
+                .or_else(|| {
+                    ctl.clock.map(|c| match ctl.pause_started {
+                        Some(p) => p.duration_since(c),
+                        None => c.elapsed(),
+                    })
+                })
+                .unwrap_or_default()
+                .as_secs_f64();
+            if let Some(f_pts) = ctl.peek_pts {
+                let delta = f_pts - pos;
                 if delta > 0.0 {
                     // Moving the clock's epoch back makes the next frame due.
-                    if let Some(c) = clock.checked_sub(Duration::from_secs_f64(delta)) {
-                        self.video_clock = Some(c);
+                    if let Some(c) = ctl.clock.and_then(|c| c.checked_sub(Duration::from_secs_f64(delta)))
+                    {
+                        ctl.clock = Some(c);
                         self.show_paused_offset -= delta;
                     }
                 }
-                self.video_step_pending = true;
+                ctl.step_pending = true;
                 return;
             }
             log::debug!("Frame step: no decoded frame available yet");
             return;
         }
+        drop(ctl);
         // No video: advance the frozen clock by one display frame.
         let fps = {
             let Ok(state) = self.cuepool.state().lock() else { return };
@@ -2418,15 +2564,17 @@ impl App {
 
     /// Step one video frame back while paused. The decoder is forward-only,
     /// so this restarts the decode thread with a seek to just before the
-    /// current frame, then snaps the (frozen) clocks to the delivered frame's
-    /// exact PTS. Without a video playing, rewinds one display frame.
+    /// current frame; the consume thread waits for the delivered frame and
+    /// snaps the (frozen) clock to its exact PTS. Without a video playing,
+    /// rewinds one display frame.
     fn frame_step_back(&mut self) {
         if !self.paused {
             return;
         }
-        if self.video_clock.is_some() {
+        let has_clock = self.video_control.lock_unpoisoned().clock.is_some();
+        if has_clock {
             let pos = self.video_paused_position().unwrap_or_default().as_secs_f64();
-            let cur = self.last_video_pts.unwrap_or(pos);
+            let cur = self.video_control.lock_unpoisoned().last_pts.unwrap_or(pos);
             if cur <= 0.0 {
                 return;
             }
@@ -2444,25 +2592,9 @@ impl App {
                 path
             };
             self.spawn_video_decode(&path, Some(cur));
-            self.video_peek = None;
-            // ponytail: block for the sought frame (we're paused; a single-GOP
-            // decode is well under this) so the clock can snap to its exact pts.
-            let Some(rx) = self.video_frame_rx.as_ref() else { return };
-            match rx.recv_timeout(Duration::from_millis(1000)) {
-                Ok(f) => {
-                    let delta = pos - f.pts;
-                    if delta > 0.0 {
-                        if let Some(clock) = self.video_clock {
-                            // Moving the epoch forward rewinds the paused position.
-                            self.video_clock = Some(clock + Duration::from_secs_f64(delta));
-                            self.show_paused_offset += delta;
-                        }
-                    }
-                    self.video_peek = Some(f);
-                    self.video_step_pending = true;
-                }
-                Err(_) => log::warn!("Frame step back: no frame delivered after seek"),
-            }
+            // The consume thread does the (blocking) wait for the sought frame,
+            // snaps the clock, and reports the delta back for the show clock.
+            self.video_control.lock_unpoisoned().step_back = Some(pos);
             return;
         }
         // No video: rewind the frozen clock by one display frame.
@@ -3288,21 +3420,28 @@ impl App {
                     state: ac.state,
                 }
             }).collect();
+            // Video clock state for the synthesized entry below — read BEFORE
+            // the GUI state lock so the two locks are never held together.
+            let (video_paused, video_pos_secs) = {
+                let ctl = self.video_control.lock_unpoisoned();
+                let pos = match (ctl.clock, ctl.pause_started) {
+                    (Some(clock), Some(paused_at)) => paused_at.duration_since(clock).as_secs_f32(),
+                    (Some(clock), None) => clock.elapsed().as_secs_f32(),
+                    _ => 0.0,
+                };
+                (ctl.pause_started.is_some(), pos)
+            };
             if let Ok(mut state) = self.cuepool.state().lock() {
                 // A video with no audio track (or whose audio failed to open) has
                 // no mixer input and thus no ActiveCue — but it is on screen.
                 // Synthesize a panel entry from the video clock so it still shows
-                // as active. Position comes from `video_clock` (frozen across
+                // as active. Position comes from the video clock (frozen across
                 // pause); length from the cue's duration field when set.
                 if let Some(vqid) = self.current_video_qid {
                     if !gui_active.iter().any(|c| c.qid == vqid) {
                         if let Some(cue) = state.show_file.cues.iter().find(|c| c.base().qid == vqid) {
-                            let paused = self.video_pause_started.is_some();
-                            let position_secs = match (self.video_clock, self.video_pause_started) {
-                                (Some(clock), Some(paused_at)) => paused_at.duration_since(clock).as_secs_f32(),
-                                (Some(clock), None) => clock.elapsed().as_secs_f32(),
-                                _ => 0.0,
-                            };
+                            let paused = video_paused;
+                            let position_secs = video_pos_secs;
                             let dur = match cue {
                                 cuepool_core::Cue::Video { duration, .. } => duration.as_secs_f64() as f32,
                                 _ => 0.0,
@@ -3388,165 +3527,6 @@ impl App {
         // Commands queued during the UI frame drain in tick_engine, which runs
         // in about_to_wait later this same iteration.
     }
-
-    /// Consume decoded frames whose PTS is due and upload the newest to the
-    /// canvas. Runs on the main thread each tick (was the front half of
-    /// render_video); the render threads then sample the shared canvas texture
-    /// on their own vsync.
-    ///
-    /// `video_clock` is a wall clock = real time (the audio runs on the same
-    /// real time), so this keeps A/V in sync and plays correct-speed on any
-    /// display refresh. Frames late vs the clock are dropped to catch up; when
-    /// ahead, the last frame is held (the render threads re-present it).
-    fn consume_due_video_frames(&mut self) {
-        let stepping = std::mem::take(&mut self.video_step_pending);
-        if self.paused && !stepping {
-            return;
-        }
-        // While paused-and-stepping, the target is the frozen position —
-        // clock.elapsed() keeps growing through the pause and would drain
-        // every buffered frame. +1µs absorbs the f64→Duration rounding of
-        // the step's clock adjustment so the frame it made due isn't held.
-        let Some(target) = self
-            .video_paused_position()
-            .map(|t| if stepping { t + Duration::from_micros(1) } else { t })
-        else {
-            return;
-        };
-        let mut newest_due: Option<VideoFrame> = None;
-        loop {
-            if self.video_peek.is_none() {
-                self.video_peek =
-                    self.video_frame_rx.as_ref().and_then(|rx| rx.try_recv().ok());
-            }
-            match self.video_peek.as_ref() {
-                Some(f) if Duration::from_secs_f64(f.pts.max(0.0)) <= target => {
-                    newest_due = self.video_peek.take();
-                }
-                _ => break, // next frame not due yet, or channel empty
-            }
-        }
-        let Some(frame) = newest_due else {
-            if self.video_peek.is_none() {
-                self.dbg_starved += 1;
-            }
-            return;
-        };
-        self.last_video_pts = Some(frame.pts);
-        match frame.pixels {
-            cuepool_video::FramePixels::Rgba(_) => {
-                let fit = self.cuepool.state().lock_unpoisoned().show_file.projection.fit;
-                if let Some(canvas) = self.canvas_texture.as_ref() {
-                    canvas.upload_frame(&self.queue, &frame, fit);
-                }
-            }
-            _ => {
-                // GPU path: upload decoded planes, then run the YUV→RGB convert
-                // as its own standalone submit (no CPU swscale, no 23 MB RGBA
-                // copy). It used to fold into the first output's encoder; with
-                // per-output render threads there is no shared encoder, and the
-                // queue serializes this before any later sampling pass anyway.
-                if self.yuv_converter.is_none() {
-                    self.yuv_converter = Some(cuepool_video::YuvConverter::new(
-                        &self.device,
-                        wgpu::TextureFormat::Rgba8Unorm,
-                    ));
-                }
-                let fit = self.cuepool.state().lock_unpoisoned().show_file.projection.fit;
-                if let (Some(canvas), Some(conv)) =
-                    (self.canvas_texture.as_ref(), self.yuv_converter.as_mut())
-                {
-                    conv.upload(
-                        &self.device,
-                        &self.queue,
-                        &frame,
-                        [canvas.width, canvas.height],
-                        fit,
-                    );
-                    let mut encoder =
-                        self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                            label: Some("canvas-yuv-convert"),
-                        });
-                    conv.encode(&mut encoder, &canvas.render_view());
-                    self.queue.submit(std::iter::once(encoder.finish()));
-                }
-            }
-        }
-        self.canvas_has_frame = true;
-    }
-
-    /// Publish the current frame state to the per-output render threads.
-    /// Runs each tick; the bundle only changes (generation bump) when one of
-    /// its fields actually changed — the video frames themselves flow through
-    /// the shared canvas texture, not the bundle.
-    fn publish_output_frame(&mut self) {
-        // Stop-cue picture fade: ramp the canvas to black over the fade time,
-        // then stop playback for good. Must run before has_content is computed
-        // so the completed fade publishes as the black clear-pass. The render
-        // threads present every vsync, so the ramp animates on its own.
-        let video_opacity = match self.video_fade {
-            Some((start, duration)) => {
-                let t = (start.elapsed().as_secs_f32() / duration).clamp(0.0, 1.0);
-                if t >= 1.0 {
-                    self.stop_video_playback();
-                    0.0
-                } else {
-                    1.0 - t
-                }
-            }
-            None => 1.0,
-        };
-
-        let has_content = self.current_video_qid.is_some()
-            || self.canvas_has_frame
-            || self.current_text_qid.is_some();
-        let identify = self.identify_until.is_some_and(|t| std::time::Instant::now() < t);
-
-        // Live projection outputs ride the bundle (cheap change-detect against
-        // the last publish), so projection-panel edits apply without a rebuild.
-        let outputs_changed = {
-            let state = self.cuepool.state().lock_unpoisoned();
-            let live = &state.show_file.projection.outputs;
-            if *live != self.published_outputs {
-                self.published_outputs = live.clone();
-                true
-            } else {
-                false
-            }
-        };
-
-        let mut frame = self.frame_state.lock_unpoisoned();
-        let mut changed = false;
-        if std::mem::take(&mut self.frame_views_dirty) {
-            frame.canvas_view = self.canvas_texture.as_ref().map(|c| c.view());
-            frame.overlay_view = self.text_overlay.as_ref().map(|t| t.view());
-            frame.canvas_size = self
-                .canvas_texture
-                .as_ref()
-                .map(|c| [c.width, c.height])
-                .unwrap_or([0, 0]);
-            changed = true;
-        }
-        if outputs_changed {
-            frame.outputs = self.published_outputs.clone();
-            changed = true;
-        }
-        if frame.opacity != video_opacity {
-            frame.opacity = video_opacity;
-            changed = true;
-        }
-        if frame.has_content != has_content {
-            frame.has_content = has_content;
-            changed = true;
-        }
-        if frame.identify != identify {
-            frame.identify = identify;
-            changed = true;
-        }
-        if changed {
-            frame.generation += 1;
-        }
-    }
 }
 
 impl ApplicationHandler<AppEvent> for App {
@@ -3598,21 +3578,20 @@ impl ApplicationHandler<AppEvent> for App {
                         }
                         _ => {
                             // OneShot (or cue gone): blank the output to black.
-                            self.current_video_qid = None;
-                            self.video_frame_rx = None;
-                            self.video_clock = None;
-                            self.video_peek = None;
-                            self.canvas_has_frame = false;
+                            self.set_current_video_qid(None);
+                            {
+                                let mut ctl = self.video_control.lock_unpoisoned();
+                                ctl.frame_rx = None;
+                                ctl.clock = None;
+                                ctl.peek_pts = None;
+                                ctl.last_pts = None;
+                                ctl.canvas_has_frame = false;
+                            }
                             self.cuepool.state().lock_unpoisoned().diagnostics.video = None;
                             // Blank the canvas texture too: with a text overlay
                             // active the canvas still renders, and the clip's
                             // last frame must not linger behind the text.
-                            if let Some(canvas) = self.canvas_texture.as_ref() {
-                                canvas.upload_rgba(
-                                    &self.queue,
-                                    &vec![0u8; (canvas.width * canvas.height * 4) as usize],
-                                );
-                            }
+                            let _ = self.canvas_cmd_tx.send(CanvasCommand::BlankCanvas);
                         }
                     }
                 }
@@ -3795,6 +3774,7 @@ impl ApplicationHandler<AppEvent> for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.dbg_ticks += 1;
         // Quit confirmed by the in-app modal — hard-exit (see hard_exit for why).
         if self.cuepool.state().lock().map(|s| s.quit).unwrap_or(false) {
             self.hard_exit();
@@ -3853,7 +3833,14 @@ impl ApplicationHandler<AppEvent> for App {
                 self.upload_pixmap_frames();
                 // Raw (non-sRGB) views: bytes as stored, display-referred —
                 // the colour pipeline's gamma does the linearisation.
-                let canvas_view = self.canvas_texture.as_ref().map(|c| c.render_view());
+                // The canvas lives on the consume thread; its linear view is
+                // republished through the bundle on every recreate.
+                // ponytail: the pixmap/sample GPU calls stay on the winit
+                // thread (they only run when lighting pixel-map segments are
+                // enabled, at the DMX rate — never in the failing video-only
+                // rig config). Upgrade path: move sampling into the consume
+                // thread if a lighting show ever hits the WSI stall.
+                let canvas_view = self.frame_state.lock_unpoisoned().canvas_render_view.clone();
                 let pixmap_view = self.pixmap_texture.as_ref().map(|t| t.render_view());
                 let batch: Vec<(&wgpu::TextureView, u32, [f32; 4], u32, u32)> = cfg
                     .active_segments()
@@ -3938,15 +3925,47 @@ impl ApplicationHandler<AppEvent> for App {
             }
         }
 
-        // Decode-frame consumption (PTS due-selection → canvas upload) and the
-        // frame-state publish for the render threads. The render threads do
-        // the vsync-blocked presenting; this just keeps the canvas current.
-        self.consume_due_video_frames();
-        self.publish_output_frame();
+        // Push winit-side state to the consume thread: canvas fit, changed
+        // projection outputs, identify flag. Also fold in a completed
+        // frame-step-back clock delta and finish a completed stop-cue fade.
+        // (Decode consumption, canvas upload and the frame-state publish all
+        // live on the consume thread — no GPU work happens on this thread.)
+        {
+            let (fit, outputs_changed) = {
+                let state = self.cuepool.state().lock_unpoisoned();
+                let live = &state.show_file.projection;
+                let changed = if live.outputs != self.published_outputs {
+                    self.published_outputs = live.outputs.clone();
+                    Some(self.published_outputs.clone())
+                } else {
+                    None
+                };
+                (live.fit, changed)
+            };
+            let mut ctl = self.video_control.lock_unpoisoned();
+            ctl.fit = fit;
+            if let Some(outputs) = outputs_changed {
+                ctl.outputs = outputs;
+                ctl.outputs_gen += 1;
+            }
+            ctl.identify = self.identify_until.is_some_and(|t| std::time::Instant::now() < t);
+            if let Some(delta) = ctl.step_back_delta.take() {
+                self.show_paused_offset += delta;
+            }
+            let fade_done = ctl
+                .fade
+                .is_some_and(|(start, dur)| start.elapsed().as_secs_f32() >= dur);
+            drop(ctl);
+            if fade_done {
+                self.stop_video_playback();
+            }
+        }
 
         if self.dbg_last_log.elapsed() >= std::time::Duration::from_secs(1) {
             let secs = self.dbg_last_log.elapsed().as_secs_f64();
-            let starved_per_sec = self.dbg_starved as f64 / secs;
+            let starved_per_sec =
+                std::mem::replace(&mut self.video_control.lock_unpoisoned().starved, 0) as f64 / secs;
+            let ticks_per_sec = self.dbg_ticks as f64 / secs;
             // Publish the counters (plus a fresh output snapshot) to the Status
             // window. The output list is rebuilt here rather than patched on
             // create/destroy, so every mutation site stays in sync for free.
@@ -3983,17 +4002,18 @@ impl ApplicationHandler<AppEvent> for App {
                     .collect::<Vec<_>>()
                     .join(" | ");
                 eprintln!(
-                    "VIDEO DIAG: starved {:.0}/s | presented {}",
-                    starved_per_sec, per_output,
+                    "VIDEO DIAG: loop {:.0}/s | starved {:.0}/s | presented {}",
+                    ticks_per_sec, starved_per_sec, per_output,
                 );
             }
             let mut state = self.cuepool.state().lock_unpoisoned();
             let d = &mut state.diagnostics;
             d.presented_per_sec = total_presented;
             d.starved_per_sec = starved_per_sec;
+            d.event_loop_per_sec = ticks_per_sec;
             d.outputs = outputs;
             drop(state);
-            self.dbg_starved = 0;
+            self.dbg_ticks = 0;
             self.dbg_last_log = std::time::Instant::now();
         }
 
@@ -4006,10 +4026,12 @@ impl ApplicationHandler<AppEvent> for App {
             }
         }
 
-        // Main-loop pacing: nothing on this thread blocks on vsync anymore —
-        // each output blocks on its own vsync in its render thread — so
-        // ControlFlow::Poll would free-spin. Wake at ~250 Hz for decode
-        // consumption, fades and UI; OS events still wake the loop instantly.
+        // Main-loop pacing: nothing on this thread blocks on vsync (each output
+        // paces itself in its render thread) and no GPU work happens here
+        // (decode consumption + uploads live on the consume thread) — so
+        // ControlFlow::Poll would free-spin. Wake at ~250 Hz for cue timing and
+        // UI; OS events still wake the loop instantly. On Windows this cadence
+        // needs the 1 ms timer resolution raised at startup (see win_timer).
         event_loop.set_control_flow(ControlFlow::WaitUntil(
             std::time::Instant::now() + std::time::Duration::from_millis(4),
         ));
@@ -4077,6 +4099,302 @@ fn resolve_goto_target(
             Some(cuepool_core::Cue::Goto { target_qid, .. }) => current = *target_qid,
             Some(_) => return Some(current),
             None => return None, // dead end
+        }
+    }
+}
+
+/// Video consume thread: owns the canvas/overlay textures, the YUV converter,
+/// the decode-channel drain and the frame-state publish — every non-egui GPU
+/// call. Moving this off the winit thread is the Windows fix: NVIDIA's Vulkan
+/// WSI serializes a thread's GPU calls behind the vsync-blocked render
+/// threads (20-60 ms per call), which dragged the whole event loop to ~10 Hz.
+///
+/// The loop is paced by the video clock: compute the next due frame's PTS
+/// against the clock, sleep until due, drain due frames, upload the newest,
+/// submit the YUV convert, publish. Paused/idle: a light 2 ms poll so
+/// frame-step/stop stay responsive without busy-spinning.
+///
+/// Lock order: `control` and `frame_state` are both leaf locks, never held
+/// together across GPU calls and never held while sleeping or blocking on
+/// `recv_timeout`.
+fn video_consume_thread(
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    control: Arc<Mutex<VideoControl>>,
+    frame_state: Arc<Mutex<OutputFrameState>>,
+    cmd_rx: std::sync::mpsc::Receiver<CanvasCommand>,
+    stop: Arc<AtomicBool>,
+) {
+    let mut canvas: Option<cuepool_video::CanvasTexture> = None;
+    let mut overlay: Option<cuepool_video::CanvasTexture> = None;
+    let mut yuv_converter: Option<cuepool_video::YuvConverter> = None;
+    // Decode channel taken out of the control struct; None when stopped/EOF.
+    let mut rx: Option<std::sync::mpsc::Receiver<VideoFrame>> = None;
+    // Next decoded frame, peeked but not yet due.
+    let mut peek: Option<VideoFrame> = None;
+    // Live outputs copy (re-cloned only when `outputs_gen` advances).
+    let mut outputs: Vec<cuepool_core::ProjectorOutput> = Vec::new();
+    let mut outputs_gen = 0u64;
+
+    while !stop.load(Ordering::Relaxed) {
+        // ── Cue-driven canvas/overlay commands (rare) ──
+        let mut views_dirty = false;
+        while let Ok(cmd) = cmd_rx.try_recv() {
+            match cmd {
+                CanvasCommand::Resize { w, h, force } => {
+                    if force || canvas.as_ref().is_none_or(|c| c.width != w || c.height != h) {
+                        canvas = Some(cuepool_video::CanvasTexture::new(&device, w, h));
+                        views_dirty = true;
+                    }
+                    if overlay.as_ref().is_none_or(|o| o.width != w || o.height != h) {
+                        overlay = Some(cuepool_video::CanvasTexture::new(&device, w, h));
+                        views_dirty = true;
+                    }
+                }
+                CanvasCommand::Drop => {
+                    canvas = None;
+                    overlay = None;
+                    views_dirty = true;
+                }
+                CanvasCommand::BlankCanvas => {
+                    if let Some(c) = canvas.as_ref() {
+                        c.upload_rgba(&queue, &vec![0u8; (c.width * c.height * 4) as usize]);
+                    }
+                }
+                CanvasCommand::Image(path, fit) => {
+                    if let Some(c) = canvas.as_ref() {
+                        if let Err(e) = c.upload_image(&queue, &path, fit) {
+                            log::error!("Image cue failed to load '{path}': {e}");
+                        }
+                    }
+                }
+                CanvasCommand::Overlay(content) => {
+                    if let Some(ov) = overlay.as_ref() {
+                        match content {
+                            Some((frame, fit)) => ov.upload_frame(&queue, &frame, fit),
+                            None => {
+                                ov.upload_rgba(&queue, &vec![0u8; (ov.width * ov.height * 4) as usize])
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Control handshake: new stream, stop, step-back ──
+        {
+            let mut ctl = control.lock_unpoisoned();
+            // A newly installed receiver = a new stream: take it and drop the
+            // peeked frame (stale PTS).
+            if ctl.frame_rx.is_some() {
+                rx = ctl.frame_rx.take();
+                peek = None;
+                ctl.peek_pts = None;
+            }
+            // Clock cleared (stop / still-image cue): retire the channel so the
+            // decode thread's next send fails and it exits.
+            if ctl.clock.is_none() {
+                rx = None;
+                peek = None;
+                ctl.peek_pts = None;
+            }
+        }
+        // Frame-step-back: wait (blocking, but on THIS thread, so the GUI never
+        // freezes) for the sought frame, snap the frozen clock to its exact
+        // PTS, and report the delta back for the show clock. Taken AFTER the
+        // channel refresh above so we wait on the NEW (re-seeked) receiver.
+        let step_back = control.lock_unpoisoned().step_back.take();
+        if let Some(pos) = step_back {
+            peek = None;
+            let delivered = rx.as_ref().map(|r| r.recv_timeout(Duration::from_millis(1000)));
+            let mut ctl = control.lock_unpoisoned();
+            match delivered {
+                Some(Ok(f)) => {
+                    let delta = pos - f.pts;
+                    if delta > 0.0 {
+                        if let Some(c) = ctl.clock {
+                            // Moving the epoch forward rewinds the paused position.
+                            ctl.clock = Some(c + Duration::from_secs_f64(delta));
+                        }
+                        ctl.step_back_delta = Some(delta);
+                    }
+                    ctl.peek_pts = Some(f.pts);
+                    peek = Some(f);
+                    ctl.step_pending = true;
+                }
+                Some(Err(_)) => log::warn!("Frame step back: no frame delivered after seek"),
+                None => {}
+            }
+        }
+
+        // ── Due-frame selection against the video clock ──
+        let (target, fit) = {
+            let mut ctl = control.lock_unpoisoned();
+            let stepping = std::mem::take(&mut ctl.step_pending);
+            let target = if !ctl.paused || stepping {
+                // While paused-and-stepping, the target is the frozen position —
+                // clock.elapsed() keeps growing through the pause and would drain
+                // every buffered frame. +1µs absorbs the f64→Duration rounding of
+                // the step's clock adjustment so the frame it made due isn't held.
+                let pos = if let Some(h) = ctl.hold_position {
+                    Some(Duration::from_secs_f64(h.max(0.0)))
+                } else {
+                    ctl.clock.map(|clock| match ctl.pause_started {
+                        Some(paused_at) => paused_at.duration_since(clock),
+                        None => clock.elapsed(),
+                    })
+                };
+                pos.map(|t| if stepping { t + Duration::from_micros(1) } else { t })
+            } else {
+                None
+            };
+            (target, ctl.fit)
+        };
+
+        let mut consumed: Option<VideoFrame> = None;
+        if let Some(target) = target {
+            loop {
+                if peek.is_none() {
+                    match rx.as_ref().map(|r| r.try_recv()) {
+                        Some(Ok(f)) => peek = Some(f),
+                        // EOF: the decode thread exited — retire the channel.
+                        Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => rx = None,
+                        _ => {}
+                    }
+                }
+                match peek.as_ref() {
+                    Some(f) if Duration::from_secs_f64(f.pts.max(0.0)) <= target => {
+                        consumed = peek.take();
+                    }
+                    _ => break, // next frame not due yet, or channel empty
+                }
+            }
+        }
+
+        // ── Upload the newest due frame to the canvas (GPU work) ──
+        if let Some(frame) = consumed {
+            match frame.pixels {
+                cuepool_video::FramePixels::Rgba(_) => {
+                    if let Some(c) = canvas.as_ref() {
+                        c.upload_frame(&queue, &frame, fit);
+                    }
+                }
+                _ => {
+                    // GPU path: upload decoded planes, then run the YUV→RGB
+                    // convert as its own standalone submit (no CPU swscale, no
+                    // 23 MB RGBA copy).
+                    if yuv_converter.is_none() {
+                        yuv_converter = Some(cuepool_video::YuvConverter::new(
+                            &device,
+                            wgpu::TextureFormat::Rgba8Unorm,
+                        ));
+                    }
+                    if let (Some(c), Some(conv)) = (canvas.as_ref(), yuv_converter.as_mut()) {
+                        conv.upload(&device, &queue, &frame, [c.width, c.height], fit);
+                        let mut encoder =
+                            device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                                label: Some("canvas-yuv-convert"),
+                            });
+                        conv.encode(&mut encoder, &c.render_view());
+                        queue.submit(std::iter::once(encoder.finish()));
+                    }
+                }
+            }
+            let mut ctl = control.lock_unpoisoned();
+            ctl.last_pts = Some(frame.pts);
+            ctl.canvas_has_frame = true;
+            ctl.peek_pts = peek.as_ref().map(|f| f.pts);
+        } else {
+            let mut ctl = control.lock_unpoisoned();
+            ctl.peek_pts = peek.as_ref().map(|f| f.pts);
+            // Starved: a frame was due (clock running) but the channel is empty.
+            if target.is_some() && peek.is_none() && rx.is_some() {
+                ctl.starved += 1;
+            }
+        }
+
+        // ── Publish the frame-state bundle (change-detect + generation bump) ──
+        {
+            let (opacity, has_content, identify, new_outputs) = {
+                let ctl = control.lock_unpoisoned();
+                // Stop-cue picture fade: ramp to black; the winit thread stops
+                // playback when the ramp completes.
+                let opacity = match ctl.fade {
+                    Some((start, dur)) => {
+                        1.0 - (start.elapsed().as_secs_f32() / dur).clamp(0.0, 1.0)
+                    }
+                    None => 1.0,
+                };
+                let has_content =
+                    ctl.video_active || ctl.canvas_has_frame || ctl.text_active;
+                let new_outputs = if ctl.outputs_gen != outputs_gen {
+                    outputs_gen = ctl.outputs_gen;
+                    Some(ctl.outputs.clone())
+                } else {
+                    None
+                };
+                (opacity, has_content, ctl.identify, new_outputs)
+            };
+            if let Some(o) = new_outputs {
+                outputs = o;
+            }
+            let mut frame = frame_state.lock_unpoisoned();
+            let mut changed = false;
+            if views_dirty {
+                frame.canvas_view = canvas.as_ref().map(|c| c.view());
+                frame.canvas_render_view = canvas.as_ref().map(|c| c.render_view());
+                frame.overlay_view = overlay.as_ref().map(|o| o.view());
+                frame.canvas_size = canvas
+                    .as_ref()
+                    .map(|c| [c.width, c.height])
+                    .unwrap_or([0, 0]);
+                changed = true;
+            }
+            if frame.outputs != outputs {
+                frame.outputs = outputs.clone();
+                changed = true;
+            }
+            if frame.opacity != opacity {
+                frame.opacity = opacity;
+                changed = true;
+            }
+            if frame.has_content != has_content {
+                frame.has_content = has_content;
+                changed = true;
+            }
+            if frame.identify != identify {
+                frame.identify = identify;
+                changed = true;
+            }
+            if changed {
+                frame.generation += 1;
+            }
+        }
+
+        // ── Pace: sleep until the next frame is due, or a light idle poll ──
+        let sleep_for = match target {
+            None => Duration::from_millis(2), // paused/idle: watch for step/stop
+            Some(pos) => match peek.as_ref() {
+                Some(f) => {
+                    let due_in = f.pts.max(0.0) - pos.as_secs_f64();
+                    if due_in <= 0.0 {
+                        Duration::ZERO
+                    } else {
+                        Duration::from_secs_f64(due_in).min(Duration::from_millis(4))
+                    }
+                }
+                // Decode behind (or channel retired): poll quickly / lazily.
+                None => {
+                    if rx.is_some() {
+                        Duration::from_millis(1)
+                    } else {
+                        Duration::from_millis(4)
+                    }
+                }
+            },
+        };
+        if !sleep_for.is_zero() {
+            std::thread::sleep(sleep_for);
         }
     }
 }
@@ -4662,6 +4980,10 @@ fn main() -> anyhow::Result<()> {
 
     cuepool_gui::logging::init_logger();
 
+    // 1 ms timer resolution so WaitUntil/sleep don't quantize to 15.6 ms.
+    #[cfg(windows)]
+    win_timer::raise();
+
     let event_loop = EventLoop::with_user_event().build()?;
     event_loop.set_control_flow(ControlFlow::Poll);
     let proxy = event_loop.create_proxy();
@@ -4726,8 +5048,17 @@ fn main() -> anyhow::Result<()> {
     let recent_files = app.cuepool.state().lock().map(|s| s.recent_files.clone()).unwrap_or_default();
     save_settings(&AppSettings { recent_files });
 
+    // Graceful exit (never reached via hard_exit, which process::exit()s):
+    // stop and join the consume thread like the render threads.
+    app.consume_stop.store(true, Ordering::Relaxed);
+    if let Some(join) = app.consume_join.take() {
+        let _ = join.join();
+    }
     // Signal autosave thread to stop
     app.autosave_running.store(false, Ordering::Relaxed);
+
+    #[cfg(windows)]
+    win_timer::release();
 
     Ok(())
 }

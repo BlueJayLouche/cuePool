@@ -203,6 +203,9 @@ pub struct Diagnostics {
     /// Sum of all outputs' presented/s.
     pub presented_per_sec: f64,
     pub starved_per_sec: f64,
+    /// Main event-loop iterations per second. The field diagnostic for a
+    /// GPU-stalled winit loop (healthy ≈ 250, the Windows WSI stall showed 10).
+    pub event_loop_per_sec: f64,
     pub video: Option<VideoDiagnostics>,
 }
 
@@ -253,6 +256,7 @@ impl Diagnostics {
 
         sections.push(("Render Loop", vec![
             ("Output Count".into(), self.outputs.len().to_string()),
+            ("Event Loop/s".into(), format!("{:.0}", self.event_loop_per_sec)),
             ("Presented/s (all outputs)".into(), format!("{:.0}", self.presented_per_sec)),
             ("Starved/s".into(), format!("{:.0}", self.starved_per_sec)),
         ]));
