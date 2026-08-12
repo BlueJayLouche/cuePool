@@ -22,7 +22,7 @@ use cuepool_protocols::msc::{MscCommandFlags, MscEvent, MscManager};
 use cuepool_protocols::osc::{OscEvent, OscManager};
 use cuepool_video::{VideoFrame, VideoSource};
 use std::net::Ipv4Addr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -2871,11 +2871,9 @@ impl App {
 
         // Open project files directly
         if ext.as_deref() == Some("qproj") {
-            if let Ok(mut state) = self.cuepool.state().lock() {
-                state.command_queue.push(cuepool_gui::AppCommand::OpenProject {
-                    path: path.to_path_buf(),
-                });
-            }
+            self.cuepool.state().lock_unpoisoned().command_queue.push(
+                cuepool_gui::AppCommand::OpenProject { path: path.to_path_buf() },
+            );
             return;
         }
 
@@ -5448,6 +5446,31 @@ fn parse_osc_command(command: &str) -> anyhow::Result<rosc::OscMessage> {
     Ok(rosc::OscMessage { addr, args })
 }
 
+fn resolve_cli_project_path(path: &Path, cwd: &Path) -> Result<PathBuf, String> {
+    let resolved = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+    if !resolved
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("qproj"))
+    {
+        return Err(format!(
+            "Cannot open CLI project '{}': expected a .qproj file",
+            resolved.display()
+        ));
+    }
+    if !resolved.is_file() {
+        return Err(format!(
+            "Cannot open CLI project '{}': path is not an existing file",
+            resolved.display()
+        ));
+    }
+    Ok(resolved)
+}
+
 fn main() -> anyhow::Result<()> {
     // Single instance guard. On unix the name is a filesystem path, and
     // Finder launches apps with cwd=/ (read-only) — use an absolute temp
@@ -5524,12 +5547,35 @@ fn main() -> anyhow::Result<()> {
 
     // Optional CLI: `cuepool path/to/show.qproj` opens a project on startup.
     if let Some(path) = std::env::args_os().nth(1).map(std::path::PathBuf::from) {
-        if path.extension().and_then(|e| e.to_str()) == Some("qproj") && path.exists() {
-            if let Ok(mut state) = app.cuepool.state().lock() {
-                state.command_queue.push(cuepool_gui::AppCommand::OpenProject { path });
-            }
+        let project_path = if path.is_absolute() {
+            resolve_cli_project_path(&path, Path::new("."))
         } else {
-            log::warn!("Ignoring CLI argument (expected an existing .qproj file): {:?}", path);
+            std::env::current_dir()
+                .map_err(|error| {
+                    format!(
+                        "Cannot resolve CLI project '{}': working directory unavailable: {error}",
+                        path.display()
+                    )
+                })
+                .and_then(|cwd| resolve_cli_project_path(&path, &cwd))
+        };
+        match project_path {
+            Ok(path) => {
+                app.cuepool
+                    .state()
+                    .lock_unpoisoned()
+                    .command_queue
+                    .push(AppCommand::OpenProject { path });
+            }
+            Err(message) => {
+                log::error!("{message}");
+                let _ = rfd::MessageDialog::new()
+                    .set_title("Could not open project")
+                    .set_description(message)
+                    .set_level(rfd::MessageLevel::Error)
+                    .set_buttons(rfd::MessageButtons::Ok)
+                    .show();
+            }
         }
     }
 
@@ -5567,6 +5613,46 @@ fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cli_project_test_dir() -> PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("cuepool-cli-path-{}-{unique}", std::process::id()));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn cli_project_path_preserves_absolute_and_resolves_relative_paths() {
+        let cwd = cli_project_test_dir();
+        let relative = PathBuf::from("show files").join("Opening Night.QPROJ");
+        let absolute = cwd.join(&relative);
+        std::fs::create_dir_all(absolute.parent().unwrap()).unwrap();
+        std::fs::write(&absolute, b"{}").unwrap();
+
+        assert!(absolute.is_absolute());
+        assert_eq!(
+            resolve_cli_project_path(&absolute, &cwd),
+            Ok(absolute.clone())
+        );
+        assert_eq!(resolve_cli_project_path(&relative, &cwd), Ok(absolute));
+
+        std::fs::remove_dir_all(cwd).unwrap();
+    }
+
+    #[test]
+    fn missing_cli_project_error_names_resolved_path() {
+        let cwd = cli_project_test_dir();
+        let resolved = cwd.join("missing project.qproj");
+
+        let error = resolve_cli_project_path(Path::new("missing project.qproj"), &cwd).unwrap_err();
+
+        assert!(error.contains(&resolved.display().to_string()), "{error}");
+        std::fs::remove_dir_all(cwd).unwrap();
+    }
 
     #[test]
     fn canvas_commands_coalesce_to_latest_state_after_drop() {
