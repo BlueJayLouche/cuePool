@@ -24,7 +24,7 @@ use cuepool_video::{VideoFrame, VideoSource};
 use std::net::Ipv4Addr;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
@@ -87,8 +87,19 @@ fn monitor_descriptor(m: &winit::monitor::MonitorHandle) -> cuepool_core::Monito
 /// User events sent to the main event loop from background threads.
 #[derive(Debug)]
 enum AppEvent {
-    /// Video stream reached EOF. (Frames travel on a bounded channel, not here.)
-    VideoEof,
+    /// The consume thread uploaded the stream's final due frame.
+    VideoEof(u64),
+    /// An output worker needs winit to recreate its window-owned surface.
+    OutputSurfaceLost(WindowId),
+    /// The shared GPU device is gone; recovery requires rebuilding all resources.
+    DeviceLost,
+}
+
+/// Ordered decode output. EOF follows the final frame through the same bounded
+/// channel so it cannot overtake buffered frames.
+enum VideoMessage {
+    Frame(VideoFrame),
+    Eof,
 }
 
 /// Per-window identifiers so we can route events.
@@ -154,13 +165,25 @@ struct OutputWindow {
 }
 
 impl Drop for OutputWindow {
-    /// Signal the render thread and join it BEFORE the window/surface can die,
-    /// so no thread presents into a torn-down surface. The thread is blocked
-    /// at most one vsync (~20 ms at 50 Hz), so the join is bounded.
+    /// Signal the render thread, but never let a wedged driver call freeze winit.
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(join) = self.join.take() {
-            let _ = join.join();
+            let deadline = Instant::now() + Duration::from_millis(250);
+            while !join.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            if join.is_finished() {
+                let _ = join.join();
+            } else {
+                // Detaching is the lesser evil: the worker owns its Surface and
+                // cloned GPU/state handles. `create_surface(Arc<Window>)` keeps
+                // that window alive until the worker eventually drops the Surface.
+                log::error!(
+                    "Output '{}' render thread did not stop within 250 ms; detaching",
+                    self.output_config.name,
+                );
+            }
         }
     }
 }
@@ -221,10 +244,13 @@ impl Default for OutputFrameState {
 /// this one. The 1 s step-back `recv_timeout` happens AFTER the request is
 /// taken out and the guard dropped.
 struct VideoControl {
+    /// Playback identity. Every play/stop transition invalidates receiver and
+    /// frame work captured under an older epoch.
+    stream_epoch: u64,
     /// Current decode channel receiver, installed by `spawn_video_decode` on
     /// the winit thread and taken out by the consume thread. A new receiver
     /// means a new stream: the consume thread drops its peeked frame.
-    frame_rx: Option<std::sync::mpsc::Receiver<VideoFrame>>,
+    frame_rx: Option<std::sync::mpsc::Receiver<VideoMessage>>,
     /// Wall-clock playback anchor (real time = A/V sync reference).
     clock: Option<Instant>,
     /// Set while paused, to freeze `clock` across the pause.
@@ -269,6 +295,7 @@ struct VideoControl {
 impl Default for VideoControl {
     fn default() -> Self {
         Self {
+            stream_epoch: 0,
             frame_rx: None,
             clock: None,
             pause_started: None,
@@ -312,6 +339,39 @@ enum CanvasCommand {
     Overlay(Option<(VideoFrame, CanvasFit)>),
 }
 
+/// Collapse a drained burst to the latest state setters. Survivors stay in
+/// their original order; `Drop` resets every earlier canvas/overlay command.
+fn coalesce_canvas_commands(commands: impl IntoIterator<Item = CanvasCommand>) -> Vec<CanvasCommand> {
+    let mut pending = Vec::new();
+    for command in commands {
+        if matches!(command, CanvasCommand::Drop) {
+            pending.clear();
+        } else {
+            pending.retain(|earlier| {
+                !matches!(
+                    (&command, earlier),
+                    (CanvasCommand::Resize { .. }, CanvasCommand::Resize { .. })
+                        | (CanvasCommand::Overlay(_), CanvasCommand::Overlay(_))
+                        | (
+                            CanvasCommand::BlankCanvas | CanvasCommand::Image(..),
+                            CanvasCommand::BlankCanvas | CanvasCommand::Image(..)
+                        )
+                )
+            });
+        }
+        pending.push(command);
+    }
+    pending
+}
+
+fn fade_elapsed(start: Instant, pause_started: Option<Instant>) -> Duration {
+    pause_started.unwrap_or_else(Instant::now).saturating_duration_since(start)
+}
+
+fn shift_fade_start_after_pause(start: Instant, pause_started: Instant, resumed_at: Instant) -> Instant {
+    start + resumed_at.saturating_duration_since(start.max(pause_started))
+}
+
 /// Raise the Windows timer resolution to 1 ms for the process lifetime.
 /// winit does not do this itself: without it, `ControlFlow::WaitUntil` and
 /// `thread::sleep` quantize to the 15.6 ms default, capping the main-loop tick
@@ -319,19 +379,25 @@ enum CanvasCommand {
 /// cadences). Direct winmm FFI — no crate dependency.
 #[cfg(windows)]
 mod win_timer {
+    const TIMERR_NOCANDO: u32 = 97;
+
     #[link(name = "winmm")]
-    unsafe extern "C" {
+    unsafe extern "system" {
         fn timeBeginPeriod(period: u32) -> u32;
         fn timeEndPeriod(period: u32) -> u32;
     }
     pub fn raise() {
-        unsafe {
-            timeBeginPeriod(1);
+        if unsafe { timeBeginPeriod(1) } == TIMERR_NOCANDO {
+            log::warn!(
+                "timeBeginPeriod(1) failed: TIMERR_NOCANDO; timer quantization may degrade playback"
+            );
         }
     }
     pub fn release() {
-        unsafe {
-            timeEndPeriod(1);
+        if unsafe { timeEndPeriod(1) } == TIMERR_NOCANDO {
+            log::warn!(
+                "timeEndPeriod(1) failed: TIMERR_NOCANDO; timer-resolution request may remain active"
+            );
         }
     }
 }
@@ -371,6 +437,10 @@ struct App {
     adapter: wgpu::Adapter,
     device: wgpu::Device,
     queue: wgpu::Queue,
+    /// `Surface::configure` takes this exclusively; GPU queue/present cycles
+    /// take it shared. Lock it without `VideoControl` or `frame_state` held;
+    /// configure paths never take either user mutex while holding the gate.
+    configure_gate: Arc<RwLock<()>>,
 
     // ── control window (egui) ──
     control_window: Option<Arc<Window>>,
@@ -396,6 +466,8 @@ struct App {
     /// Stop signal + handle for the consume thread (joined on graceful exit).
     consume_stop: Arc<AtomicBool>,
     consume_join: Option<std::thread::JoinHandle<()>>,
+    /// One-shot guard for the about-to-wait consumer watchdog.
+    consume_failure_reported: bool,
     /// Last projection outputs pushed to the consume thread (change detect).
     published_outputs: Vec<cuepool_core::ProjectorOutput>,
 
@@ -429,6 +501,8 @@ struct App {
     active_timecodes: Vec<(rust_decimal::Decimal, std::time::Instant)>,
 
     // ── video playback ──
+    /// Kept for render threads to request winit-side surface rebuilds; the
+    /// consume thread gets its own clone at construction.
     event_loop_proxy: winit::event_loop::EventLoopProxy<AppEvent>,
     /// The decode channel, clock, pause/step/fade state and frame consumption
     /// live in `video_control` (shared with the consume thread, which owns the
@@ -637,6 +711,7 @@ impl App {
         // the Windows/NVIDIA WSI stall behind the vsync-blocked render threads.
         let video_control = Arc::new(Mutex::new(VideoControl::default()));
         let frame_state = Arc::new(Mutex::new(OutputFrameState::default()));
+        let configure_gate = Arc::new(RwLock::new(()));
         let (canvas_cmd_tx, canvas_cmd_rx) = std::sync::mpsc::channel::<CanvasCommand>();
         let consume_stop = Arc::new(AtomicBool::new(false));
         let consume_join = {
@@ -644,10 +719,23 @@ impl App {
             let queue = queue.clone();
             let control = Arc::clone(&video_control);
             let frame = Arc::clone(&frame_state);
+            let configure_gate = Arc::clone(&configure_gate);
             let stop = Arc::clone(&consume_stop);
+            let proxy = proxy.clone();
             std::thread::Builder::new()
                 .name("video-consume".into())
-                .spawn(move || video_consume_thread(device, queue, control, frame, canvas_cmd_rx, stop))
+                .spawn(move || {
+                    video_consume_thread(
+                        device,
+                        queue,
+                        configure_gate,
+                        control,
+                        frame,
+                        canvas_cmd_rx,
+                        proxy,
+                        stop,
+                    )
+                })
                 .expect("spawn video consume thread")
         };
 
@@ -656,6 +744,7 @@ impl App {
             adapter,
             device,
             queue,
+            configure_gate,
             control_window: None,
             control_surface: None,
             control_config: None,
@@ -675,6 +764,7 @@ impl App {
             canvas_cmd_tx,
             consume_stop,
             consume_join: Some(consume_join),
+            consume_failure_reported: false,
             published_outputs: Vec::new(),
             video_stop_flag: Arc::new(AtomicBool::new(false)),
             video_pause_flag: Arc::new(AtomicBool::new(false)),
@@ -755,7 +845,13 @@ impl App {
         } else if caps.present_modes.contains(&wgpu::PresentMode::Immediate) {
             config.present_mode = wgpu::PresentMode::Immediate;
         }
-        surface.configure(&self.device, &config);
+        {
+            let _configure_guard = self
+                .configure_gate
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            surface.configure(&self.device, &config);
+        }
 
         let egui_state = egui_winit::State::new(
             self.egui_ctx.clone(),
@@ -874,6 +970,7 @@ impl App {
             / windowed_count as f64)
             .max(160.0);
         let mut windowed_idx = 0usize;
+        let mut pending_outputs = Vec::with_capacity(outputs.len());
 
         for (out_idx, output) in outputs.iter().enumerate() {
             let mut attrs = winit::window::WindowAttributes::default()
@@ -935,7 +1032,23 @@ impl App {
             } else {
                 wgpu::PresentMode::Fifo
             };
-            surface.configure(&self.device, &config);
+            if matches!(
+                config.present_mode,
+                wgpu::PresentMode::Mailbox | wgpu::PresentMode::Immediate
+            ) {
+                log::warn!(
+                    "Output '{}' uses {:?}, which free-runs; throttling to ~120 fps for safety",
+                    output.name,
+                    config.present_mode
+                );
+            }
+            {
+                let _configure_guard = self
+                    .configure_gate
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner());
+                surface.configure(&self.device, &config);
+            }
 
             if std::env::var("QPLAYER_FPS_DEBUG").is_ok() {
                 let refresh = window
@@ -961,43 +1074,76 @@ impl App {
                 pixel_perfect,
             );
 
-            let video_id = window.id();
             let size_atomic = Arc::new(AtomicU64::new(pack_size(size.width, size.height)));
             let stop = Arc::new(AtomicBool::new(false));
             let presented = Arc::new(AtomicU32::new(0));
             let present_mode = config.present_mode;
             let format = config.format;
-            let join = {
-                let frame_state = Arc::clone(&self.frame_state);
-                let thread_size = Arc::clone(&size_atomic);
-                let thread_stop = Arc::clone(&stop);
-                let thread_presented = Arc::clone(&presented);
-                let device = self.device.clone();
-                let queue = self.queue.clone();
-                let fallback_output = output.clone();
-                std::thread::Builder::new()
-                    .name(format!("output-render-{}", output.name))
-                    .spawn(move || {
-                        output_render_thread(
-                            surface,
-                            config,
-                            renderer,
-                            device,
-                            queue,
-                            frame_state,
-                            thread_size,
-                            thread_stop,
-                            thread_presented,
-                            out_idx,
-                            fallback_output,
-                        );
-                    })
-                    .expect("spawn output render thread")
-            };
+            pending_outputs.push((
+                out_idx,
+                output.clone(),
+                window,
+                surface,
+                config,
+                renderer,
+                size_atomic,
+                stop,
+                presented,
+                present_mode,
+                format,
+            ));
+        }
+
+        // All surfaces must be configured before any render thread can submit.
+        for (
+            out_idx,
+            output_config,
+            window,
+            surface,
+            config,
+            renderer,
+            size_atomic,
+            stop,
+            presented,
+            present_mode,
+            format,
+        ) in pending_outputs
+        {
+            let video_id = window.id();
+            let frame_state = Arc::clone(&self.frame_state);
+            let configure_gate = Arc::clone(&self.configure_gate);
+            let thread_size = Arc::clone(&size_atomic);
+            let thread_stop = Arc::clone(&stop);
+            let thread_presented = Arc::clone(&presented);
+            let device = self.device.clone();
+            let queue = self.queue.clone();
+            let event_loop_proxy = self.event_loop_proxy.clone();
+            let fallback_output = output_config.clone();
+            let join = std::thread::Builder::new()
+                .name(format!("output-render-{}", output_config.name))
+                .spawn(move || {
+                    output_render_thread(
+                        surface,
+                        config,
+                        renderer,
+                        device,
+                        queue,
+                        configure_gate,
+                        event_loop_proxy,
+                        frame_state,
+                        thread_size,
+                        thread_stop,
+                        thread_presented,
+                        video_id,
+                        out_idx,
+                        fallback_output,
+                    );
+                })
+                .expect("spawn output render thread");
             self.output_windows.push(OutputWindow {
                 id: video_id,
                 window,
-                output_config: output.clone(),
+                output_config,
                 size: size_atomic,
                 stop,
                 presented,
@@ -1345,6 +1491,7 @@ impl App {
                 // sending the upload command so no late video frame lands over it.
                 {
                     let mut ctl = self.video_control.lock_unpoisoned();
+                    ctl.stream_epoch += 1;
                     ctl.clock = None;
                     ctl.frame_rx = None;
                     ctl.peek_pts = None;
@@ -1454,6 +1601,10 @@ impl App {
             let img = img.to_rgba8();
             let (w, h) = (img.width(), img.height());
             self.ensure_pixmap_texture(w, h);
+            let _configure_guard = self
+                .configure_gate
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
             self.pixmap_texture.as_ref().unwrap().upload_frame(
                 &self.queue,
                 &VideoFrame::new(w, h, img.into_raw(), 0.0),
@@ -1493,6 +1644,8 @@ impl App {
         }
         let Some(frame) = latest else { return };
         let (w, h) = (frame.width, frame.height);
+        let configure_gate = Arc::clone(&self.configure_gate);
+        let _configure_guard = configure_gate.read().unwrap_or_else(|e| e.into_inner());
         if frame.rgba().is_some() {
             self.ensure_pixmap_texture(w, h);
             let tex = self.pixmap_texture.as_ref().unwrap();
@@ -2249,7 +2402,6 @@ impl App {
         }
         // A newly-started video should always play, even if the system was paused.
         self.video_pause_flag.store(false, Ordering::Relaxed);
-        self.set_current_video_qid(Some(qid));
 
         let projection = {
             let state = self.cuepool.state().lock_unpoisoned();
@@ -2257,6 +2409,7 @@ impl App {
         };
         {
             let mut ctl = self.video_control.lock_unpoisoned();
+            ctl.stream_epoch += 1;
             // Start the playback clock now; PTS are matched against it (and frames
             // late vs the clock are skipped, so video catches up to audio even if
             // decode open / first-frame took a while).
@@ -2268,8 +2421,12 @@ impl App {
             // A new video always starts at full brightness, cancelling any
             // Stop-cue fade still in flight.
             ctl.fade = None;
+            // A step-back aimed at the previous stream must not replay here
+            // (the epoch gate no longer consumes it against a dead stream).
+            ctl.step_back = None;
             ctl.fit = projection.fit;
         }
+        self.set_current_video_qid(Some(qid));
         // (Re)create the consume thread's canvas at the projection size; `force`
         // clears the previous clip's last frame even when the dims match.
         let _ = self.canvas_cmd_tx.send(CanvasCommand::Resize {
@@ -2300,19 +2457,23 @@ impl App {
         // decode runs at real-time rate — no free-running decoder to drift against
         // the clock. The small buffer absorbs decode jitter. Pacing is the wall
         // clock, not the audio clock, so it can't freeze if the audio device sleeps.
-        let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<VideoFrame>(VIDEO_QUEUE_CAP);
+        let (frame_tx, frame_rx) =
+            std::sync::mpsc::sync_channel::<VideoMessage>(VIDEO_QUEUE_CAP);
         // Installing a new receiver also tells the consume thread to drop its
-        // peeked frame (new stream, stale PTS).
-        self.video_control.lock_unpoisoned().frame_rx = Some(frame_rx);
+        // peeked frame and invalidates EOF already queued by the old decoder.
+        {
+            let mut ctl = self.video_control.lock_unpoisoned();
+            ctl.stream_epoch += 1;
+            ctl.frame_rx = Some(frame_rx);
+        }
         let stop_flag = Arc::clone(&self.video_stop_flag);
         let pause_flag = Arc::clone(&self.video_pause_flag);
-        let proxy = self.event_loop_proxy.clone();
         let diag_state = Arc::clone(self.cuepool.state());
 
         std::thread::Builder::new()
             .name("video-decode".into())
             .spawn(move || {
-                video_decode_thread(&path, start_before, stop_flag, pause_flag, frame_tx, proxy, diag_state);
+                video_decode_thread(&path, start_before, stop_flag, pause_flag, frame_tx, diag_state);
             })
             .expect("spawn video decode thread");
     }
@@ -2352,6 +2513,7 @@ impl App {
         self.video_stop_flag.store(true, Ordering::Relaxed);
         {
             let mut ctl = self.video_control.lock_unpoisoned();
+            ctl.stream_epoch += 1;
             ctl.frame_rx = None;
             ctl.clock = None;
             ctl.peek_pts = None;
@@ -2359,6 +2521,7 @@ impl App {
             ctl.canvas_has_frame = false;
             ctl.fade = None;
             ctl.hold_position = None;
+            ctl.step_back = None;
         }
         self.set_current_video_qid(None);
         self.cuepool.state().lock_unpoisoned().diagnostics.video = None;
@@ -2387,7 +2550,12 @@ impl App {
         self.pixmap_frame_rx = None;
         if let Some(tex) = self.pixmap_texture.as_ref() {
             let (w, h) = (tex.width, tex.height);
-            tex.upload_rgba(&self.queue, &vec![0u8; (w * h * 4) as usize]);
+            let blank = vec![0u8; (w * h * 4) as usize];
+            let _configure_guard = self
+                .configure_gate
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            tex.upload_rgba(&self.queue, &blank);
         }
         self.clear_text_overlay();
         // The render threads present every vsync, so the cleared/black state
@@ -2447,8 +2615,12 @@ impl App {
             let mut ctl = self.video_control.lock_unpoisoned();
             ctl.paused = false;
             if let Some(t) = ctl.pause_started.take() {
+                let resumed_at = std::time::Instant::now();
                 if let Some(c) = ctl.clock.as_mut() {
-                    *c += t.elapsed();
+                    *c += resumed_at.saturating_duration_since(t);
+                }
+                if let Some((start, _)) = ctl.fade.as_mut() {
+                    *start = shift_fade_start_after_pause(*start, t, resumed_at);
                 }
             }
         }
@@ -3478,21 +3650,58 @@ impl App {
         self.update_window_title();
         // Read before egui_state's mutable borrow below (E0502 otherwise).
         let sample_rate = (self.audio_sample_rate() as f64).max(1.0);
-        let Some(surface) = self.control_surface.as_ref() else { return };
-        let Some(config) = self.control_config.as_ref() else { return };
-        let Some(window) = self.control_window.as_ref() else { return };
-        let Some(egui_state) = self.egui_state.as_mut() else { return };
-        let Some(egui_renderer) = self.egui_renderer.as_mut() else { return };
 
+        // Acquire (under the shared gate) BEFORE running the egui pass: bailing
+        // out after `run` would discard its texture deltas and desync the atlas.
+        let submit_guard = self
+            .configure_gate
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        let Some(surface) = self.control_surface.as_ref() else { return };
         let output = match surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(o) | wgpu::CurrentSurfaceTexture::Suboptimal(o) => o,
             // Control window covered/minimized — skip this frame quietly (no spam).
             wgpu::CurrentSurfaceTexture::Occluded => return,
+            wgpu::CurrentSurfaceTexture::Outdated => {
+                drop(submit_guard);
+                log::debug!("Control surface outdated, reconfiguring");
+                let Some(surface) = self.control_surface.as_ref() else { return };
+                let Some(config) = self.control_config.as_ref() else { return };
+                let _configure_guard = self
+                    .configure_gate
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner());
+                surface.configure(&self.device, config);
+                return;
+            }
+            wgpu::CurrentSurfaceTexture::Lost => {
+                drop(submit_guard);
+                log::warn!("Control surface lost, recreating");
+                let Some(window) = self.control_window.as_ref() else { return };
+                let Some(config) = self.control_config.as_ref() else { return };
+                let surface = self
+                    .instance
+                    .create_surface(Arc::clone(window))
+                    .expect("recreate control surface");
+                {
+                    let _configure_guard = self
+                        .configure_gate
+                        .write()
+                        .unwrap_or_else(|e| e.into_inner());
+                    surface.configure(&self.device, config);
+                }
+                self.control_surface = Some(surface);
+                return;
+            }
             err => {
                 log::warn!("Control surface acquire failed: {err:?}");
                 return;
             }
         };
+        let Some(config) = self.control_config.as_ref() else { return };
+        let Some(window) = self.control_window.as_ref() else { return };
+        let Some(egui_state) = self.egui_state.as_mut() else { return };
+        let Some(egui_renderer) = self.egui_renderer.as_mut() else { return };
         let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         let raw_input = egui_state.take_egui_input(window);
@@ -3597,11 +3806,11 @@ impl App {
             pixels_per_point: window.scale_factor() as f32 * self.egui_ctx.zoom_factor(),
         };
 
+        let paint_jobs = self.egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("control-encoder"),
         });
 
-        let paint_jobs = self.egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
         for (id, image_delta) in &full_output.textures_delta.set {
             egui_renderer.update_texture(&self.device, &self.queue, *id, image_delta);
         }
@@ -3643,7 +3852,12 @@ impl ApplicationHandler<AppEvent> for App {
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: AppEvent) {
         match event {
-            AppEvent::VideoEof => {
+            AppEvent::VideoEof(epoch) => {
+                let current_epoch = self.video_control.lock_unpoisoned().stream_epoch;
+                if epoch != current_epoch {
+                    log::debug!("Ignoring stale video EOF epoch {epoch} (current {current_epoch})");
+                    return;
+                }
                 log::info!("Video EOF");
                 // MTC follow: hold the last frame on the canvas past the end —
                 // looping, re-locating and blanking are all owned by the MTC
@@ -3683,16 +3897,7 @@ impl ApplicationHandler<AppEvent> for App {
                         }
                         _ => {
                             // OneShot (or cue gone): blank the output to black.
-                            self.set_current_video_qid(None);
-                            {
-                                let mut ctl = self.video_control.lock_unpoisoned();
-                                ctl.frame_rx = None;
-                                ctl.clock = None;
-                                ctl.peek_pts = None;
-                                ctl.last_pts = None;
-                                ctl.canvas_has_frame = false;
-                            }
-                            self.cuepool.state().lock_unpoisoned().diagnostics.video = None;
+                            self.stop_video_playback();
                             // Blank the canvas texture too: with a text overlay
                             // active the canvas still renders, and the clip's
                             // last frame must not linger behind the text.
@@ -3700,6 +3905,16 @@ impl ApplicationHandler<AppEvent> for App {
                         }
                     }
                 }
+            }
+            AppEvent::OutputSurfaceLost(window_id) => {
+                if self.output_windows.iter().any(|out| out.id == window_id) {
+                    log::warn!("Output surface lost — rebuilding output windows");
+                    self.create_output_windows(event_loop);
+                }
+            }
+            AppEvent::DeviceLost => {
+                log::error!("GPU device lost; CuePool cannot recover without a restart — exiting");
+                event_loop.exit();
             }
         }
     }
@@ -3751,6 +3966,10 @@ impl ApplicationHandler<AppEvent> for App {
                         }
                         if let Some(surface) = self.control_surface.as_ref() {
                             if let Some(config) = self.control_config.as_ref() {
+                                let _configure_guard = self
+                                    .configure_gate
+                                    .write()
+                                    .unwrap_or_else(|e| e.into_inner());
                                 surface.configure(&self.device, config);
                             }
                         }
@@ -3885,6 +4104,15 @@ impl ApplicationHandler<AppEvent> for App {
             self.hard_exit();
         }
 
+        if !self.consume_failure_reported
+            && self.consume_join.as_ref().is_some_and(|join| join.is_finished())
+        {
+            const ERROR: &str = "video-consume thread exited unexpectedly; video output is frozen";
+            self.consume_failure_reported = true;
+            log::error!("{ERROR}");
+            self.cuepool.state().lock_unpoisoned().diagnostics.consumer_error = Some(ERROR.into());
+        }
+
         // A new or loaded project bumps project_generation — stop the old project's
         // cues and close its output windows.
         let project_generation = self.cuepool.state().lock_unpoisoned().project_generation;
@@ -3960,6 +4188,7 @@ impl ApplicationHandler<AppEvent> for App {
                     .collect();
                 if !batch.is_empty() {
                     self.last_pixel_sample = Instant::now();
+                    let configure_gate = Arc::clone(&self.configure_gate);
                     let sampler = self
                         .pixel_sampler
                         .get_or_insert_with(|| cuepool_video::PixelSampler::new(&self.device));
@@ -3975,6 +4204,8 @@ impl ApplicationHandler<AppEvent> for App {
                             self.lighting.set_segment_pixels(id, cols, rows, rgba);
                         }
                     }
+                    let _configure_guard =
+                        configure_gate.read().unwrap_or_else(|e| e.into_inner());
                     sampler.sample(&self.device, &self.queue, &batch);
                 }
             }
@@ -4060,7 +4291,7 @@ impl ApplicationHandler<AppEvent> for App {
             }
             let fade_done = ctl
                 .fade
-                .is_some_and(|(start, dur)| start.elapsed().as_secs_f32() >= dur);
+                .is_some_and(|(start, dur)| fade_elapsed(start, ctl.pause_started).as_secs_f32() >= dur);
             drop(ctl);
             if fade_done {
                 self.stop_video_playback();
@@ -4226,16 +4457,20 @@ fn resolve_goto_target(
 fn video_consume_thread(
     device: wgpu::Device,
     queue: wgpu::Queue,
+    configure_gate: Arc<RwLock<()>>,
     control: Arc<Mutex<VideoControl>>,
     frame_state: Arc<Mutex<OutputFrameState>>,
     cmd_rx: std::sync::mpsc::Receiver<CanvasCommand>,
+    proxy: winit::event_loop::EventLoopProxy<AppEvent>,
     stop: Arc<AtomicBool>,
 ) {
     let mut canvas: Option<cuepool_video::CanvasTexture> = None;
     let mut overlay: Option<cuepool_video::CanvasTexture> = None;
     let mut yuv_converter: Option<cuepool_video::YuvConverter> = None;
     // Decode channel taken out of the control struct; None when stopped/EOF.
-    let mut rx: Option<std::sync::mpsc::Receiver<VideoFrame>> = None;
+    let mut rx: Option<std::sync::mpsc::Receiver<VideoMessage>> = None;
+    // Epoch captured with `rx`; all frame work is discarded if control moves on.
+    let mut rx_epoch: Option<u64> = None;
     // Next decoded frame, peeked but not yet due.
     let mut peek: Option<VideoFrame> = None;
     // Live outputs copy (re-cloned only when `outputs_gen` advances).
@@ -4245,7 +4480,7 @@ fn video_consume_thread(
     while !stop.load(Ordering::Relaxed) {
         // ── Cue-driven canvas/overlay commands (rare) ──
         let mut views_dirty = false;
-        while let Ok(cmd) = cmd_rx.try_recv() {
+        for cmd in coalesce_canvas_commands(cmd_rx.try_iter()) {
             match cmd {
                 CanvasCommand::Resize { w, h, force } => {
                     if force || canvas.as_ref().is_none_or(|c| c.width != w || c.height != h) {
@@ -4264,22 +4499,47 @@ fn video_consume_thread(
                 }
                 CanvasCommand::BlankCanvas => {
                     if let Some(c) = canvas.as_ref() {
-                        c.upload_rgba(&queue, &vec![0u8; (c.width * c.height * 4) as usize]);
+                        let blank = vec![0u8; (c.width * c.height * 4) as usize];
+                        let _configure_guard =
+                            configure_gate.read().unwrap_or_else(|e| e.into_inner());
+                        c.upload_rgba(&queue, &blank);
                     }
                 }
                 CanvasCommand::Image(path, fit) => {
                     if let Some(c) = canvas.as_ref() {
-                        if let Err(e) = c.upload_image(&queue, &path, fit) {
-                            log::error!("Image cue failed to load '{path}': {e}");
+                        match image::open(&path) {
+                            Ok(image) => {
+                                let image = image.to_rgba8();
+                                let frame = VideoFrame::new(
+                                    image.width(),
+                                    image.height(),
+                                    image.into_raw(),
+                                    0.0,
+                                );
+                                let _configure_guard = configure_gate
+                                    .read()
+                                    .unwrap_or_else(|e| e.into_inner());
+                                c.upload_frame(&queue, &frame, fit);
+                            }
+                            Err(e) => log::error!("Image cue failed to load '{path}': {e}"),
                         }
                     }
                 }
                 CanvasCommand::Overlay(content) => {
                     if let Some(ov) = overlay.as_ref() {
                         match content {
-                            Some((frame, fit)) => ov.upload_frame(&queue, &frame, fit),
+                            Some((frame, fit)) => {
+                                let _configure_guard = configure_gate
+                                    .read()
+                                    .unwrap_or_else(|e| e.into_inner());
+                                ov.upload_frame(&queue, &frame, fit);
+                            }
                             None => {
-                                ov.upload_rgba(&queue, &vec![0u8; (ov.width * ov.height * 4) as usize])
+                                let blank = vec![0u8; (ov.width * ov.height * 4) as usize];
+                                let _configure_guard = configure_gate
+                                    .read()
+                                    .unwrap_or_else(|e| e.into_inner());
+                                ov.upload_rgba(&queue, &blank)
                             }
                         }
                     }
@@ -4287,13 +4547,22 @@ fn video_consume_thread(
             }
         }
 
+        let mut eof_epoch = None;
+
         // ── Control handshake: new stream, stop, step-back ──
         {
             let mut ctl = control.lock_unpoisoned();
+            if rx_epoch.is_some_and(|epoch| epoch != ctl.stream_epoch) {
+                rx = None;
+                rx_epoch = None;
+                peek = None;
+                ctl.peek_pts = None;
+            }
             // A newly installed receiver = a new stream: take it and drop the
             // peeked frame (stale PTS).
-            if ctl.frame_rx.is_some() {
-                rx = ctl.frame_rx.take();
+            if let Some(new_rx) = ctl.frame_rx.take() {
+                rx = Some(new_rx);
+                rx_epoch = Some(ctl.stream_epoch);
                 peek = None;
                 ctl.peek_pts = None;
             }
@@ -4301,6 +4570,7 @@ fn video_consume_thread(
             // decode thread's next send fails and it exits.
             if ctl.clock.is_none() {
                 rx = None;
+                rx_epoch = None;
                 peek = None;
                 ctl.peek_pts = None;
             }
@@ -4309,35 +4579,51 @@ fn video_consume_thread(
         // freezes) for the sought frame, snap the frozen clock to its exact
         // PTS, and report the delta back for the show clock. Taken AFTER the
         // channel refresh above so we wait on the NEW (re-seeked) receiver.
-        let step_back = control.lock_unpoisoned().step_back.take();
+        let step_back = {
+            let mut ctl = control.lock_unpoisoned();
+            (rx_epoch == Some(ctl.stream_epoch))
+                .then(|| ctl.step_back.take())
+                .flatten()
+        };
         if let Some(pos) = step_back {
             peek = None;
             let delivered = rx.as_ref().map(|r| r.recv_timeout(Duration::from_millis(1000)));
             let mut ctl = control.lock_unpoisoned();
-            match delivered {
-                Some(Ok(f)) => {
-                    let delta = pos - f.pts;
-                    if delta > 0.0 {
-                        if let Some(c) = ctl.clock {
-                            // Moving the epoch forward rewinds the paused position.
-                            ctl.clock = Some(c + Duration::from_secs_f64(delta));
+            if rx_epoch != Some(ctl.stream_epoch) {
+                rx = None;
+                rx_epoch = None;
+            } else {
+                match delivered {
+                    Some(Ok(VideoMessage::Frame(f))) => {
+                        let delta = pos - f.pts;
+                        if delta > 0.0 {
+                            if let Some(c) = ctl.clock {
+                                // Moving the epoch forward rewinds the paused position.
+                                ctl.clock = Some(c + Duration::from_secs_f64(delta));
+                            }
+                            ctl.step_back_delta = Some(delta);
                         }
-                        ctl.step_back_delta = Some(delta);
+                        ctl.peek_pts = Some(f.pts);
+                        peek = Some(f);
+                        ctl.step_pending = true;
                     }
-                    ctl.peek_pts = Some(f.pts);
-                    peek = Some(f);
-                    ctl.step_pending = true;
+                    Some(Ok(VideoMessage::Eof)) => {
+                        rx = None;
+                        eof_epoch = rx_epoch;
+                        ctl.peek_pts = None;
+                    }
+                    Some(Err(_)) => log::warn!("Frame step back: no frame delivered after seek"),
+                    None => {}
                 }
-                Some(Err(_)) => log::warn!("Frame step back: no frame delivered after seek"),
-                None => {}
             }
         }
 
         // ── Due-frame selection against the video clock ──
         let (target, fit) = {
             let mut ctl = control.lock_unpoisoned();
-            let stepping = std::mem::take(&mut ctl.step_pending);
-            let target = if !ctl.paused || stepping {
+            let stream_current = rx_epoch == Some(ctl.stream_epoch);
+            let stepping = stream_current && std::mem::take(&mut ctl.step_pending);
+            let target = if stream_current && (!ctl.paused || stepping) {
                 // While paused-and-stepping, the target is the frozen position —
                 // clock.elapsed() keeps growing through the pause and would drain
                 // every buffered frame. +1µs absorbs the f64→Duration rounding of
@@ -4357,13 +4643,31 @@ fn video_consume_thread(
             (target, ctl.fit)
         };
 
+        // Keep one frame peeked while paused, and notice an immediately-following
+        // EOF even without a running target clock. A future frame still holds EOF
+        // behind it until playback resumes and presents that frame.
+        if peek.is_none() && eof_epoch.is_none() {
+            match rx.as_ref().map(|r| r.try_recv()) {
+                Some(Ok(VideoMessage::Frame(f))) => peek = Some(f),
+                Some(Ok(VideoMessage::Eof)) => {
+                    rx = None;
+                    eof_epoch = rx_epoch;
+                }
+                Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => rx = None,
+                _ => {}
+            }
+        }
+
         let mut consumed: Option<VideoFrame> = None;
         if let Some(target) = target {
             loop {
                 if peek.is_none() {
                     match rx.as_ref().map(|r| r.try_recv()) {
-                        Some(Ok(f)) => peek = Some(f),
-                        // EOF: the decode thread exited — retire the channel.
+                        Some(Ok(VideoMessage::Frame(f))) => peek = Some(f),
+                        Some(Ok(VideoMessage::Eof)) => {
+                            rx = None;
+                            eof_epoch = rx_epoch;
+                        }
                         Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => rx = None,
                         _ => {}
                     }
@@ -4377,11 +4681,25 @@ fn video_consume_thread(
             }
         }
 
+        // Check immediately before GPU work without holding the control lock
+        // across uploads/submits. The write-back below checks again afterward.
+        if consumed.is_some()
+            && rx_epoch.is_none_or(|epoch| control.lock_unpoisoned().stream_epoch != epoch)
+        {
+            consumed = None;
+            rx = None;
+            rx_epoch = None;
+            peek = None;
+            eof_epoch = None;
+        }
+
         // ── Upload the newest due frame to the canvas (GPU work) ──
         if let Some(frame) = consumed {
             match frame.pixels {
                 cuepool_video::FramePixels::Rgba(_) => {
                     if let Some(c) = canvas.as_ref() {
+                        let _configure_guard =
+                            configure_gate.read().unwrap_or_else(|e| e.into_inner());
                         c.upload_frame(&queue, &frame, fit);
                     }
                 }
@@ -4396,6 +4714,8 @@ fn video_consume_thread(
                         ));
                     }
                     if let (Some(c), Some(conv)) = (canvas.as_ref(), yuv_converter.as_mut()) {
+                        let _configure_guard =
+                            configure_gate.read().unwrap_or_else(|e| e.into_inner());
                         conv.upload(&device, &queue, &frame, [c.width, c.height], fit);
                         let mut encoder =
                             device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -4407,16 +4727,45 @@ fn video_consume_thread(
                 }
             }
             let mut ctl = control.lock_unpoisoned();
-            ctl.last_pts = Some(frame.pts);
-            ctl.canvas_has_frame = true;
-            ctl.peek_pts = peek.as_ref().map(|f| f.pts);
-        } else {
-            let mut ctl = control.lock_unpoisoned();
-            ctl.peek_pts = peek.as_ref().map(|f| f.pts);
-            // Starved: a frame was due (clock running) but the channel is empty.
-            if target.is_some() && peek.is_none() && rx.is_some() {
-                ctl.starved += 1;
+            if rx_epoch == Some(ctl.stream_epoch) {
+                ctl.last_pts = Some(frame.pts);
+                ctl.canvas_has_frame = true;
+                ctl.peek_pts = peek.as_ref().map(|f| f.pts);
+            } else {
+                drop(ctl);
+                rx = None;
+                rx_epoch = None;
+                peek = None;
+                eof_epoch = None;
             }
+        } else if let Some(epoch) = rx_epoch {
+            let mut ctl = control.lock_unpoisoned();
+            if ctl.stream_epoch == epoch {
+                ctl.peek_pts = peek.as_ref().map(|f| f.pts);
+                // Starved: a frame was due (clock running) but the channel is empty.
+                if target.is_some() && peek.is_none() && rx.is_some() {
+                    ctl.starved += 1;
+                }
+            } else {
+                drop(ctl);
+                rx = None;
+                rx_epoch = None;
+                peek = None;
+                eof_epoch = None;
+            }
+        }
+
+        // The marker is observed only after every preceding frame has left the
+        // FIFO. Emit after the final due upload/write-back, tagged for winit.
+        if let Some(epoch) = eof_epoch {
+            if rx_epoch == Some(epoch) {
+                let _ = proxy.send_event(AppEvent::VideoEof(epoch));
+            }
+            rx = None;
+            rx_epoch = None;
+            peek = None;
+        } else if rx.is_none() && peek.is_none() {
+            rx_epoch = None;
         }
 
         // ── Publish the frame-state bundle (change-detect + generation bump) ──
@@ -4427,7 +4776,8 @@ fn video_consume_thread(
                 // playback when the ramp completes.
                 let opacity = match ctl.fade {
                     Some((start, dur)) => {
-                        1.0 - (start.elapsed().as_secs_f32() / dur).clamp(0.0, 1.0)
+                        1.0 - (fade_elapsed(start, ctl.pause_started).as_secs_f32() / dur)
+                            .clamp(0.0, 1.0)
                     }
                     None => 1.0,
                 };
@@ -4519,10 +4869,13 @@ fn output_render_thread(
     renderer: cuepool_video::ProjectionRenderer,
     device: wgpu::Device,
     queue: wgpu::Queue,
+    configure_gate: Arc<RwLock<()>>,
+    event_loop_proxy: winit::event_loop::EventLoopProxy<AppEvent>,
     frame_state: Arc<Mutex<OutputFrameState>>,
     size: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
     presented: Arc<AtomicU32>,
+    window_id: WindowId,
     out_index: usize,
     fallback_output: cuepool_core::ProjectorOutput,
 ) {
@@ -4542,6 +4895,7 @@ fn output_render_thread(
         if w > 0 && h > 0 && (w != config.width || h != config.height) {
             config.width = w;
             config.height = h;
+            let _configure_guard = configure_gate.write().unwrap_or_else(|e| e.into_inner());
             surface.configure(&device, &config);
         }
         if w == 0 || h == 0 {
@@ -4551,28 +4905,54 @@ fn output_render_thread(
         }
 
         use wgpu::CurrentSurfaceTexture::{Lost, Occluded, Outdated, Suboptimal, Success};
+        let mut submit_guard = configure_gate.read().unwrap_or_else(|e| e.into_inner());
         let surface_texture = match surface.get_current_texture() {
             Success(o) | Suboptimal(o) => o,
             // Output window covered/minimized — skip quietly (decode + audio keep
             // running on their own threads, so playback is unaffected). Sleep so
             // the non-blocking Occluded return can't free-spin this thread.
             Occluded => {
+                drop(submit_guard);
                 std::thread::sleep(Duration::from_millis(8));
                 continue;
             }
-            Lost | Outdated => {
-                log::debug!("Output surface lost/outdated, reconfiguring");
-                surface.configure(&device, &config);
+            Lost => {
+                log::warn!("Output surface lost; requesting a winit-side rebuild");
+                drop(submit_guard);
+                if event_loop_proxy
+                    .send_event(AppEvent::OutputSurfaceLost(window_id))
+                    .is_err()
+                {
+                    log::error!("Cannot request output surface rebuild: event loop closed");
+                    break;
+                }
+                while !stop.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(8));
+                }
+                break;
+            }
+            Outdated => {
+                log::debug!("Output surface outdated, reconfiguring");
+                drop(submit_guard);
+                {
+                    let _configure_guard =
+                        configure_gate.write().unwrap_or_else(|e| e.into_inner());
+                    surface.configure(&device, &config);
+                }
+                submit_guard = configure_gate.read().unwrap_or_else(|e| e.into_inner());
                 match surface.get_current_texture() {
                     Success(o) | Suboptimal(o) => o,
                     err => {
                         log::warn!("Output surface acquire failed after reconfigure: {err:?}");
+                        drop(submit_guard);
+                        std::thread::sleep(Duration::from_millis(8));
                         continue;
                     }
                 }
             }
             err => {
                 log::warn!("Output surface acquire failed: {err:?}");
+                drop(submit_guard);
                 std::thread::sleep(Duration::from_millis(8));
                 continue;
             }
@@ -4677,7 +5057,14 @@ fn output_render_thread(
 
         queue.submit(std::iter::once(encoder.finish()));
         surface_texture.present();
+        drop(submit_guard);
         presented.fetch_add(1, Ordering::Relaxed);
+        if !matches!(
+            config.present_mode,
+            wgpu::PresentMode::Fifo | wgpu::PresentMode::FifoRelaxed
+        ) {
+            std::thread::sleep(Duration::from_millis(8));
+        }
     }
 }
 
@@ -4685,20 +5072,20 @@ fn output_render_thread(
 /// a frame, polling so it stays responsive to the stop signal. The bounded
 /// channel is what paces decode to what playback actually consumes.
 /// Returns `false` when the thread should exit (stopped or disconnected).
-fn send_video_frame(
-    frame_tx: &std::sync::mpsc::SyncSender<VideoFrame>,
+fn send_video_message(
+    frame_tx: &std::sync::mpsc::SyncSender<VideoMessage>,
     stop_flag: &AtomicBool,
-    mut frame: VideoFrame,
+    mut message: VideoMessage,
 ) -> bool {
     use std::sync::mpsc::TrySendError;
     loop {
         if stop_flag.load(Ordering::Relaxed) {
             return false;
         }
-        match frame_tx.try_send(frame) {
+        match frame_tx.try_send(message) {
             Ok(()) => return true,
-            Err(TrySendError::Full(f)) => {
-                frame = f;
+            Err(TrySendError::Full(m)) => {
+                message = m;
                 std::thread::sleep(Duration::from_millis(2));
             }
             Err(TrySendError::Disconnected(_)) => return false,
@@ -4706,7 +5093,7 @@ fn send_video_frame(
     }
 }
 
-/// Video decode thread: sleeps until each frame's PTS, then sends it to the main loop.
+/// Video decode thread: sends frames and EOF through the bounded consumer channel.
 /// `start_before`: deliver first the last frame with PTS strictly below this
 /// timestamp (frame-step-back), then continue with the frames after it.
 fn video_decode_thread(
@@ -4714,8 +5101,7 @@ fn video_decode_thread(
     start_before: Option<f64>,
     stop_flag: Arc<AtomicBool>,
     pause_flag: Arc<AtomicBool>,
-    frame_tx: std::sync::mpsc::SyncSender<VideoFrame>,
-    proxy: winit::event_loop::EventLoopProxy<AppEvent>,
+    frame_tx: std::sync::mpsc::SyncSender<VideoMessage>,
     diag_state: SharedStateHandle,
 ) {
     let mut source = match VideoSource::open(path) {
@@ -4750,11 +5136,11 @@ fn video_decode_thread(
                 Some(f) if f.pts + 1e-4 < t => prev = Some(f),
                 Some(f) => {
                     if let Some(p) = prev.take() {
-                        if !send_video_frame(&frame_tx, &stop_flag, p) {
+                        if !send_video_message(&frame_tx, &stop_flag, VideoMessage::Frame(p)) {
                             return;
                         }
                     }
-                    if !send_video_frame(&frame_tx, &stop_flag, f) {
+                    if !send_video_message(&frame_tx, &stop_flag, VideoMessage::Frame(f)) {
                         return;
                     }
                     break;
@@ -4762,8 +5148,11 @@ fn video_decode_thread(
                 None => {
                     // t is past the last frame: deliver that frame and end.
                     if let Some(p) = prev.take() {
-                        send_video_frame(&frame_tx, &stop_flag, p);
+                        if !send_video_message(&frame_tx, &stop_flag, VideoMessage::Frame(p)) {
+                            return;
+                        }
                     }
+                    send_video_message(&frame_tx, &stop_flag, VideoMessage::Eof);
                     return;
                 }
             }
@@ -4785,12 +5174,12 @@ fn video_decode_thread(
                         v.decode_path = source.decode_path().to_string();
                     }
                 }
-                if !send_video_frame(&frame_tx, &stop_flag, frame) {
+                if !send_video_message(&frame_tx, &stop_flag, VideoMessage::Frame(frame)) {
                     return;
                 }
             }
             None => {
-                let _ = proxy.send_event(AppEvent::VideoEof);
+                send_video_message(&frame_tx, &stop_flag, VideoMessage::Eof);
                 break;
             }
         }
@@ -5116,6 +5505,13 @@ fn main() -> anyhow::Result<()> {
             ..Default::default()
         },
     ))?;
+    let device_lost_proxy = proxy.clone();
+    device.set_device_lost_callback(move |reason, message| {
+        log::error!("GPU device lost ({reason:?}): {message}");
+        if device_lost_proxy.send_event(AppEvent::DeviceLost).is_err() {
+            log::error!("Cannot report GPU device loss: event loop closed");
+        }
+    });
 
     let mut app = App::new(instance, adapter, device, queue, proxy);
 
@@ -5171,6 +5567,47 @@ fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canvas_commands_coalesce_to_latest_state_after_drop() {
+        let commands = coalesce_canvas_commands([
+            CanvasCommand::Resize { w: 640, h: 480, force: false },
+            CanvasCommand::Image("discarded.png".into(), CanvasFit::default()),
+            CanvasCommand::Overlay(None),
+            CanvasCommand::Drop,
+            CanvasCommand::Resize { w: 1280, h: 720, force: false },
+            CanvasCommand::BlankCanvas,
+            CanvasCommand::Overlay(None),
+            CanvasCommand::Resize { w: 1920, h: 1080, force: true },
+            CanvasCommand::Image("latest.png".into(), CanvasFit::default()),
+            CanvasCommand::Overlay(None),
+        ]);
+
+        assert_eq!(commands.len(), 4);
+        assert!(matches!(commands[0], CanvasCommand::Drop));
+        assert!(matches!(
+            commands[1],
+            CanvasCommand::Resize { w: 1920, h: 1080, force: true }
+        ));
+        assert!(matches!(&commands[2], CanvasCommand::Image(path, _) if path == "latest.png"));
+        assert!(matches!(commands[3], CanvasCommand::Overlay(None)));
+    }
+
+    #[test]
+    fn picture_fade_freezes_when_paused_before_or_after_it_starts() {
+        let origin = Instant::now();
+        let paused_at = origin + Duration::from_secs(2);
+        let resumed_at = origin + Duration::from_secs(7);
+
+        assert_eq!(fade_elapsed(origin, Some(paused_at)), Duration::from_secs(2));
+        let shifted = shift_fade_start_after_pause(origin, paused_at, resumed_at);
+        assert_eq!(resumed_at.duration_since(shifted), Duration::from_secs(2));
+
+        let started_while_paused = origin + Duration::from_secs(4);
+        assert_eq!(fade_elapsed(started_while_paused, Some(paused_at)), Duration::ZERO);
+        let shifted = shift_fade_start_after_pause(started_while_paused, paused_at, resumed_at);
+        assert_eq!(shifted, resumed_at);
+    }
 
     #[test]
     fn test_parse_osc_command_address_only() {
