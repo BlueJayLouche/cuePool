@@ -5,10 +5,11 @@
 //!   own display's vsync (Fifo) — ungenlocked outputs never serialize.
 //! - Audio engine: cpal output with master clock for A/V sync
 //! - Video decode: background thread feeding a bounded channel; a consume
-//!   thread picks the frame due against the wall-clock video clock and uploads
-//!   it to the shared canvas texture the render threads sample. All non-egui
-//!   GPU work lives on the consume thread (Windows/NVIDIA WSI stalls any
-//!   thread that submits behind vsync-blocked swapchains).
+//!   thread quantizes uploads to reference-output presents while ticks are
+//!   healthy, selecting one refresh ahead against the wall-clock video clock.
+//!   Timeout wakes retain wall-clock pacing when ticks stop. All non-egui GPU
+//!   work lives on the consume thread (Windows/NVIDIA WSI stalls any thread
+//!   that submits behind vsync-blocked swapchains).
 
 use cuepool_audio::{AudioEngine, FileDecoder, SampleProvider};
 use cuepool_core::{
@@ -24,7 +25,7 @@ use cuepool_video::{FramePool, VideoFrame, VideoSource, ZeroCopyAvailability, Ze
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
@@ -294,6 +295,10 @@ struct VideoControl {
     outputs_gen: u64,
     /// Decode-starvation counter (consume → winit diagnostics; swapped out ~1 Hz).
     starved: u32,
+    /// Video-frame upload counter (consume → winit diagnostics; swapped out ~1 Hz).
+    uploads: u32,
+    /// Due-frame drop counter (consume → winit diagnostics; swapped out ~1 Hz).
+    dropped: u32,
 }
 
 
@@ -439,6 +444,8 @@ struct App {
     frame_state: Arc<Mutex<OutputFrameState>>,
     /// Playback control shared with the consume thread (see `VideoControl`).
     video_control: Arc<Mutex<VideoControl>>,
+    /// Monotonic present counter + wakeup from reference output 0.
+    vsync_tick: Arc<(Mutex<u64>, Condvar)>,
     /// Cue-driven canvas/overlay work for the consume thread (rare).
     canvas_cmd_tx: std::sync::mpsc::Sender<CanvasCommand>,
     /// Stop signal + handle for the consume thread (joined on graceful exit).
@@ -692,6 +699,7 @@ impl App {
         // the Windows/NVIDIA WSI stall behind the vsync-blocked render threads.
         let video_control = Arc::new(Mutex::new(VideoControl::default()));
         let frame_state = Arc::new(Mutex::new(OutputFrameState::default()));
+        let vsync_tick = Arc::new((Mutex::new(0u64), Condvar::new()));
         let configure_gate = Arc::new(RwLock::new(()));
         let (canvas_cmd_tx, canvas_cmd_rx) = std::sync::mpsc::channel::<CanvasCommand>();
         let consume_stop = Arc::new(AtomicBool::new(false));
@@ -701,6 +709,7 @@ impl App {
             let queue = queue.clone();
             let control = Arc::clone(&video_control);
             let frame = Arc::clone(&frame_state);
+            let vsync_tick = Arc::clone(&vsync_tick);
             let configure_gate = Arc::clone(&configure_gate);
             let stop = Arc::clone(&consume_stop);
             let frame_pool = Arc::clone(&frame_pool);
@@ -714,6 +723,7 @@ impl App {
                         configure_gate,
                         control,
                         frame,
+                        vsync_tick,
                         canvas_cmd_rx,
                         proxy,
                         stop,
@@ -745,6 +755,7 @@ impl App {
             output_windows_built_from: None,
             frame_state,
             video_control,
+            vsync_tick,
             canvas_cmd_tx,
             consume_stop,
             consume_join: Some(consume_join),
@@ -1095,6 +1106,7 @@ impl App {
         {
             let video_id = window.id();
             let frame_state = Arc::clone(&self.frame_state);
+            let vsync_tick = Arc::clone(&self.vsync_tick);
             let configure_gate = Arc::clone(&self.configure_gate);
             let thread_size = Arc::clone(&size_atomic);
             let thread_stop = Arc::clone(&stop);
@@ -1115,6 +1127,7 @@ impl App {
                         configure_gate,
                         event_loop_proxy,
                         frame_state,
+                        vsync_tick,
                         thread_size,
                         thread_stop,
                         thread_presented,
@@ -4306,8 +4319,14 @@ impl ApplicationHandler<AppEvent> for App {
 
         if self.dbg_last_log.elapsed() >= std::time::Duration::from_secs(1) {
             let secs = self.dbg_last_log.elapsed().as_secs_f64();
-            let starved_per_sec =
-                std::mem::replace(&mut self.video_control.lock_unpoisoned().starved, 0) as f64 / secs;
+            let (starved_per_sec, uploads_per_sec, dropped_per_sec) = {
+                let mut ctl = self.video_control.lock_unpoisoned();
+                (
+                    std::mem::replace(&mut ctl.starved, 0) as f64 / secs,
+                    std::mem::replace(&mut ctl.uploads, 0) as f64 / secs,
+                    std::mem::replace(&mut ctl.dropped, 0) as f64 / secs,
+                )
+            };
             let ticks_per_sec = self.dbg_ticks as f64 / secs;
             // Publish the counters (plus a fresh output snapshot) to the Status
             // window. The output list is rebuilt here rather than patched on
@@ -4353,6 +4372,8 @@ impl ApplicationHandler<AppEvent> for App {
             let d = &mut state.diagnostics;
             d.presented_per_sec = total_presented;
             d.starved_per_sec = starved_per_sec;
+            d.uploads_per_sec = uploads_per_sec;
+            d.dropped_per_sec = dropped_per_sec;
             d.event_loop_per_sec = ticks_per_sec;
             d.outputs = outputs;
             drop(state);
@@ -4446,16 +4467,66 @@ fn resolve_goto_target(
     }
 }
 
+const VSYNC_INTERVAL_MIN: Duration = Duration::from_millis(4);
+const VSYNC_INTERVAL_MAX: Duration = Duration::from_millis(40);
+const VSYNC_STALE_MAX: Duration = Duration::from_millis(60);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FramePacingDecision {
+    target: Option<Duration>,
+    tick_paced: bool,
+}
+
+fn frame_pacing_decision(
+    position: Option<Duration>,
+    stepping: bool,
+    woke_on_tick: bool,
+    last_tick_age: Option<Duration>,
+    tick_interval: Option<Duration>,
+) -> FramePacingDecision {
+    let Some(position) = position else {
+        return FramePacingDecision { target: None, tick_paced: false };
+    };
+    let healthy_interval = tick_interval
+        .map(|interval| interval.clamp(VSYNC_INTERVAL_MIN, VSYNC_INTERVAL_MAX))
+        .filter(|interval| {
+            last_tick_age.is_some_and(|age| {
+                age < interval.saturating_mul(3).min(VSYNC_STALE_MAX)
+            })
+        });
+    if !stepping
+        && let Some(interval) = healthy_interval {
+            return FramePacingDecision {
+                target: woke_on_tick.then(|| position.saturating_add(interval)),
+                tick_paced: true,
+            };
+        }
+    FramePacingDecision { target: Some(position), tick_paced: false }
+}
+
+fn update_vsync_interval(
+    interval: Option<Duration>,
+    elapsed: Duration,
+    tick_count: u64,
+) -> Duration {
+    let sample = Duration::from_secs_f64(elapsed.as_secs_f64() / tick_count as f64)
+        .clamp(VSYNC_INTERVAL_MIN, VSYNC_INTERVAL_MAX);
+    interval
+        .map(|previous| previous.mul_f64(0.8) + sample.mul_f64(0.2))
+        .unwrap_or(sample)
+        .clamp(VSYNC_INTERVAL_MIN, VSYNC_INTERVAL_MAX)
+}
+
 /// Video consume thread: owns the canvas/overlay textures, the YUV converter,
 /// the decode-channel drain and the frame-state publish — every non-egui GPU
 /// call. Moving this off the winit thread is the Windows fix: NVIDIA's Vulkan
 /// WSI serializes a thread's GPU calls behind the vsync-blocked render
 /// threads (20-60 ms per call), which dragged the whole event loop to ~10 Hz.
 ///
-/// The loop is paced by the video clock: compute the next due frame's PTS
-/// against the clock, sleep until due, drain due frames, upload the newest,
-/// submit the YUV convert, publish. Paused/idle: a light 2 ms poll so
-/// frame-step/stop stay responsive without busy-spinning.
+/// While output 0 presents regularly, only its ticks consume frames and a
+/// one-interval lookahead selects what the next scanout should show. Timeout
+/// wakes still handle control and publishing. Missing/stale ticks and stepping
+/// use the original wall-clock selection and sleep behavior unchanged.
 ///
 /// Lock order: `control` and `frame_state` are both leaf locks, never held
 /// together across GPU calls and never held while sleeping or blocking on
@@ -4468,6 +4539,7 @@ fn video_consume_thread(
     configure_gate: Arc<RwLock<()>>,
     control: Arc<Mutex<VideoControl>>,
     frame_state: Arc<Mutex<OutputFrameState>>,
+    vsync_tick: Arc<(Mutex<u64>, Condvar)>,
     cmd_rx: std::sync::mpsc::Receiver<CanvasCommand>,
     proxy: winit::event_loop::EventLoopProxy<AppEvent>,
     stop: Arc<AtomicBool>,
@@ -4492,6 +4564,10 @@ fn video_consume_thread(
     let mut direct_retirement = cuepool_video::SubmissionRetirement::default();
     #[cfg(windows)]
     let (retirement_tx, retirement_rx) = std::sync::mpsc::channel::<()>();
+    let mut last_vsync_tick = *vsync_tick.0.lock_unpoisoned();
+    let mut woke_on_vsync = false;
+    let mut last_vsync_at: Option<Instant> = None;
+    let mut vsync_interval: Option<Duration> = None;
 
     while !stop.load(Ordering::Relaxed) {
         #[cfg(windows)]
@@ -4645,11 +4721,11 @@ fn video_consume_thread(
         }
 
         // ── Due-frame selection against the video clock ──
-        let (target, fit) = {
+        let (position, fit, stepping) = {
             let mut ctl = control.lock_unpoisoned();
             let stream_current = rx_epoch == Some(ctl.stream_epoch);
             let stepping = stream_current && std::mem::take(&mut ctl.step_pending);
-            let target = if stream_current && (!ctl.paused || stepping) {
+            let position = if stream_current && (!ctl.paused || stepping) {
                 // While paused-and-stepping, the target is the frozen position —
                 // clock.elapsed() keeps growing through the pause and would drain
                 // every buffered frame. +1µs absorbs the f64→Duration rounding of
@@ -4666,8 +4742,17 @@ fn video_consume_thread(
             } else {
                 None
             };
-            (target, ctl.fit)
+            (position, ctl.fit, stepping)
         };
+        let pacing = frame_pacing_decision(
+            position,
+            stepping,
+            woke_on_vsync,
+            last_vsync_at.map(|tick| tick.elapsed()),
+            vsync_interval,
+        );
+        let target = pacing.target;
+        woke_on_vsync = false;
 
         // Keep one frame peeked while paused, and notice an immediately-following
         // EOF even without a running target clock. A future frame still holds EOF
@@ -4685,6 +4770,7 @@ fn video_consume_thread(
         }
 
         let mut consumed: Option<VideoFrame> = None;
+        let mut dropped = 0u32;
         if let Some(target) = target {
             loop {
                 if peek.is_none() {
@@ -4701,12 +4787,16 @@ fn video_consume_thread(
                 match peek.as_ref() {
                     Some(f) if Duration::from_secs_f64(f.pts.max(0.0)) <= target => {
                         if let Some(discarded) = consumed.replace(peek.take().unwrap()) {
+                            dropped += 1;
                             frame_pool.recycle_frame(discarded);
                         }
                     }
                     _ => break, // next frame not due yet, or channel empty
                 }
             }
+        }
+        if dropped != 0 {
+            control.lock_unpoisoned().dropped += dropped;
         }
 
         // Check immediately before GPU work without holding the control lock
@@ -4733,6 +4823,7 @@ fn video_consume_thread(
             let frame_presented = true;
             #[cfg(windows)]
             let mut direct_submitted = false;
+            let mut uploaded = false;
             match &frame.pixels {
                 cuepool_video::FramePixels::Rgba(_) => {
                     if let Some(c) = canvas.as_ref() {
@@ -4741,6 +4832,7 @@ fn video_consume_thread(
                         let upload_started = Instant::now();
                         c.upload_frame(&queue, &frame, fit);
                         timings.upload.set_ms(upload_timing.record(upload_started.elapsed()));
+                        uploaded = true;
                     }
                 }
                 #[cfg(windows)]
@@ -4805,6 +4897,7 @@ fn video_consume_thread(
                                             let _ = retirement_tx.send(());
                                         });
                                         direct_submitted = true;
+                                        uploaded = true;
                                         timings.conversion_submit.set_ms(
                                             conversion_submit_timing
                                                 .record(conversion_started.elapsed()),
@@ -4860,10 +4953,14 @@ fn video_consume_thread(
                         timings.conversion_submit.set_ms(
                             conversion_submit_timing.record(conversion_started.elapsed()),
                         );
+                        uploaded = true;
                     }
                 }
             }
             let mut ctl = control.lock_unpoisoned();
+            if uploaded {
+                ctl.uploads += 1;
+            }
             if rx_epoch == Some(ctl.stream_epoch) {
                 if frame_presented {
                     ctl.last_pts = Some(frame.pts);
@@ -4974,8 +5071,8 @@ fn video_consume_thread(
             }
         }
 
-        // ── Pace: sleep until the next frame is due, or a light idle poll ──
-        let sleep_for = match target {
+        // ── Pace: wake after reference present, with the old poll as fallback ──
+        let sleep_for = match position {
             None => Duration::from_millis(2), // paused/idle: watch for step/stop
             Some(pos) => match peek.as_ref() {
                 Some(f) => {
@@ -4996,8 +5093,35 @@ fn video_consume_thread(
                 }
             },
         };
+        // A frame held for the next healthy tick would otherwise leave the old
+        // due-now calculation at zero and spin instead of returning to the wait.
+        let sleep_for = if pacing.tick_paced {
+            sleep_for.max(Duration::from_millis(1))
+        } else {
+            sleep_for
+        };
         if !sleep_for.is_zero() {
-            std::thread::sleep(sleep_for);
+            let tick = vsync_tick.0.lock_unpoisoned();
+            let (tick, _) = vsync_tick
+                .1
+                .wait_timeout_while(tick, sleep_for, |tick| *tick == last_vsync_tick)
+                .unwrap_or_else(|e| e.into_inner());
+            let next_vsync_tick = *tick;
+            drop(tick);
+            let tick_count = next_vsync_tick.wrapping_sub(last_vsync_tick);
+            woke_on_vsync = tick_count != 0;
+            if woke_on_vsync {
+                let now = Instant::now();
+                if let Some(previous) = last_vsync_at {
+                    vsync_interval = Some(update_vsync_interval(
+                        vsync_interval,
+                        now.saturating_duration_since(previous),
+                        tick_count,
+                    ));
+                }
+                last_vsync_at = Some(now);
+            }
+            last_vsync_tick = next_vsync_tick;
         }
     }
 
@@ -5034,6 +5158,7 @@ fn output_render_thread(
     configure_gate: Arc<RwLock<()>>,
     event_loop_proxy: winit::event_loop::EventLoopProxy<AppEvent>,
     frame_state: Arc<Mutex<OutputFrameState>>,
+    vsync_tick: Arc<(Mutex<u64>, Condvar)>,
     size: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
     presented: Arc<AtomicU32>,
@@ -5219,6 +5344,13 @@ fn output_render_thread(
 
         queue.submit(std::iter::once(encoder.finish()));
         surface_texture.present();
+        if out_index == 0 {
+            {
+                let mut tick = vsync_tick.0.lock_unpoisoned();
+                *tick = tick.wrapping_add(1);
+            }
+            vsync_tick.1.notify_all();
+        }
         drop(submit_guard);
         presented.fetch_add(1, Ordering::Relaxed);
         if !matches!(
@@ -5895,6 +6027,44 @@ mod tests {
             timing.record(Duration::from_millis(ms));
         }
         assert!((timing.record(Duration::from_millis(51)) - 26.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn frame_pacing_quantizes_healthy_ticks_and_preserves_fallbacks() {
+        let position = Duration::from_secs(10);
+        let interval = Duration::from_millis(20);
+        let decide = |stepping, woke_on_tick, age, interval| {
+            frame_pacing_decision(Some(position), stepping, woke_on_tick, age, interval)
+        };
+
+        let tick = decide(false, true, Some(Duration::from_millis(1)), Some(interval));
+        assert_eq!(tick.target, Some(position + interval));
+        assert!(tick.tick_paced);
+
+        let timeout = decide(false, false, Some(Duration::from_millis(5)), Some(interval));
+        assert_eq!(timeout.target, None);
+        assert!(timeout.tick_paced);
+
+        let absent = decide(false, false, None, None);
+        assert_eq!(absent.target, Some(position));
+        assert!(!absent.tick_paced);
+
+        let stale = decide(false, false, Some(Duration::from_millis(61)), Some(interval));
+        assert_eq!(stale.target, Some(position));
+        assert!(!stale.tick_paced);
+
+        let stepping = decide(true, false, Some(Duration::from_millis(1)), Some(interval));
+        assert_eq!(stepping.target, Some(position));
+        assert!(!stepping.tick_paced);
+
+        assert_eq!(
+            update_vsync_interval(None, Duration::from_millis(2), 1),
+            VSYNC_INTERVAL_MIN
+        );
+        assert_eq!(
+            update_vsync_interval(None, Duration::from_millis(100), 2),
+            VSYNC_INTERVAL_MAX
+        );
     }
 
     fn cli_project_test_dir() -> PathBuf {
