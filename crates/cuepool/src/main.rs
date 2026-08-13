@@ -471,7 +471,7 @@ impl App {
             let ffmpeg = cuepool_video::ffmpeg_version();
             let mut state = cuepool.state().lock_unpoisoned();
             let d = &mut state.diagnostics;
-            d.app_version = env!("CARGO_PKG_VERSION").into();
+            d.app_version = cuepool_gui::build_identity();
             d.os = std::env::consts::OS.into();
             d.arch = std::env::consts::ARCH.into();
             d.gpu_name = info.name;

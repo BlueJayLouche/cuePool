@@ -1,9 +1,9 @@
 //! Update visual baselines with `UPDATE_SNAPSHOTS=1 cargo test -p cuepool-gui`.
 
-use cuepool_gui::{AppCommand, SharedStateHandle, ShowMode, preview};
+use cuepool_gui::{AppCommand, CuePoolApp, SharedStateHandle, ShowMode, build_identity, preview};
 use egui::accesskit::Role;
 use egui_kittest::{
-    Harness,
+    Harness, OsThreshold, SnapshotOptions,
     kittest::{By, Queryable},
 };
 use rust_decimal::Decimal;
@@ -15,8 +15,7 @@ fn has_wgpu_adapter() -> bool {
     !pollster::block_on(instance.enumerate_adapters(egui_wgpu::wgpu::Backends::all())).is_empty()
 }
 
-fn demo_harness() -> (Harness<'static>, SharedStateHandle) {
-    let mut app = preview::demo_app();
+fn app_harness(mut app: CuePoolApp) -> (Harness<'static>, SharedStateHandle) {
     let state = app.state().clone();
     let mut harness = Harness::builder()
         .with_size([1280.0, 800.0])
@@ -29,8 +28,49 @@ fn demo_harness() -> (Harness<'static>, SharedStateHandle) {
         style.interaction.selectable_labels = false;
         style.interaction.multi_widget_text_select = false;
     });
-    harness.run();
+    harness.input_mut().time = Some(harness.ctx.input(|i| i.time));
+    harness.step();
     (harness, state)
+}
+
+fn demo_harness() -> (Harness<'static>, SharedStateHandle) {
+    app_harness(preview::demo_app())
+}
+
+#[test]
+fn launch_splash_shows_the_build_and_blocks_the_workspace() {
+    let (mut harness, state) = app_harness(CuePoolApp::new());
+
+    assert!(harness.query_by_label(&build_identity()).is_some());
+    harness.get_by_label("Edit Mode").click();
+    harness.key_press(egui::Key::Space);
+    harness.step();
+
+    let state = state.lock().unwrap();
+    assert_eq!(state.show_mode, ShowMode::Edit);
+    assert!(state.command_queue.is_empty());
+    drop(state);
+    harness.remove_cursor();
+    harness.step();
+    // GitHub's Linux WGPU backend differs from the macOS baseline by one edge pixel.
+    let snapshot_options = has_wgpu_adapter().then(|| {
+        SnapshotOptions::new().failed_pixel_count_threshold(OsThreshold::new(0).linux(1))
+    });
+    if let Some(options) = &snapshot_options {
+        harness.snapshot_options("launch_splash", options);
+    }
+
+    let started_at = 1.0 / 60.0;
+    harness.input_mut().time = Some(started_at + 2.29);
+    harness.step();
+    assert!(harness.query_by_label(&build_identity()).is_some());
+    if let Some(options) = &snapshot_options {
+        harness.snapshot_options("launch_splash_fade", options);
+    }
+
+    harness.input_mut().time = Some(started_at + 2.5);
+    harness.step();
+    assert!(harness.query_by_label(&build_identity()).is_none());
 }
 
 #[test]

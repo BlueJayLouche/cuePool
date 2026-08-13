@@ -1197,7 +1197,7 @@ dependencies = [
 
 [[package]]
 name = "cuepool"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1230,7 +1230,7 @@ dependencies = [
 
 [[package]]
 name = "cuepool-audio"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "cpal",
  "crossbeam",
@@ -1243,7 +1243,7 @@ dependencies = [
 
 [[package]]
 name = "cuepool-core"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "flate2",
@@ -1258,7 +1258,7 @@ dependencies = [
 
 [[package]]
 name = "cuepool-gui"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "cuepool-audio",
@@ -1282,7 +1282,7 @@ dependencies = [
 
 [[package]]
 name = "cuepool-harness"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "cuepool-audio",
  "cuepool-core",
@@ -1293,7 +1293,7 @@ dependencies = [
 
 [[package]]
 name = "cuepool-protocols"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "bitflags 2.13.1",
@@ -1304,7 +1304,7 @@ dependencies = [
 
 [[package]]
 name = "cuepool-video"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "ash",

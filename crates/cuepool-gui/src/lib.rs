@@ -2,6 +2,17 @@
 //!
 //! Replaces all WPF Views and ViewModels.
 
+/// Human-readable identity shared by the launch splash, About window and diagnostics.
+pub fn build_identity() -> String {
+    match option_env!("CUEPOOL_BUILD_ID")
+        .map(str::trim)
+        .filter(|build| !build.is_empty())
+    {
+        Some(build) => format!("{} · Build {build}", env!("CARGO_PKG_VERSION")),
+        None => format!("{} · Local build", env!("CARGO_PKG_VERSION")),
+    }
+}
+
 pub mod active_cues;
 pub mod app;
 pub mod cue_list;
@@ -48,4 +59,19 @@ pub(crate) fn colour_to_egui(c: cuepool_core::SerializedColour) -> egui::Color32
         (c.b * 255.0) as u8,
         (c.a * 255.0) as u8,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn build_identity_includes_the_workspace_version() {
+        let suffix = option_env!("CUEPOOL_BUILD_ID")
+            .map(str::trim)
+            .filter(|build| !build.is_empty())
+            .map_or_else(|| "Local build".into(), |build| format!("Build {build}"));
+        assert_eq!(
+            super::build_identity(),
+            format!("{} · {suffix}", env!("CARGO_PKG_VERSION"))
+        );
+    }
 }
