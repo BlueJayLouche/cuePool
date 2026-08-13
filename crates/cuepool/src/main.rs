@@ -14,13 +14,13 @@ use cuepool_audio::{AudioEngine, FileDecoder, SampleProvider};
 use cuepool_core::{
     AudioOutputDriver, CanvasFit, LockExt, MidiTrigger, MidiTriggerKind, SerializedColour, Timespan,
 };
-use cuepool_gui::{AppCommand, CuePoolApp, DecodeTiming, OutputDiagnostics, SharedStateHandle, VideoDiagnostics};
+use cuepool_gui::{AppCommand, CuePoolApp, OutputDiagnostics, SharedStateHandle, VideoDiagnostics, VideoTimings};
 use cuepool_gui::app::CueState;
 use cuepool_protocols::midi::mtc::{MtcFrameRate, MtcReceiver, MtcState};
 use cuepool_protocols::midi::{MidiEvent, MidiManager};
 use cuepool_protocols::msc::{MscCommandFlags, MscEvent, MscManager};
 use cuepool_protocols::osc::{OscEvent, OscManager};
-use cuepool_video::{FramePool, VideoFrame, VideoSource};
+use cuepool_video::{FramePool, VideoFrame, VideoSource, ZeroCopyAvailability, ZeroCopyPreference};
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -254,6 +254,7 @@ struct VideoControl {
     /// the winit thread and taken out by the consume thread. A new receiver
     /// means a new stream: the consume thread drops its peeked frame.
     frame_rx: Option<std::sync::mpsc::Receiver<VideoMessage>>,
+    timings: VideoTimings,
     /// Wall-clock playback anchor (real time = A/V sync reference).
     clock: Option<Instant>,
     /// Set while paused, to freeze `clock` across the pause.
@@ -488,6 +489,7 @@ struct App {
     video_stop_flag: Arc<AtomicBool>,
     video_pause_flag: Arc<AtomicBool>,
     frame_pool: Arc<FramePool>,
+    zero_copy: ZeroCopyAvailability,
     /// QID of the cue whose video is currently playing (for loop sync).
     current_video_qid: Option<rust_decimal::Decimal>,
     /// Last `SharedState.project_generation` we acted on. A change means a project
@@ -562,6 +564,7 @@ impl App {
         device: wgpu::Device,
         queue: wgpu::Queue,
         proxy: winit::event_loop::EventLoopProxy<AppEvent>,
+        zero_copy: ZeroCopyAvailability,
     ) -> Self {
         let cuepool = CuePoolApp::new();
 
@@ -676,7 +679,7 @@ impl App {
                 (ffmpeg >> 8) & 0xff,
                 ffmpeg & 0xff,
             );
-            for var in ["QPLAYER_PRESENT_MODE", "QPLAYER_FPS_DEBUG", "QPLAYER_NO_HWACCEL"] {
+            for var in ["QPLAYER_PRESENT_MODE", "QPLAYER_FPS_DEBUG", "QPLAYER_NO_HWACCEL", "QPLAYER_ZEROCOPY"] {
                 if let Ok(value) = std::env::var(var) {
                     d.env_overrides.push((var.into(), value));
                 }
@@ -750,6 +753,7 @@ impl App {
             video_stop_flag: Arc::new(AtomicBool::new(false)),
             video_pause_flag: Arc::new(AtomicBool::new(false)),
             frame_pool,
+            zero_copy,
             current_video_qid: None,
             last_project_generation: 0,
             last_control_redraw: std::time::Instant::now(),
@@ -2466,17 +2470,20 @@ impl App {
         // clock, not the audio clock, so it can't freeze if the audio device sleeps.
         let (frame_tx, frame_rx) =
             std::sync::mpsc::sync_channel::<VideoMessage>(VIDEO_QUEUE_CAP);
+        let timings = VideoTimings::default();
         // Installing a new receiver also tells the consume thread to drop its
         // peeked frame and invalidates EOF already queued by the old decoder.
         {
             let mut ctl = self.video_control.lock_unpoisoned();
             ctl.stream_epoch += 1;
             ctl.frame_rx = Some(frame_rx);
+            ctl.timings = timings.clone();
         }
         let stop_flag = Arc::clone(&self.video_stop_flag);
         let pause_flag = Arc::clone(&self.video_pause_flag);
         let frame_pool = Arc::clone(&self.frame_pool);
         let diag_state = Arc::clone(self.cuepool.state());
+        let zero_copy = self.zero_copy.clone();
 
         if let Err(e) = std::thread::Builder::new()
             .name("video-decode".into())
@@ -2489,6 +2496,8 @@ impl App {
                     frame_tx,
                     diag_state,
                     frame_pool,
+                    timings,
+                    zero_copy,
                 );
             })
         {
@@ -4476,8 +4485,22 @@ fn video_consume_thread(
     // Live outputs copy (re-cloned only when `outputs_gen` advances).
     let mut outputs: Vec<cuepool_core::ProjectorOutput> = Vec::new();
     let mut outputs_gen = 0u64;
+    let mut timings = VideoTimings::default();
+    let mut upload_timing = TimingWindow::default();
+    let mut conversion_submit_timing = TimingWindow::default();
+    #[cfg(windows)]
+    let mut direct_retirement = cuepool_video::SubmissionRetirement::default();
+    #[cfg(windows)]
+    let (retirement_tx, retirement_rx) = std::sync::mpsc::channel::<()>();
 
     while !stop.load(Ordering::Relaxed) {
+        #[cfg(windows)]
+        {
+            let _ = device.poll(wgpu::PollType::Poll);
+            if retirement_rx.try_iter().next().is_some() {
+                direct_retirement.drain_completed();
+            }
+        }
         // ── Cue-driven canvas/overlay commands (rare) ──
         let mut views_dirty = false;
         for cmd in coalesce_canvas_commands(cmd_rx.try_iter()) {
@@ -4563,6 +4586,9 @@ fn video_consume_thread(
             if let Some(new_rx) = ctl.frame_rx.take() {
                 rx = Some(new_rx);
                 rx_epoch = Some(ctl.stream_epoch);
+                timings = ctl.timings.clone();
+                upload_timing = TimingWindow::default();
+                conversion_submit_timing = TimingWindow::default();
                 peek = None;
                 ctl.peek_pts = None;
             }
@@ -4701,12 +4727,111 @@ fn video_consume_thread(
 
         // ── Upload the newest due frame to the canvas (GPU work) ──
         if let Some(frame) = consumed {
+            #[cfg(windows)]
+            let mut frame_presented = true;
+            #[cfg(not(windows))]
+            let frame_presented = true;
+            #[cfg(windows)]
+            let mut direct_submitted = false;
             match &frame.pixels {
                 cuepool_video::FramePixels::Rgba(_) => {
                     if let Some(c) = canvas.as_ref() {
                         let _configure_guard =
                             configure_gate.read().unwrap_or_else(|e| e.into_inner());
+                        let upload_started = Instant::now();
                         c.upload_frame(&queue, &frame, fit);
+                        timings.upload.set_ms(upload_timing.record(upload_started.elapsed()));
+                    }
+                }
+                #[cfg(windows)]
+                cuepool_video::FramePixels::D3d11Nv12(direct) => {
+                    if yuv_converter.is_none() {
+                        yuv_converter = Some(cuepool_video::YuvConverter::new(
+                            &device,
+                            wgpu::TextureFormat::Rgba8Unorm,
+                        ));
+                    }
+                    if let (Some(c), Some(conv)) = (canvas.as_ref(), yuv_converter.as_mut()) {
+                        let _configure_guard =
+                            configure_gate.read().unwrap_or_else(|e| e.into_inner());
+                        if let Some(readback) = direct.take_canary_readback() {
+                            let canary_result = cuepool_video::YuvConverter::run_d3d11_canary(
+                                &device,
+                                &queue,
+                                &frame,
+                                &readback,
+                                [c.width, c.height],
+                                fit,
+                            );
+                            frame_pool.recycle_frame(readback);
+                            if let Err(reason) = canary_result {
+                                let reason = format!("zero-copy canary failed: {reason}");
+                                direct.complete(Err(reason));
+                                frame_presented = false;
+                            }
+                        }
+
+                        if frame_presented {
+                            let upload_started = Instant::now();
+                            conv.upload(&device, &queue, &frame, [c.width, c.height], fit);
+                            timings.upload.set_ms(upload_timing.record(upload_started.elapsed()));
+                            let conversion_started = Instant::now();
+                            let mut encoder =
+                                device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                                    label: Some("canvas-d3d11va-convert"),
+                                });
+                            let prepared = unsafe { direct.record_vulkan_acquire(&mut encoder) }
+                                .and_then(|()| {
+                                    conv.encode(&mut encoder, &c.render_view());
+                                    unsafe { direct.record_vulkan_release(&mut encoder) }
+                                })
+                                .and_then(|()| unsafe { direct.attach_keyed_mutex(&mut encoder) });
+                            let epoch = rx_epoch.unwrap_or_default();
+                            let retired = direct_retirement.submit(epoch, direct.clone());
+                            match (prepared, retired) {
+                                (Ok(()), Ok(completed)) => {
+                                    if let Err(reason) = direct.release_to_vulkan() {
+                                        completed.store(true, Ordering::Release);
+                                        direct_retirement.drain_completed();
+                                        direct.complete(Err(reason));
+                                        frame_presented = false;
+                                    } else {
+                                        queue.submit(std::iter::once(encoder.finish()));
+                                        let completion = direct.clone();
+                                        let retirement_tx = retirement_tx.clone();
+                                        queue.on_submitted_work_done(move || {
+                                            completed.store(true, Ordering::Release);
+                                            completion.complete(Ok(()));
+                                            let _ = retirement_tx.send(());
+                                        });
+                                        direct_submitted = true;
+                                        timings.conversion_submit.set_ms(
+                                            conversion_submit_timing
+                                                .record(conversion_started.elapsed()),
+                                        );
+                                    }
+                                }
+                                (Err(reason), Ok(completed)) => {
+                                    completed.store(true, Ordering::Release);
+                                    direct_retirement.drain_completed();
+                                    direct.complete(Err(reason));
+                                    frame_presented = false;
+                                }
+                                (Ok(()), Err(_)) => {
+                                    direct.complete(Err(
+                                        "zero-copy submission retirement budget exhausted".into(),
+                                    ));
+                                    frame_presented = false;
+                                }
+                                (Err(reason), Err(_)) => {
+                                    direct.complete(Err(reason));
+                                    frame_presented = false;
+                                }
+                            }
+                        }
+                    } else {
+                        direct.complete(Err("zero-copy canvas is unavailable".into()));
+                        frame_presented = false;
                     }
                 }
                 _ => {
@@ -4722,20 +4847,28 @@ fn video_consume_thread(
                     if let (Some(c), Some(conv)) = (canvas.as_ref(), yuv_converter.as_mut()) {
                         let _configure_guard =
                             configure_gate.read().unwrap_or_else(|e| e.into_inner());
+                        let upload_started = Instant::now();
                         conv.upload(&device, &queue, &frame, [c.width, c.height], fit);
+                        timings.upload.set_ms(upload_timing.record(upload_started.elapsed()));
+                        let conversion_started = Instant::now();
                         let mut encoder =
                             device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                                 label: Some("canvas-yuv-convert"),
                             });
                         conv.encode(&mut encoder, &c.render_view());
                         queue.submit(std::iter::once(encoder.finish()));
+                        timings.conversion_submit.set_ms(
+                            conversion_submit_timing.record(conversion_started.elapsed()),
+                        );
                     }
                 }
             }
             let mut ctl = control.lock_unpoisoned();
             if rx_epoch == Some(ctl.stream_epoch) {
-                ctl.last_pts = Some(frame.pts);
-                ctl.canvas_has_frame = true;
+                if frame_presented {
+                    ctl.last_pts = Some(frame.pts);
+                    ctl.canvas_has_frame = true;
+                }
                 ctl.peek_pts = peek.as_ref().map(|f| f.pts);
             } else {
                 drop(ctl);
@@ -4744,6 +4877,13 @@ fn video_consume_thread(
                 peek = None;
                 eof_epoch = None;
             }
+            #[cfg(windows)]
+            if direct_submitted {
+                drop(frame);
+            } else {
+                frame_pool.recycle_frame(frame);
+            }
+            #[cfg(not(windows))]
             frame_pool.recycle_frame(frame);
         } else if let Some(epoch) = rx_epoch {
             let mut ctl = control.lock_unpoisoned();
@@ -4859,6 +4999,21 @@ fn video_consume_thread(
         if !sleep_for.is_zero() {
             std::thread::sleep(sleep_for);
         }
+    }
+
+    #[cfg(windows)]
+    while !direct_retirement.is_empty() {
+        if device
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: Some(Duration::from_secs(2)),
+            })
+            .is_err()
+        {
+            log::error!("Video zero-copy teardown timed out; waiting to preserve submitted leases");
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        }
+        direct_retirement.drain_completed();
     }
 }
 
@@ -5103,6 +5258,8 @@ fn send_video_message(
 /// Video decode thread: sends frames and EOF through the bounded consumer channel.
 /// `start_before`: deliver first the last frame with PTS strictly below this
 /// timestamp (frame-step-back), then continue with the frames after it.
+// ponytail: Keep thread resources explicit until the Windows interop context lands in this API.
+#[allow(clippy::too_many_arguments)]
 fn video_decode_thread(
     path: &str,
     start_before: Option<f64>,
@@ -5111,8 +5268,19 @@ fn video_decode_thread(
     frame_tx: std::sync::mpsc::SyncSender<VideoMessage>,
     diag_state: SharedStateHandle,
     frame_pool: Arc<FramePool>,
+    timings: VideoTimings,
+    zero_copy: ZeroCopyAvailability,
 ) {
-    let mut source = match VideoSource::open_with_pool(path, Arc::clone(&frame_pool)) {
+    let zero_copy = if start_before.is_some() {
+        ZeroCopyAvailability::declined("seek/frame-step-back uses D3D11VA readback")
+    } else {
+        zero_copy
+    };
+    let mut source = match VideoSource::open_with_zero_copy(
+        path,
+        Arc::clone(&frame_pool),
+        zero_copy,
+    ) {
         Ok(s) => s,
         Err(e) => {
             log::error!("Failed to open video source {}: {e}", path);
@@ -5121,16 +5289,16 @@ fn video_decode_thread(
     };
 
     // Publish what's decoding to the Status window (Help → Status…).
-    let decode_timing = DecodeTiming::default();
     diag_state.lock_unpoisoned().diagnostics.video = Some(VideoDiagnostics {
         path: path.to_string(),
         width: source.width(),
         height: source.height(),
         decode_path: source.decode_path().to_string(),
-        decode_ms_per_frame: decode_timing.clone(),
+        fallback_reason: source.fallback_reason().map(str::to_owned),
+        timings: timings.clone(),
     });
 
-    let mut timing_window = DecodeTimingWindow::default();
+    let mut timing_windows = VideoTimingWindows::default();
 
     if let Some(t) = start_before {
         // Seek to the keyframe at/before t, then scan forward for the frame
@@ -5144,7 +5312,7 @@ fn video_decode_thread(
             if stop_flag.load(Ordering::Relaxed) {
                 return;
             }
-            match timed_read_frame(&mut source, &mut timing_window, &decode_timing) {
+            match timed_read_frame(&mut source, &mut timing_windows, &timings) {
                 Some(f) if f.pts + 1e-4 < t => {
                     if let Some(discarded) = prev.replace(f) {
                         frame_pool.recycle_frame(discarded);
@@ -5181,14 +5349,36 @@ fn video_decode_thread(
     // tentative (hw device created ≠ hw decode engaged — e.g. Hap has none).
     let mut diag_path_pending = true;
     while !stop_flag.load(Ordering::Relaxed) {
-        match timed_read_frame(&mut source, &mut timing_window, &decode_timing) {
+        match timed_read_frame(&mut source, &mut timing_windows, &timings) {
             Some(frame) => {
+                #[cfg(windows)]
+                let handoff = frame.d3d11_handoff();
                 if std::mem::take(&mut diag_path_pending)
                     && let Some(v) = diag_state.lock_unpoisoned().diagnostics.video.as_mut() {
                         v.decode_path = source.decode_path().to_string();
+                        v.fallback_reason = source.fallback_reason().map(str::to_owned);
                     }
                 if !send_video_message(&frame_tx, &stop_flag, VideoMessage::Frame(frame)) {
                     return;
+                }
+                #[cfg(windows)]
+                if let Some(handoff) = handoff {
+                    if let Err(reason) = handoff.wait(&stop_flag) {
+                        if stop_flag.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        if !source.fallback_zero_copy(format!(
+                            "serialized keyed-mutex handoff failed: {reason}"
+                        )) {
+                            return;
+                        }
+                    } else if !stop_flag.load(Ordering::Relaxed) {
+                        source.mark_zero_copy_engaged();
+                    }
+                    if let Some(video) = diag_state.lock_unpoisoned().diagnostics.video.as_mut() {
+                        video.decode_path = source.decode_path().to_string();
+                        video.fallback_reason = source.fallback_reason().map(str::to_owned);
+                    }
                 }
             }
             None => {
@@ -5202,11 +5392,11 @@ fn video_decode_thread(
 const DECODE_TIMING_WINDOW: usize = 50;
 
 #[derive(Default)]
-struct DecodeTimingWindow {
+struct TimingWindow {
     samples_ms: std::collections::VecDeque<f64>,
 }
 
-impl DecodeTimingWindow {
+impl TimingWindow {
     fn record(&mut self, elapsed: Duration) -> f64 {
         if self.samples_ms.len() == DECODE_TIMING_WINDOW {
             self.samples_ms.pop_front();
@@ -5216,14 +5406,25 @@ impl DecodeTimingWindow {
     }
 }
 
+#[derive(Default)]
+struct VideoTimingWindows {
+    decode: TimingWindow,
+    hw_transfer: TimingWindow,
+    plane_copy: TimingWindow,
+}
+
 fn timed_read_frame(
     source: &mut VideoSource,
-    timing_window: &mut DecodeTimingWindow,
-    decode_timing: &DecodeTiming,
+    timing_windows: &mut VideoTimingWindows,
+    timings: &VideoTimings,
 ) -> Option<VideoFrame> {
-    let start = Instant::now();
     let frame = source.read_frame();
-    decode_timing.set_ms(timing_window.record(start.elapsed()));
+    let frame_timings = source.last_timings();
+    timings.decode.set_ms(timing_windows.decode.record(frame_timings.decode));
+    timings.hw_transfer.set_ms(
+        timing_windows.hw_transfer.record(frame_timings.hw_transfer),
+    );
+    timings.plane_copy.set_ms(timing_windows.plane_copy.record(frame_timings.plane_copy));
     frame
 }
 
@@ -5561,15 +5762,46 @@ fn main() -> anyhow::Result<()> {
     }))
     .map_err(|e| anyhow::anyhow!("no wgpu adapter: {e}"))?;
 
-    let (device, queue) = pollster::block_on(adapter.request_device(
-        &wgpu::DeviceDescriptor {
+    let zero_copy_preference = ZeroCopyPreference::from_env();
+    let zero_copy_features =
+        ZeroCopyAvailability::required_features(&adapter, zero_copy_preference);
+    let request_device = |features| {
+        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("cuepool-device"),
             // Required for the 10-bit planar (p10le) GPU path.
-            required_features: wgpu::Features::TEXTURE_FORMAT_16BIT_NORM,
+            required_features: wgpu::Features::TEXTURE_FORMAT_16BIT_NORM | features,
             required_limits: wgpu::Limits::default(),
             ..Default::default()
+        }))
+    };
+    let (device, queue, device_fallback) = match request_device(zero_copy_features) {
+        Ok((device, queue)) => (device, queue, None),
+        Err(error) if !zero_copy_features.is_empty() => {
+            let reason = format!("zero-copy device feature request failed: {error}");
+            log::warn!("Video zero-copy fallback: {reason}; retrying the stock device");
+            let (device, queue) = request_device(wgpu::Features::empty())?;
+            (device, queue, Some(reason))
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let device_fallback_logged = device_fallback.is_some();
+    let zero_copy = device_fallback.map_or_else(
+        || {
+            ZeroCopyAvailability::finish(
+                &adapter,
+                &device,
+                &queue,
+                zero_copy_preference,
+            )
         },
-    ))?;
+        ZeroCopyAvailability::declined,
+    );
+    if zero_copy_preference.enabled()
+        && !device_fallback_logged
+        && let Some(reason) = zero_copy.fallback_reason()
+    {
+        log::warn!("Video zero-copy fallback: {reason}; using the stock readback path");
+    }
     let device_lost_proxy = proxy.clone();
     device.set_device_lost_callback(move |reason, message| {
         log::error!("GPU device lost ({reason:?}): {message}");
@@ -5578,7 +5810,7 @@ fn main() -> anyhow::Result<()> {
         }
     });
 
-    let mut app = App::new(instance, adapter, device, queue, proxy);
+    let mut app = App::new(instance, adapter, device, queue, proxy, zero_copy);
 
     // Load app-level settings. Project audio settings live in the show file
     // and are applied when its project generation changes.
@@ -5657,8 +5889,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn decode_timing_averages_the_last_fifty_samples() {
-        let mut timing = DecodeTimingWindow::default();
+    fn timing_averages_the_last_fifty_samples() {
+        let mut timing = TimingWindow::default();
         for ms in 1..=50 {
             timing.record(Duration::from_millis(ms));
         }
