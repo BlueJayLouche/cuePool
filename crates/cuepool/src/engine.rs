@@ -6,7 +6,7 @@ use rust_decimal::Decimal;
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::AtomicU32;
 use std::time::Duration;
 
 #[derive(Debug, Clone)]
@@ -116,6 +116,7 @@ struct ActiveCue {
     state: CueState,
     loop_counter: Option<Arc<AtomicU32>>,
     video_loop_count: u32,
+    video_loop_limit: Option<u32>,
     loop_start_frame: u64,
     loop_end_frame: u64,
     fade_out: f32,
@@ -773,6 +774,11 @@ impl ShowEngine {
             state,
             loop_counter: playback.loop_counter,
             video_loop_count: 0,
+            video_loop_limit: match loop_mode {
+                LoopMode::Looped => Some((loop_count as u32).saturating_sub(1)),
+                LoopMode::LoopedInfinite => None,
+                _ => None,
+            },
             loop_start_frame: (start_frame as f64 * out_scale) as u64,
             loop_end_frame: (effective_end_frame as f64 * out_scale) as u64,
             fade_out,
@@ -1161,13 +1167,21 @@ impl ShowEngine {
             .iter_mut()
             .find(|cue| cue.qid == video.qid)
             .and_then(|cue| {
-                let current = cue.loop_counter.as_ref()?.load(Ordering::Relaxed);
-                if current > cue.video_loop_count {
-                    cue.video_loop_count = current;
-                    Some(())
-                } else {
-                    None
+                cue.loop_counter.as_ref()?;
+                let loop_frames = cue.loop_end_frame.saturating_sub(cue.loop_start_frame);
+                if loop_frames == 0 {
+                    return None;
                 }
+                let played_frames =
+                    u64::try_from(cue.input.position() / cue.input.channels().max(1))
+                        .unwrap_or(u64::MAX);
+                let current = u32::try_from(played_frames / loop_frames).unwrap_or(u32::MAX);
+                let current = cue
+                    .video_loop_limit
+                    .map_or(current, |limit| current.min(limit));
+                let previous = cue.video_loop_count;
+                cue.video_loop_count = current;
+                if current > previous { Some(()) } else { None }
             })
             .is_some();
         if looped {
@@ -1238,7 +1252,8 @@ impl ShowEngine {
             return;
         }
         match video.loop_mode {
-            LoopMode::Looped | LoopMode::LoopedInfinite if !video.has_audio => {
+            LoopMode::Looped | LoopMode::LoopedInfinite if video.has_audio => {}
+            LoopMode::Looped | LoopMode::LoopedInfinite => {
                 self.push_video_action(video);
             }
             LoopMode::HoldLast => {}
@@ -1456,6 +1471,88 @@ fn find_in_dir(dir: &Path, target: &std::ffi::OsStr) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct PositionSource {
+        position: Arc<AtomicUsize>,
+    }
+
+    impl SampleProvider for PositionSource {
+        fn read(&self, _buffer: &mut [f32]) -> usize {
+            0
+        }
+
+        fn seek(&self, sample: usize) {
+            self.position.store(sample, Ordering::Relaxed);
+        }
+
+        fn position(&self) -> usize {
+            self.position.load(Ordering::Relaxed)
+        }
+
+        fn length(&self) -> Option<usize> {
+            None
+        }
+
+        fn sample_rate(&self) -> u32 {
+            48_000
+        }
+
+        fn channels(&self) -> u16 {
+            2
+        }
+    }
+
+    fn looped_video_engine(loop_mode: LoopMode) -> (ShowEngine, Arc<AtomicUsize>, Arc<AtomicU32>) {
+        let app = cuepool_gui::CuePoolApp::new();
+        let mut engine = ShowEngine::new(app.state().clone(), None);
+        let position = Arc::new(AtomicUsize::new(0));
+        let input = Arc::new(cuepool_audio::MixerInput::new(
+            Box::new(PositionSource {
+                position: Arc::clone(&position),
+            }),
+            2,
+        ));
+        let loop_counter = Arc::new(AtomicU32::new(0));
+        engine.active_cues.push(ActiveCue {
+            instance_id: 1,
+            qid: Decimal::ONE,
+            name: "looped video".into(),
+            input,
+            state: CueState::PlayingLooped,
+            loop_counter: Some(Arc::clone(&loop_counter)),
+            video_loop_count: 0,
+            video_loop_limit: matches!(loop_mode, LoopMode::Looped).then_some(1),
+            loop_start_frame: 0,
+            loop_end_frame: 100,
+            fade_out: 0.0,
+            fade_type: Default::default(),
+            fade_out_started: false,
+            pending_stop: None,
+        });
+        engine.current_video = Some(CurrentVideo {
+            qid: Decimal::ONE,
+            instance_id: 1,
+            epoch: 1,
+            path: "video.mov".into(),
+            start_time: Timespan::ZERO,
+            duration: Timespan::ZERO,
+            loop_mode,
+            follow_mtc: false,
+            mtc_start: Timespan::ZERO,
+            has_audio: true,
+            clock_origin: Duration::ZERO,
+            paused_position: None,
+        });
+        (engine, position, loop_counter)
+    }
+
+    fn play_video_count(actions: &[EngineAction]) -> usize {
+        actions
+            .iter()
+            .filter(|action| matches!(action, EngineAction::PlayVideo { .. }))
+            .count()
+    }
 
     fn dummy(qid: i64, trigger: TriggerMode) -> Cue {
         Cue::Dummy {
@@ -1648,5 +1745,53 @@ mod tests {
                 .command(EngineCommand::Fire(Decimal::TWO), Duration::ZERO)
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn audio_backed_video_restarts_only_after_played_loop_boundary() {
+        let (mut engine, position, decoder_loops) = looped_video_engine(LoopMode::Looped);
+
+        decoder_loops.store(1, Ordering::Relaxed);
+        engine.check_video_loops();
+        assert_eq!(play_video_count(&engine.take_actions()), 0);
+
+        position.store(200, Ordering::Relaxed);
+        engine.check_video_loops();
+        assert_eq!(play_video_count(&engine.take_actions()), 1);
+        engine.check_video_loops();
+        assert_eq!(play_video_count(&engine.take_actions()), 0);
+
+        position.store(0, Ordering::Relaxed);
+        engine.check_video_loops();
+        assert_eq!(play_video_count(&engine.take_actions()), 0);
+        position.store(200, Ordering::Relaxed);
+        engine.check_video_loops();
+        assert_eq!(play_video_count(&engine.take_actions()), 1);
+
+        decoder_loops.store(2, Ordering::Relaxed);
+        position.store(400, Ordering::Relaxed);
+        engine.check_video_loops();
+        assert_eq!(play_video_count(&engine.take_actions()), 0);
+    }
+
+    #[test]
+    fn audio_backed_loop_holds_video_at_eof_until_audio_boundary() {
+        let (mut engine, _, _) = looped_video_engine(LoopMode::Looped);
+        engine.video_eof(1, 1);
+        assert!(engine.current_video.is_some());
+        assert!(engine.take_actions().is_empty());
+
+        let (mut video_only, _, _) = looped_video_engine(LoopMode::Looped);
+        video_only.current_video.as_mut().unwrap().has_audio = false;
+        video_only.video_eof(1, 1);
+        assert_eq!(play_video_count(&video_only.take_actions()), 1);
+
+        let (mut one_shot, _, _) = looped_video_engine(LoopMode::OneShot);
+        one_shot.video_eof(1, 1);
+        assert!(one_shot.current_video.is_none());
+        assert!(matches!(
+            one_shot.take_actions().as_slice(),
+            [EngineAction::StopVideo { .. }]
+        ));
     }
 }
