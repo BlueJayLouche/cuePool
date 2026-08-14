@@ -1,4 +1,5 @@
 use cuepool_gui::SharedStateHandle;
+use cuepool_gui::logging::PERSIST_TARGET;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -57,7 +58,8 @@ pub(crate) fn spawn_autosave_thread(state: SharedStateHandle, running: Arc<Atomi
 }
 
 /// Attempt an emergency save before the process exits.
-pub(crate) fn emergency_save(state: &SharedStateHandle) {
+pub(crate) fn emergency_save(state: &SharedStateHandle, reason: &str) {
+    log::info!(target: PERSIST_TARGET, "Recovery save requested: {reason}");
     let (json, path) = {
         let Ok(state) = state.lock() else { return };
         let json = match serde_json::to_string_pretty(&state.show_file) {
@@ -80,14 +82,14 @@ pub(crate) fn emergency_save(state: &SharedStateHandle) {
     if let Err(e) = std::fs::write(&crash_path, &json) {
         log::error!("Emergency save: failed to write {:?}: {}", crash_path, e);
     } else {
-        log::info!("Emergency save written to {:?}", crash_path);
+        log::info!(target: PERSIST_TARGET, "Recovery save written to {:?}", crash_path);
     }
 
     if let Some(project_path) = path {
         if let Err(e) = std::fs::write(&project_path, &json) {
             log::error!("Emergency save: failed to overwrite {:?}: {}", project_path, e);
         } else {
-            log::info!("Emergency save overwritten {:?}", project_path);
+            log::info!(target: PERSIST_TARGET, "Recovery save overwrote {:?}", project_path);
         }
     }
 }

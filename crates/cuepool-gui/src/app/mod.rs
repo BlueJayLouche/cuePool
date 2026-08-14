@@ -245,6 +245,7 @@ pub struct Diagnostics {
     pub app_version: String,
     pub os: String,
     pub arch: String,
+    pub log_file: String,
     pub gpu_name: String,
     pub gpu_backend: String,
     pub gpu_driver: String,
@@ -279,6 +280,7 @@ impl Diagnostics {
             ("App Version".into(), self.app_version.clone()),
             ("OS".into(), self.os.clone()),
             ("Arch".into(), self.arch.clone()),
+            ("Log File".into(), self.log_file.clone()),
         ]));
 
         sections.push(("GPU", vec![
@@ -2087,8 +2089,21 @@ impl CuePoolApp {
                     if !Self::confirm_discard(&self.state) {
                         continue;
                     }
-                    if let Err(error) = self.open_project_path(&path) {
-                        log::error!("{error}");
+                    log::info!(
+                        target: crate::logging::PERSIST_TARGET,
+                        "Project load requested: {}",
+                        path.display()
+                    );
+                    match self.open_project_path(&path) {
+                        Ok(()) => log::info!(
+                            target: crate::logging::PERSIST_TARGET,
+                            "Project loaded: {}",
+                            path.display()
+                        ),
+                        Err(error) => log::error!(
+                            "Project load failed for '{}': {error}",
+                            path.display()
+                        ),
                     }
                 }
                 AppCommand::SaveProject => {
@@ -2808,6 +2823,21 @@ mod tests {
                 cuepool_core::AudioOutputDriver::WASAPI
             ))
         ));
+    }
+
+    #[test]
+    fn diagnostics_include_the_persistent_log_path() {
+        let diagnostics = Diagnostics {
+            log_file: "C:/CuePool/cuepool.log".into(),
+            ..Default::default()
+        };
+
+        assert!(diagnostics.sections()[0]
+            .1
+            .contains(&("Log File".into(), "C:/CuePool/cuepool.log".into())));
+        assert!(diagnostics
+            .to_text()
+            .contains("Log File: C:/CuePool/cuepool.log"));
     }
 
     #[test]

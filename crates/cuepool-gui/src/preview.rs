@@ -163,6 +163,7 @@ fn populate_telemetry(state: &mut SharedState) {
         app_version: "0.1.0-preview".into(),
         os: "Preview OS".into(),
         arch: "x86_64".into(),
+        log_file: "/tmp/CuePool/cuepool.log".into(),
         gpu_name: "Preview GPU".into(),
         gpu_backend: "Vulkan".into(),
         gpu_driver: "Demo Driver".into(),
