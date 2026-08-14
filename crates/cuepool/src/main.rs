@@ -22,6 +22,7 @@ use cuepool_protocols::midi::{MidiEvent, MidiManager};
 use cuepool_protocols::msc::{MscCommandFlags, MscEvent, MscManager};
 use cuepool_protocols::osc::{OscEvent, OscManager};
 use cuepool_video::{FramePool, VideoFrame, ZeroCopyAvailability, ZeroCopyPreference};
+use std::ffi::OsString;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -408,9 +409,8 @@ impl App {
         queue: wgpu::Queue,
         proxy: winit::event_loop::EventLoopProxy<AppEvent>,
         zero_copy: ZeroCopyAvailability,
+        cuepool: CuePoolApp,
     ) -> Self {
-        let cuepool = CuePoolApp::new();
-
         // Protocol settings from project settings (fallback to defaults)
         let (nic, subnet, osc_rx_port, osc_tx_port, is_remote_host, enable_remote_control) = {
             match cuepool.state().lock() {
@@ -4569,24 +4569,57 @@ fn resolve_cli_project_path(path: &Path, cwd: &Path) -> Result<PathBuf, String> 
     Ok(resolved)
 }
 
-fn main() -> anyhow::Result<()> {
-    // Single instance guard. On unix the name is a filesystem path, and
-    // Finder launches apps with cwd=/ (read-only) — use an absolute temp
-    // path, and never crash over the guard (worst case: two instances).
-    #[cfg(unix)]
-    let lock_name = std::env::temp_dir()
-        .join("CuePool.lock")
-        .to_string_lossy()
-        .into_owned();
-    #[cfg(not(unix))]
-    let lock_name = "CuePool".to_string();
-    let single = single_instance::SingleInstance::new(&lock_name).ok();
-    if let Some(s) = &single
-        && !s.is_single()
-    {
-        log::warn!("Another instance of CuePool is already running. Exiting.");
-        return Ok(());
+const CLI_USAGE: &str = "Usage: cuepool [--project <path> | <path>]";
+
+fn parse_cli_project(args: impl IntoIterator<Item = OsString>) -> Result<Option<PathBuf>, String> {
+    let mut project = None;
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        let path = if arg == "--project" {
+            args.next()
+                .ok_or_else(|| format!("Missing path after --project. {CLI_USAGE}"))?
+        } else if arg.to_string_lossy().starts_with('-') {
+            return Err(format!(
+                "Unknown option '{}'. {CLI_USAGE}",
+                arg.to_string_lossy()
+            ));
+        } else {
+            arg
+        };
+
+        if project.replace(PathBuf::from(path)).is_some() {
+            return Err(format!(
+                "Only one project path may be provided. {CLI_USAGE}"
+            ));
+        }
     }
+    Ok(project)
+}
+
+fn load_startup_project(cuepool: &CuePoolApp, path: &Path) -> Result<(), String> {
+    let data = std::fs::read_to_string(path)
+        .map_err(|error| format!("Cannot read startup project '{}': {error}", path.display()))?;
+    let mut state = cuepool.state().lock_unpoisoned();
+    state
+        .load_show_file(path, &data)
+        .map_err(|error| format!("Cannot parse startup project '{}': {error}", path.display()))?;
+    state.push_recent_file(path);
+    Ok(())
+}
+
+fn startup_error(title: &str, message: String) -> anyhow::Error {
+    log::error!("{message}");
+    let _ = rfd::MessageDialog::new()
+        .set_title(title)
+        .set_description(&message)
+        .set_level(rfd::MessageLevel::Error)
+        .set_buttons(rfd::MessageButtons::Ok)
+        .show();
+    anyhow::anyhow!(message)
+}
+
+fn main() -> anyhow::Result<()> {
+    cuepool_gui::logging::init_logger();
 
     human_panic::setup_panic!(
         Metadata::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
@@ -4594,7 +4627,69 @@ fn main() -> anyhow::Result<()> {
             .homepage("https://github.com/BlueJayLouche/CuePool")
     );
 
-    cuepool_gui::logging::init_logger();
+    let argv: Vec<OsString> = std::env::args_os().collect();
+    let cwd = std::env::current_dir().map_err(|error| {
+        startup_error(
+            "Could not start CuePool",
+            format!("Cannot read the startup working directory: {error}"),
+        )
+    })?;
+    log::info!(
+        "CuePool startup: argv={argv:?}, working_directory={}",
+        cwd.display()
+    );
+
+    let project_path = parse_cli_project(argv.iter().skip(1).cloned())
+        .and_then(|path| {
+            path.map(|path| resolve_cli_project_path(&path, &cwd))
+                .transpose()
+        })
+        .map_err(|message| startup_error("Could not open project", message))?;
+    if let Some(path) = &project_path {
+        log::info!("CuePool startup: resolved_project={}", path.display());
+    } else {
+        log::info!("CuePool startup: resolved_project=<none>");
+    }
+
+    // Single instance guard. On Unix the name is a filesystem path, and
+    // Finder launches apps with cwd=/ (read-only), so use an absolute temp path.
+    #[cfg(unix)]
+    let lock_name = std::env::temp_dir()
+        .join("CuePool.lock")
+        .to_string_lossy()
+        .into_owned();
+    #[cfg(not(unix))]
+    let lock_name = "CuePool".to_string();
+    let single = single_instance::SingleInstance::new(&lock_name).map_err(|error| {
+        startup_error(
+            "Could not start CuePool",
+            format!("Cannot establish the CuePool single-instance guard: {error}"),
+        )
+    })?;
+    if !single.is_single() {
+        return Err(startup_error(
+            "CuePool is already running",
+            "Another instance of CuePool is already running; the project was not opened.".into(),
+        ));
+    }
+
+    let cuepool = CuePoolApp::new();
+    let settings = load_settings();
+    cuepool.state().lock_unpoisoned().recent_files = settings.recent_files;
+    if let Some(path) = &project_path {
+        load_startup_project(&cuepool, path).map_err(|message| {
+            startup_error(
+                "Could not open project",
+                format!("CuePool startup project load result=failure: {message}"),
+            )
+        })?;
+        log::info!(
+            "CuePool startup project load result=success: path={}",
+            path.display()
+        );
+    } else {
+        log::info!("CuePool startup project load result=not_requested");
+    }
 
     // 1 ms timer resolution so WaitUntil/sleep don't quantize to 15.6 ms.
     #[cfg(windows)]
@@ -4665,48 +4760,7 @@ fn main() -> anyhow::Result<()> {
         }
     });
 
-    let mut app = App::new(instance, adapter, device, queue, proxy, zero_copy);
-
-    // Load app-level settings. Project audio settings live in the show file
-    // and are applied when its project generation changes.
-    let settings = load_settings();
-    if let Ok(mut state) = app.cuepool.state().lock() {
-        state.recent_files = settings.recent_files;
-    }
-
-    // Optional CLI: `cuepool path/to/show.qproj` opens a project on startup.
-    if let Some(path) = std::env::args_os().nth(1).map(std::path::PathBuf::from) {
-        let project_path = if path.is_absolute() {
-            resolve_cli_project_path(&path, Path::new("."))
-        } else {
-            std::env::current_dir()
-                .map_err(|error| {
-                    format!(
-                        "Cannot resolve CLI project '{}': working directory unavailable: {error}",
-                        path.display()
-                    )
-                })
-                .and_then(|cwd| resolve_cli_project_path(&path, &cwd))
-        };
-        match project_path {
-            Ok(path) => {
-                app.cuepool
-                    .state()
-                    .lock_unpoisoned()
-                    .command_queue
-                    .push(AppCommand::OpenProject { path });
-            }
-            Err(message) => {
-                log::error!("{message}");
-                let _ = rfd::MessageDialog::new()
-                    .set_title("Could not open project")
-                    .set_description(message)
-                    .set_level(rfd::MessageLevel::Error)
-                    .set_buttons(rfd::MessageButtons::Ok)
-                    .show();
-            }
-        }
-    }
+    let mut app = App::new(instance, adapter, device, queue, proxy, zero_copy, cuepool);
 
     // Ctrl-C / SIGTERM handler for graceful emergency save
     {
@@ -4786,16 +4840,48 @@ mod tests {
         ));
     }
 
-
     fn cli_project_test_dir() -> PathBuf {
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        static NEXT_TEST_DIR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let unique = NEXT_TEST_DIR.fetch_add(1, Ordering::Relaxed);
         let path =
             std::env::temp_dir().join(format!("cuepool-cli-path-{}-{unique}", std::process::id()));
         std::fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn cli_project_accepts_explicit_and_legacy_paths() {
+        let path = PathBuf::from("Opening Night.qproj");
+        assert_eq!(
+            parse_cli_project([OsString::from("--project"), path.clone().into_os_string()]),
+            Ok(Some(path.clone()))
+        );
+        assert_eq!(
+            parse_cli_project([path.clone().into_os_string()]),
+            Ok(Some(path))
+        );
+        assert_eq!(parse_cli_project([]), Ok(None));
+    }
+
+    #[test]
+    fn cli_project_rejects_invalid_argument_shapes() {
+        let missing = parse_cli_project([OsString::from("--project")]).unwrap_err();
+        assert!(missing.contains("Missing path"), "{missing}");
+
+        let unknown = parse_cli_project([OsString::from("--wat")]).unwrap_err();
+        assert!(unknown.contains("Unknown option"), "{unknown}");
+
+        let duplicate = parse_cli_project([
+            OsString::from("one.qproj"),
+            OsString::from("--project"),
+            OsString::from("two.qproj"),
+        ])
+        .unwrap_err();
+        assert!(duplicate.contains("Only one project"), "{duplicate}");
+
+        let extra = parse_cli_project([OsString::from("one.qproj"), OsString::from("two.qproj")])
+            .unwrap_err();
+        assert!(extra.contains("Only one project"), "{extra}");
     }
 
     #[test]
@@ -4827,7 +4913,36 @@ mod tests {
         std::fs::remove_dir_all(cwd).unwrap();
     }
 
+    #[test]
+    fn startup_project_load_populates_project_path() {
+        let dir = cli_project_test_dir();
+        let path = dir.join("startup.qproj");
+        let json = serde_json::to_string(&cuepool_core::ShowFile::default()).unwrap();
+        std::fs::write(&path, json).unwrap();
+        let cuepool = CuePoolApp::new();
 
+        load_startup_project(&cuepool, &path).unwrap();
+
+        let state = cuepool.state().lock_unpoisoned();
+        assert_eq!(state.project_path.as_deref(), Some(path.as_path()));
+        assert_eq!(state.recent_files.first(), Some(&path));
+        drop(state);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn corrupt_startup_project_fails_without_populating_project_path() {
+        let dir = cli_project_test_dir();
+        let path = dir.join("corrupt.qproj");
+        std::fs::write(&path, "{").unwrap();
+        let cuepool = CuePoolApp::new();
+
+        let error = load_startup_project(&cuepool, &path).unwrap_err();
+
+        assert!(error.contains("Cannot parse startup project"), "{error}");
+        assert!(cuepool.state().lock_unpoisoned().project_path.is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn video_seek_target_stays_strictly_before_the_end() {
