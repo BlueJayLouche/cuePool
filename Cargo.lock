@@ -2962,7 +2962,7 @@ dependencies = [
 [[package]]
 name = "naga"
 version = "29.0.4"
-source = "git+https://github.com/scroix/wgpu?rev=a0b9d5718c2ab2edfce2f156792b0f4359f25460#a0b9d5718c2ab2edfce2f156792b0f4359f25460"
+source = "git+https://github.com/scroix/wgpu?rev=3d1a6dbe55f9f1e4e3d26f6b525808a38b22cf87#3d1a6dbe55f9f1e4e3d26f6b525808a38b22cf87"
 dependencies = [
  "arrayvec",
  "bit-set",
@@ -5708,7 +5708,7 @@ checksum = "a28ac98ddc8b9274cb41bb4d9d4d5c425b6020c50c46f25559911905610b4a88"
 [[package]]
 name = "wgpu"
 version = "29.0.4"
-source = "git+https://github.com/scroix/wgpu?rev=a0b9d5718c2ab2edfce2f156792b0f4359f25460#a0b9d5718c2ab2edfce2f156792b0f4359f25460"
+source = "git+https://github.com/scroix/wgpu?rev=3d1a6dbe55f9f1e4e3d26f6b525808a38b22cf87#3d1a6dbe55f9f1e4e3d26f6b525808a38b22cf87"
 dependencies = [
  "arrayvec",
  "bitflags 2.13.1",
@@ -5737,7 +5737,7 @@ dependencies = [
 [[package]]
 name = "wgpu-core"
 version = "29.0.4"
-source = "git+https://github.com/scroix/wgpu?rev=a0b9d5718c2ab2edfce2f156792b0f4359f25460#a0b9d5718c2ab2edfce2f156792b0f4359f25460"
+source = "git+https://github.com/scroix/wgpu?rev=3d1a6dbe55f9f1e4e3d26f6b525808a38b22cf87#3d1a6dbe55f9f1e4e3d26f6b525808a38b22cf87"
 dependencies = [
  "arrayvec",
  "bit-set",
@@ -5770,7 +5770,7 @@ dependencies = [
 [[package]]
 name = "wgpu-core-deps-apple"
 version = "29.0.4"
-source = "git+https://github.com/scroix/wgpu?rev=a0b9d5718c2ab2edfce2f156792b0f4359f25460#a0b9d5718c2ab2edfce2f156792b0f4359f25460"
+source = "git+https://github.com/scroix/wgpu?rev=3d1a6dbe55f9f1e4e3d26f6b525808a38b22cf87#3d1a6dbe55f9f1e4e3d26f6b525808a38b22cf87"
 dependencies = [
  "wgpu-hal",
 ]
@@ -5778,7 +5778,7 @@ dependencies = [
 [[package]]
 name = "wgpu-core-deps-emscripten"
 version = "29.0.4"
-source = "git+https://github.com/scroix/wgpu?rev=a0b9d5718c2ab2edfce2f156792b0f4359f25460#a0b9d5718c2ab2edfce2f156792b0f4359f25460"
+source = "git+https://github.com/scroix/wgpu?rev=3d1a6dbe55f9f1e4e3d26f6b525808a38b22cf87#3d1a6dbe55f9f1e4e3d26f6b525808a38b22cf87"
 dependencies = [
  "wgpu-hal",
 ]
@@ -5786,7 +5786,7 @@ dependencies = [
 [[package]]
 name = "wgpu-core-deps-wasm"
 version = "29.0.4"
-source = "git+https://github.com/scroix/wgpu?rev=a0b9d5718c2ab2edfce2f156792b0f4359f25460#a0b9d5718c2ab2edfce2f156792b0f4359f25460"
+source = "git+https://github.com/scroix/wgpu?rev=3d1a6dbe55f9f1e4e3d26f6b525808a38b22cf87#3d1a6dbe55f9f1e4e3d26f6b525808a38b22cf87"
 dependencies = [
  "wgpu-hal",
 ]
@@ -5794,7 +5794,7 @@ dependencies = [
 [[package]]
 name = "wgpu-core-deps-windows-linux-android"
 version = "29.0.4"
-source = "git+https://github.com/scroix/wgpu?rev=a0b9d5718c2ab2edfce2f156792b0f4359f25460#a0b9d5718c2ab2edfce2f156792b0f4359f25460"
+source = "git+https://github.com/scroix/wgpu?rev=3d1a6dbe55f9f1e4e3d26f6b525808a38b22cf87#3d1a6dbe55f9f1e4e3d26f6b525808a38b22cf87"
 dependencies = [
  "wgpu-hal",
 ]
@@ -5802,7 +5802,7 @@ dependencies = [
 [[package]]
 name = "wgpu-hal"
 version = "29.0.4"
-source = "git+https://github.com/scroix/wgpu?rev=a0b9d5718c2ab2edfce2f156792b0f4359f25460#a0b9d5718c2ab2edfce2f156792b0f4359f25460"
+source = "git+https://github.com/scroix/wgpu?rev=3d1a6dbe55f9f1e4e3d26f6b525808a38b22cf87#3d1a6dbe55f9f1e4e3d26f6b525808a38b22cf87"
 dependencies = [
  "android_system_properties",
  "arrayvec",
@@ -5855,7 +5855,7 @@ dependencies = [
 [[package]]
 name = "wgpu-naga-bridge"
 version = "29.0.4"
-source = "git+https://github.com/scroix/wgpu?rev=a0b9d5718c2ab2edfce2f156792b0f4359f25460#a0b9d5718c2ab2edfce2f156792b0f4359f25460"
+source = "git+https://github.com/scroix/wgpu?rev=3d1a6dbe55f9f1e4e3d26f6b525808a38b22cf87#3d1a6dbe55f9f1e4e3d26f6b525808a38b22cf87"
 dependencies = [
  "naga",
  "wgpu-types",
@@ -5864,7 +5864,7 @@ dependencies = [
 [[package]]
 name = "wgpu-types"
 version = "29.0.4"
-source = "git+https://github.com/scroix/wgpu?rev=a0b9d5718c2ab2edfce2f156792b0f4359f25460#a0b9d5718c2ab2edfce2f156792b0f4359f25460"
+source = "git+https://github.com/scroix/wgpu?rev=3d1a6dbe55f9f1e4e3d26f6b525808a38b22cf87#3d1a6dbe55f9f1e4e3d26f6b525808a38b22cf87"
 dependencies = [
  "bitflags 2.13.1",
  "bytemuck",

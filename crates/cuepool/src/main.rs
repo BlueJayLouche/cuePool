@@ -4446,17 +4446,6 @@ impl ApplicationHandler<AppEvent> for App {
                     }
                 })
                 .collect();
-            if self.fps_debug {
-                let per_output = outputs
-                    .iter()
-                    .map(|o| format!("'{}' {:.0}/s", o.name, o.presented_per_sec))
-                    .collect::<Vec<_>>()
-                    .join(" | ");
-                eprintln!(
-                    "VIDEO DIAG: loop {:.0}/s | starved {:.0}/s | presented {}",
-                    ticks_per_sec, starved_per_sec, per_output,
-                );
-            }
             let mut state = self.cuepool.state().lock_unpoisoned();
             let d = &mut state.diagnostics;
             d.presented_per_sec = total_presented;
@@ -4465,6 +4454,70 @@ impl ApplicationHandler<AppEvent> for App {
             d.dropped_per_sec = dropped_per_sec;
             d.event_loop_per_sec = ticks_per_sec;
             d.outputs = outputs;
+            if self.fps_debug {
+                let per_output = d
+                    .outputs
+                    .iter()
+                    .map(|o| format!("'{}' {:.0}/s", o.name, o.presented_per_sec))
+                    .collect::<Vec<_>>()
+                    .join(" | ");
+                // Same counters the Status window shows, on stderr for headless
+                // capture: delivery rates plus the per-frame timing split.
+                let timings = d.video.as_ref().map(|v| {
+                    format!(
+                        " | decode {:.2} ms | upload {:.2} ms | conv-submit {:.2} ms",
+                        v.timings.decode.get_ms(),
+                        v.timings.upload.get_ms(),
+                        v.timings.conversion_submit.get_ms(),
+                    )
+                });
+                eprintln!(
+                    "VIDEO DIAG: loop {:.0}/s | uploads {:.0}/s | dropped {:.0}/s | starved {:.0}/s | presented {}{}",
+                    ticks_per_sec,
+                    uploads_per_sec,
+                    dropped_per_sec,
+                    starved_per_sec,
+                    per_output,
+                    timings.as_deref().unwrap_or(""),
+                );
+            }
+            if wgpu::frame_pacing_diag::enabled() {
+                let s = wgpu::frame_pacing_diag::snapshot_and_reset();
+                let fmt = |b: &wgpu::frame_pacing_diag::BucketSnapshot| {
+                    let m = |m: &wgpu::frame_pacing_diag::MetricSnapshot| {
+                        if m.count == 0 {
+                            "-".to_string()
+                        } else {
+                            format!(
+                                "{:.1}/{:.1}ms x{}",
+                                m.total_us as f64 / m.count as f64 / 1000.0,
+                                m.max_us as f64 / 1000.0,
+                                m.count
+                            )
+                        }
+                    };
+                    format!(
+                        "lockwait {} | hal {} | total {} | acqwait {} | acqhold {} | preswait {}",
+                        m(&b.submit_fence_wait),
+                        m(&b.submit_hal_call),
+                        m(&b.submit_total),
+                        m(&b.acquire_fence_wait),
+                        m(&b.acquire_hold),
+                        m(&b.present_fence_wait),
+                    )
+                };
+                let rows = vec![
+                    ("video-consume".to_string(), fmt(&s.consume)),
+                    ("output-render-*".to_string(), fmt(&s.render)),
+                    ("other threads".to_string(), fmt(&s.other)),
+                ];
+                if self.fps_debug {
+                    for (name, row) in &rows {
+                        eprintln!("WGPU DIAG {name}: {row}");
+                    }
+                }
+                d.frame_pacing = rows;
+            }
             drop(state);
             self.dbg_ticks = 0;
             self.dbg_last_log = std::time::Instant::now();

@@ -198,6 +198,7 @@ fn populate_telemetry(state: &mut SharedState) {
                 conversion_submit: crate::DecodeTiming::from_ms(0.2),
             },
         }),
+        frame_pacing: Vec::new(),
     };
     state.recorder_status = RecorderStatus {
         recording: true,

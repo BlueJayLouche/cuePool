@@ -264,6 +264,9 @@ pub struct Diagnostics {
     /// Set once if the video consume thread exits while the app is still running.
     pub consumer_error: Option<String>,
     pub video: Option<VideoDiagnostics>,
+    /// wgpu fence-lock timing rows (thread bucket → formatted stats), present
+    /// only when the fork's `frame-pacing-diag` feature is compiled in.
+    pub frame_pacing: Vec<(String, String)>,
 }
 
 impl Diagnostics {
@@ -326,6 +329,10 @@ impl Diagnostics {
             ("Starved/s".into(), format!("{:.0}", self.starved_per_sec)),
             ("Video Consumer".into(), self.consumer_error.clone().unwrap_or_else(|| "running".into())),
         ]));
+
+        if !self.frame_pacing.is_empty() {
+            sections.push(("Frame Pacing (wgpu)", self.frame_pacing.clone()));
+        }
 
         let env = if self.env_overrides.is_empty() {
             vec![("Overrides".into(), "none set".into())]
