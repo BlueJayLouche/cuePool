@@ -129,6 +129,16 @@ pub(crate) struct VideoControl {
     pub(crate) uploads: u32,
     /// Due-frame drop counter (consume → winit diagnostics; swapped out ~1 Hz).
     pub(crate) dropped: u32,
+    /// Consume-loop pacing stats (consume → winit diagnostics; swapped ~1 Hz).
+    /// Splits "why did an upload miss its tick": loop iterations, vsync ticks
+    /// observed, wakes that saw >1 tick at once (each coalesced tick is a
+    /// frame that could not have been shown), and the longest single loop
+    /// iteration — if iterations stay short while ticks coalesce, the pacer
+    /// output's presents are irregular, not the consume thread.
+    pub(crate) consume_iters: u32,
+    pub(crate) consume_ticks: u32,
+    pub(crate) consume_coalesced: u32,
+    pub(crate) consume_max_iter_us: u32,
 }
 
 /// Cue-driven canvas/overlay work for the consume thread (rare; the video
@@ -308,12 +318,27 @@ pub(crate) fn video_consume_thread(
     let mut last_vsync_at: Option<Instant> = None;
     let mut vsync_interval: Option<Duration> = None;
 
+    // Consume-loop pacing stats, accumulated locally and flushed to
+    // `VideoControl` about once a second (see the struct fields for meaning).
+    let mut stat_iters = 0u32;
+    let mut stat_ticks = 0u32;
+    let mut stat_coalesced = 0u32;
+    let mut stat_max_iter_us = 0u32;
+    let mut stat_last_flush = Instant::now();
+
     while !stop.load(Ordering::Relaxed) {
+        let iter_started = Instant::now();
         #[cfg(windows)]
         {
-            let _ = device.poll(wgpu::PollType::Poll);
-            if retirement_rx.try_iter().next().is_some() {
-                direct_retirement.drain_completed();
+            // Poll only while zero-copy submissions await retirement: on the
+            // readback path this ran every iteration for nothing, and on
+            // Windows/NVIDIA an idle vkGetSemaphoreCounterValue-class call can
+            // still stall tens of ms behind the vsync-blocked render threads.
+            if !direct_retirement.is_empty() {
+                let _ = device.poll(wgpu::PollType::Poll);
+                if retirement_rx.try_iter().next().is_some() {
+                    direct_retirement.drain_completed();
+                }
             }
         }
         // ── Cue-driven canvas/overlay commands (rare) ──
@@ -887,6 +912,22 @@ pub(crate) fn video_consume_thread(
         } else {
             sleep_for
         };
+        stat_iters += 1;
+        let iter_us = iter_started.elapsed().as_micros().min(u32::MAX as u128) as u32;
+        stat_max_iter_us = stat_max_iter_us.max(iter_us);
+        if stat_last_flush.elapsed() >= Duration::from_secs(1) {
+            let mut ctl = control.lock_unpoisoned();
+            ctl.consume_iters += stat_iters;
+            ctl.consume_ticks += stat_ticks;
+            ctl.consume_coalesced += stat_coalesced;
+            ctl.consume_max_iter_us = ctl.consume_max_iter_us.max(stat_max_iter_us);
+            drop(ctl);
+            stat_iters = 0;
+            stat_ticks = 0;
+            stat_coalesced = 0;
+            stat_max_iter_us = 0;
+            stat_last_flush = Instant::now();
+        }
         if !sleep_for.is_zero() {
             let tick = vsync_tick.0.lock_unpoisoned();
             let (tick, _) = vsync_tick
@@ -896,6 +937,11 @@ pub(crate) fn video_consume_thread(
             let next_vsync_tick = *tick;
             drop(tick);
             let tick_count = next_vsync_tick.wrapping_sub(last_vsync_tick);
+            stat_ticks = stat_ticks.saturating_add(tick_count.min(u32::MAX as u64) as u32);
+            if tick_count > 1 {
+                stat_coalesced =
+                    stat_coalesced.saturating_add((tick_count - 1).min(u32::MAX as u64) as u32);
+            }
             woke_on_vsync = tick_count != 0;
             if woke_on_vsync {
                 let now = Instant::now();

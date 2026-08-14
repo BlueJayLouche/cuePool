@@ -79,7 +79,7 @@ codegen-units = 1
 panic = "abort"
 
 [patch.crates-io]
-wgpu = { git = "https://github.com/scroix/wgpu", rev = "3d1a6dbe55f9f1e4e3d26f6b525808a38b22cf87" }
-wgpu-core = { git = "https://github.com/scroix/wgpu", rev = "3d1a6dbe55f9f1e4e3d26f6b525808a38b22cf87" }
-wgpu-hal = { git = "https://github.com/scroix/wgpu", rev = "3d1a6dbe55f9f1e4e3d26f6b525808a38b22cf87" }
-wgpu-types = { git = "https://github.com/scroix/wgpu", rev = "3d1a6dbe55f9f1e4e3d26f6b525808a38b22cf87" }
+wgpu = { git = "https://github.com/scroix/wgpu", rev = "a3f84d243aca193b33111b935701a8b7521ea6b5" }
+wgpu-core = { git = "https://github.com/scroix/wgpu", rev = "a3f84d243aca193b33111b935701a8b7521ea6b5" }
+wgpu-hal = { git = "https://github.com/scroix/wgpu", rev = "a3f84d243aca193b33111b935701a8b7521ea6b5" }
+wgpu-types = { git = "https://github.com/scroix/wgpu", rev = "a3f84d243aca193b33111b935701a8b7521ea6b5" }

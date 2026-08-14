@@ -276,6 +276,16 @@ struct App {
     /// main-loop liveness diagnostic (a GPU-stalled loop shows up here).
     dbg_ticks: u32,
     dbg_last_log: std::time::Instant,
+    /// Per-second max duration of one `about_to_wait` pass and one
+    /// `render_control` pass — splits a slow main loop into engine-tick time
+    /// versus egui/WSI time. Reset at the 1 Hz diagnostics flush.
+    dbg_about_max_us: u32,
+    dbg_render_max_us: u32,
+    dbg_render_count: u32,
+    /// Present mode the control surface actually negotiated (the outputs table
+    /// only covers projector surfaces, and this one decides whether the winit
+    /// thread blocks on vsync).
+    control_present_mode: String,
 
     // ── localhost automation API ──
     api: Option<ApiRuntime>,
@@ -580,6 +590,10 @@ impl App {
             fps_debug: std::env::var("QPLAYER_FPS_DEBUG").is_ok(),
             dbg_ticks: 0,
             dbg_last_log: std::time::Instant::now(),
+            dbg_about_max_us: 0,
+            dbg_render_max_us: 0,
+            dbg_render_count: 0,
+            control_present_mode: String::new(),
             api,
             osc_manager,
             osc_rx,
@@ -669,6 +683,7 @@ impl App {
         );
 
         let control_id = window.id();
+        self.control_present_mode = format!("{:?}", config.present_mode);
         self.control_window = Some(window);
         self.control_surface = Some(surface);
         self.control_config = Some(config);
@@ -2889,6 +2904,14 @@ impl App {
         }
     }
     fn render_control(&mut self) {
+        let render_started = Instant::now();
+        self.render_control_inner();
+        let us = render_started.elapsed().as_micros().min(u32::MAX as u128) as u32;
+        self.dbg_render_max_us = self.dbg_render_max_us.max(us);
+        self.dbg_render_count += 1;
+    }
+
+    fn render_control_inner(&mut self) {
         self.update_window_title();
 
         // Acquire (under the shared gate) BEFORE running the egui pass: bailing
@@ -3230,6 +3253,7 @@ impl ApplicationHandler<AppEvent> for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let about_started = Instant::now();
         self.dbg_ticks += 1;
         if let Some(api) = self.api.as_ref() {
             api.mark_alive();
@@ -3439,12 +3463,24 @@ impl ApplicationHandler<AppEvent> for App {
 
         if self.dbg_last_log.elapsed() >= std::time::Duration::from_secs(1) {
             let secs = self.dbg_last_log.elapsed().as_secs_f64();
-            let (starved_per_sec, uploads_per_sec, dropped_per_sec) = {
+            let (
+                starved_per_sec,
+                uploads_per_sec,
+                dropped_per_sec,
+                consume_iters,
+                consume_ticks,
+                consume_coalesced,
+                consume_max_iter_us,
+            ) = {
                 let mut ctl = self.video_control.lock_unpoisoned();
                 (
                     std::mem::replace(&mut ctl.starved, 0) as f64 / secs,
                     std::mem::replace(&mut ctl.uploads, 0) as f64 / secs,
                     std::mem::replace(&mut ctl.dropped, 0) as f64 / secs,
+                    std::mem::replace(&mut ctl.consume_iters, 0) as f64 / secs,
+                    std::mem::replace(&mut ctl.consume_ticks, 0) as f64 / secs,
+                    std::mem::replace(&mut ctl.consume_coalesced, 0) as f64 / secs,
+                    std::mem::replace(&mut ctl.consume_max_iter_us, 0),
                 )
             };
             let ticks_per_sec = self.dbg_ticks as f64 / secs;
@@ -3512,6 +3548,7 @@ impl ApplicationHandler<AppEvent> for App {
                     timings.as_deref().unwrap_or(""),
                 );
             }
+            let mut rows = Vec::new();
             if wgpu::frame_pacing_diag::enabled() {
                 let s = wgpu::frame_pacing_diag::snapshot_and_reset();
                 let fmt = |b: &wgpu::frame_pacing_diag::BucketSnapshot| {
@@ -3528,27 +3565,52 @@ impl ApplicationHandler<AppEvent> for App {
                         }
                     };
                     format!(
-                        "lockwait {} | hal {} | total {} | acqwait {} | acqhold {} | preswait {}",
+                        "lockwait {} | hal {} | acqhal {} | preshal {} | total {} | acqwait {} | acqhold {} | preswait {}",
                         m(&b.submit_fence_wait),
                         m(&b.submit_hal_call),
+                        m(&b.acquire_hal_call),
+                        m(&b.present_hal_call),
                         m(&b.submit_total),
                         m(&b.acquire_fence_wait),
                         m(&b.acquire_hold),
                         m(&b.present_fence_wait),
                     )
                 };
-                let rows = vec![
-                    ("video-consume".to_string(), fmt(&s.consume)),
-                    ("output-render-*".to_string(), fmt(&s.render)),
-                    ("other threads".to_string(), fmt(&s.other)),
-                ];
-                if self.fps_debug {
-                    for (name, row) in &rows {
-                        eprintln!("WGPU DIAG {name}: {row}");
-                    }
-                }
-                d.frame_pacing = rows;
+                rows.push(("video-consume".to_string(), fmt(&s.consume)));
+                rows.push(("output-render-*".to_string(), fmt(&s.render)));
+                rows.push(("other threads".to_string(), fmt(&s.other)));
             }
+            // CuePool-level pacing rows: where the consume thread's ticks went
+            // and how long the main thread's two phases run. `coalesced` counts
+            // vsync ticks observed late (each is a frame that could no longer
+            // be shown); `max-iter` is the slowest consume-loop pass.
+            rows.push((
+                "consume-loop".to_string(),
+                format!(
+                    "iters {consume_iters:.0}/s | ticks {consume_ticks:.0}/s | coalesced {consume_coalesced:.0}/s | max-iter {:.1}ms",
+                    consume_max_iter_us as f64 / 1000.0,
+                ),
+            ));
+            rows.push((
+                "main-loop".to_string(),
+                format!(
+                    "about_to_wait max {:.1}ms | render_control x{} max {:.1}ms | control-surface {}",
+                    std::mem::replace(&mut self.dbg_about_max_us, 0) as f64 / 1000.0,
+                    std::mem::replace(&mut self.dbg_render_count, 0),
+                    std::mem::replace(&mut self.dbg_render_max_us, 0) as f64 / 1000.0,
+                    if self.control_present_mode.is_empty() {
+                        "?"
+                    } else {
+                        &self.control_present_mode
+                    },
+                ),
+            ));
+            if self.fps_debug {
+                for (name, row) in &rows {
+                    eprintln!("WGPU DIAG {name}: {row}");
+                }
+            }
+            d.frame_pacing = rows;
             drop(state);
             self.dbg_ticks = 0;
             self.dbg_last_log = std::time::Instant::now();
@@ -3562,6 +3624,9 @@ impl ApplicationHandler<AppEvent> for App {
                 window.request_redraw();
             }
         }
+
+        let us = about_started.elapsed().as_micros().min(u32::MAX as u128) as u32;
+        self.dbg_about_max_us = self.dbg_about_max_us.max(us);
 
         // Main-loop pacing: nothing on this thread blocks on vsync (each output
         // paces itself in its render thread) and no GPU work happens here

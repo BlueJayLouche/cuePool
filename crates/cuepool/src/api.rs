@@ -451,6 +451,7 @@ fn build_router(state: ApiState) -> Router {
         VideoStatus,
         VideoTimingStatus,
         PacingStatus,
+        FramePacingRow,
         EnvironmentOverride,
         StatusSample,
         StatusHistoryResponse,
@@ -799,6 +800,10 @@ struct DiagnosticsResponse {
     outputs: Vec<OutputStatus>,
     video: Option<VideoStatus>,
     pacing: PacingStatus,
+    /// wgpu fence-lock timing rows from the fork's `frame-pacing-diag`
+    /// feature; empty when the feature isn't compiled in or no sample has
+    /// been taken yet.
+    frame_pacing: Vec<FramePacingRow>,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -844,6 +849,15 @@ struct VideoTimingStatus {
     plane_copy_ms_per_frame: f64,
     upload_ms_per_frame: f64,
     conversion_submit_ms_per_frame: f64,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+struct FramePacingRow {
+    /// Thread bucket: `video-consume`, `output-render-*` or `other threads`.
+    thread: String,
+    /// Formatted per-second stats: lock wait / HAL call / total / acquire
+    /// wait / acquire hold / present wait, each as `avg/max ms xCount`.
+    stats: String,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -912,6 +926,14 @@ fn diagnostics_from(diagnostics: &Diagnostics) -> DiagnosticsResponse {
             event_loop_per_second: diagnostics.event_loop_per_sec,
             consumer_error: diagnostics.consumer_error.clone(),
         },
+        frame_pacing: diagnostics
+            .frame_pacing
+            .iter()
+            .map(|(thread, stats)| FramePacingRow {
+                thread: thread.clone(),
+                stats: stats.clone(),
+            })
+            .collect(),
     }
 }
 
