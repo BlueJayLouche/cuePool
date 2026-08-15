@@ -30,6 +30,15 @@ pub enum BitDepth {
 #[derive(Debug, Clone)]
 pub enum FramePixels {
     Rgba(Vec<u8>),
+    /// Decompressed BC1/BC3 blocks from a HAP packet. The dimensions on
+    /// `VideoFrame` remain the logical image size; the upload is padded to
+    /// complete 4x4 blocks.
+    Hap {
+        format: hap_parser::TextureFormat,
+        data: Vec<u8>,
+        padded_width: u32,
+        padded_height: u32,
+    },
     YuvPlanar {
         subsample: ChromaSubsample,
         bit_depth: BitDepth,
@@ -67,6 +76,29 @@ impl VideoFrame {
             height,
             pts,
             pixels: FramePixels::Rgba(data),
+        }
+    }
+
+    pub(crate) fn hap(
+        width: u32,
+        height: u32,
+        pts: f64,
+        format: hap_parser::TextureFormat,
+        data: Vec<u8>,
+    ) -> Self {
+        let padded_width = width.div_ceil(4) * 4;
+        let padded_height = height.div_ceil(4) * 4;
+        debug_assert_eq!(data.len(), format.frame_size(width, height));
+        Self {
+            width,
+            height,
+            pts,
+            pixels: FramePixels::Hap {
+                format,
+                data,
+                padded_width,
+                padded_height,
+            },
         }
     }
 

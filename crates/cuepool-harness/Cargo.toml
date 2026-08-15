@@ -18,3 +18,6 @@ anyhow.workspace = true
 rust_decimal.workspace = true
 rosc.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+hap-qt = "0.2.0"

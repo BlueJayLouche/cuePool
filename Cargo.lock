@@ -1249,7 +1249,7 @@ dependencies = [
 
 [[package]]
 name = "cuepool"
-version = "0.3.4"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1286,7 +1286,7 @@ dependencies = [
 
 [[package]]
 name = "cuepool-audio"
-version = "0.3.4"
+version = "0.4.0"
 dependencies = [
  "cpal",
  "crossbeam",
@@ -1299,7 +1299,7 @@ dependencies = [
 
 [[package]]
 name = "cuepool-core"
-version = "0.3.4"
+version = "0.4.0"
 dependencies = [
  "chrono",
  "flate2",
@@ -1314,7 +1314,7 @@ dependencies = [
 
 [[package]]
 name = "cuepool-gui"
-version = "0.3.4"
+version = "0.4.0"
 dependencies = [
  "chrono",
  "cuepool-audio",
@@ -1338,7 +1338,7 @@ dependencies = [
 
 [[package]]
 name = "cuepool-harness"
-version = "0.3.4"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "cuepool",
@@ -1346,6 +1346,7 @@ dependencies = [
  "cuepool-core",
  "cuepool-protocols",
  "cuepool-video",
+ "hap-qt",
  "rosc",
  "rust_decimal",
  "serde_json",
@@ -1353,7 +1354,7 @@ dependencies = [
 
 [[package]]
 name = "cuepool-protocols"
-version = "0.3.4"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "bitflags 2.13.1",
@@ -1364,7 +1365,7 @@ dependencies = [
 
 [[package]]
 name = "cuepool-video"
-version = "0.3.4"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "ash",
@@ -1373,6 +1374,8 @@ dependencies = [
  "cuepool-audio",
  "cuepool-core",
  "ffmpeg-next",
+ "hap-parser",
+ "hap-qt",
  "image",
  "log",
  "pollster 0.3.0",
@@ -2221,6 +2224,30 @@ dependencies = [
  "crunchy",
  "num-traits",
  "zerocopy",
+]
+
+[[package]]
+name = "hap-parser"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1c1423b8ada98acdaced416e3d5cec5c515a9a05b2cd67c3d278328cb2f994e8"
+dependencies = [
+ "snap",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "hap-qt"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f662326133a4dd358979b5eade91252c4c04e417bd2b33cd776a2e8cf51fffea"
+dependencies = [
+ "byteorder",
+ "hap-parser",
+ "memmap2",
+ "snap",
+ "texpresso",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -4638,6 +4665,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "snap"
+version = "1.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "199905e6153d6405f9728fe44daace35f8f837bbf830bb6e85fbd5828709a886"
+
+[[package]]
 name = "socket2"
 version = "0.5.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4977,6 +5010,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06794f8f6c5c898b3275aebefa6b8a1cb24cd2c6c79397ab15774837a0bc5755"
 dependencies = [
  "winapi-util",
+]
+
+[[package]]
+name = "texpresso"
+version = "2.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8550677e2259d675a7841cb1403db35f330cc9e58674c8c5caa12dd12c51dc71"
+dependencies = [
+ "libm",
 ]
 
 [[package]]

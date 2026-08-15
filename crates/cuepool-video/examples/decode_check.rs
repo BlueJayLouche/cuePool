@@ -35,6 +35,7 @@ fn main() {
         if n == 0 {
             let path_kind = match &f.pixels {
                 FramePixels::Rgba(_) => "swscale -> RGBA (CPU fallback)".to_string(),
+                FramePixels::Hap { format, .. } => format!("GPU-native HAP {format:?}"),
                 FramePixels::YuvPlanar {
                     subsample,
                     bit_depth,

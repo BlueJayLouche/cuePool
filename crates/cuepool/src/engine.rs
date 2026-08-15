@@ -25,6 +25,7 @@ pub enum EngineCommand {
 #[derive(Debug, Clone)]
 pub enum EngineEvent {
     VideoEof { instance_id: u64, epoch: u64 },
+    VideoFailed { instance_id: u64, epoch: u64 },
     ExternalFinished { qid: Decimal },
 }
 
@@ -242,6 +243,9 @@ impl ShowEngine {
         self.now = now;
         match event {
             EngineEvent::VideoEof { instance_id, epoch } => self.video_eof(instance_id, epoch),
+            EngineEvent::VideoFailed { instance_id, epoch } => {
+                self.video_failed(instance_id, epoch)
+            }
             EngineEvent::ExternalFinished { qid } => self.finish_external(qid),
         }
         self.take_actions()
@@ -1269,6 +1273,23 @@ impl ShowEngine {
         }
     }
 
+    fn video_failed(&mut self, instance_id: u64, epoch: u64) {
+        let Some(video) = self
+            .current_video
+            .as_ref()
+            .filter(|video| video.instance_id == instance_id && video.epoch == epoch)
+            .cloned()
+        else {
+            return;
+        };
+        self.current_video = None;
+        self.actions
+            .push_back(EngineAction::StopVideo { fade_out_secs: 0.0 });
+        if !video.has_audio {
+            self.trace(EngineTrace::CueFinished { qid: video.qid });
+        }
+    }
+
     fn finish_external(&mut self, qid: Decimal) {
         self.trace(EngineTrace::CueFinished { qid });
         self.play_after_last(qid);
@@ -1793,5 +1814,26 @@ mod tests {
             one_shot.take_actions().as_slice(),
             [EngineAction::StopVideo { .. }]
         ));
+    }
+
+    #[test]
+    fn decoder_failure_stops_without_restarting_a_loop() {
+        let (mut engine, _, _) = looped_video_engine(LoopMode::Looped);
+        engine.current_video.as_mut().unwrap().has_audio = false;
+        engine.take_actions();
+
+        engine.video_failed(1, 1);
+
+        assert!(engine.current_video.is_none());
+        let actions = engine.take_actions();
+        assert!(matches!(
+            actions.first(),
+            Some(EngineAction::StopVideo { .. })
+        ));
+        assert!(
+            !actions
+                .iter()
+                .any(|action| matches!(action, EngineAction::PlayVideo { .. }))
+        );
     }
 }

@@ -589,8 +589,14 @@ impl AudioEngine {
             source = Box::new(MonoToStereo::new(source));
         }
 
-        // Double-buffer the source to decode file I/O on a background thread
-        let source = Box::new(BufferedSource::new(source));
+        // Real output decodes on a background thread so its callback never
+        // blocks. The headless virtual-time sink reads synchronously so its
+        // clock cannot outrun decoding.
+        let source: Box<dyn SampleProvider> = if self._stream.is_some() {
+            Box::new(BufferedSource::new(source))
+        } else {
+            source
+        };
 
         let max_buffer = self.sample_rate as usize * self.channels as usize; // 1 second
         let input = Arc::new(MixerInput::new(source, max_buffer));
@@ -934,6 +940,45 @@ pub enum AudioError {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "test-harness")]
+    struct SlowSource {
+        first_read: std::sync::atomic::AtomicBool,
+    }
+
+    #[cfg(feature = "test-harness")]
+    impl SampleProvider for SlowSource {
+        fn read(&self, buffer: &mut [f32]) -> usize {
+            if self
+                .first_read
+                .swap(false, std::sync::atomic::Ordering::AcqRel)
+            {
+                std::thread::sleep(Duration::from_millis(50));
+                buffer.fill(0.5);
+                buffer.len()
+            } else {
+                0
+            }
+        }
+
+        fn seek(&self, _sample: usize) {}
+
+        fn position(&self) -> usize {
+            0
+        }
+
+        fn length(&self) -> Option<usize> {
+            Some(16)
+        }
+
+        fn sample_rate(&self) -> u32 {
+            TARGET_RATE
+        }
+
+        fn channels(&self) -> u16 {
+            2
+        }
+    }
+
     fn render_test_output(
         sample_format: cpal::SampleFormat,
         data: &mut cpal::Data,
@@ -1030,6 +1075,23 @@ mod tests {
         );
 
         assert!(!format_mismatch.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    #[cfg(feature = "test-harness")]
+    fn headless_engine_reads_source_synchronously() {
+        let engine = AudioEngine::new_headless(2, TARGET_RATE);
+        engine
+            .play(Box::new(SlowSource {
+                first_read: std::sync::atomic::AtomicBool::new(true),
+            }))
+            .unwrap();
+        engine.refresh();
+
+        let mut output = [0.0; 16];
+        engine.mixer.render(&mut output);
+
+        assert!(output.iter().any(|sample| sample.abs() > 0.1));
     }
 
     #[test]

@@ -15,6 +15,7 @@ mod d3d11_zero_copy;
 mod frame;
 mod frame_lease;
 mod frame_pool;
+mod hap_converter;
 mod pixel_sampler;
 mod projection_renderer;
 mod video_source;
@@ -33,9 +34,12 @@ pub fn ffmpeg_version() -> u32 {
     ffmpeg_next::util::version()
 }
 pub use frame::{BitDepth, ChromaSubsample, FramePixels, VideoFrame, YuvPlane};
+pub use hap_converter::HapConverter;
 pub use pixel_sampler::PixelSampler;
 pub use projection_renderer::ProjectionRenderer;
-pub use video_source::{VideoFrameTimings, VideoSource, ZeroCopyPreference};
+pub use video_source::{
+    HapAcceleration, HapFallbackSession, VideoFrameTimings, VideoSource, ZeroCopyPreference,
+};
 pub use yuv_converter::YuvConverter;
 pub use zero_copy::ZeroCopyAvailability;
 
@@ -49,13 +53,16 @@ pub(crate) fn test_device_queue(
             .request_adapter(&wgpu::RequestAdapterOptions::default())
             .await
             .ok()?;
+        if !adapter.features().contains(required_features) {
+            return None;
+        }
         let device_queue = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 required_features,
                 ..Default::default()
             })
             .await
-            .expect("device");
+            .ok()?;
         Some(device_queue)
     })
 }

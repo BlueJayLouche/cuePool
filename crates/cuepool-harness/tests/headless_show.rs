@@ -6,7 +6,7 @@ use cuepool_harness::{HeadlessShowRunner, RunnerTrace};
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 use std::fs;
-use support::{Fixture, dummy, sound, video};
+use support::{Fixture, dummy, hap_video, sound, video};
 
 fn started(trace: &[RunnerTrace]) -> Vec<i64> {
     trace
@@ -148,6 +148,28 @@ fn video_seek_resets_pending_frames_and_preserves_pause() {
         RunnerTrace::VideoSeek { target_secs, .. }
             if *target_secs < 0.2 && *target_secs > 0.199
     )));
+}
+
+#[test]
+fn hap_q_uses_the_production_decoder_for_pts_seek_pause_and_eof() {
+    let fixture = Fixture::new(vec![hap_video(1, LoopMode::OneShot)]).unwrap();
+    let mut runner = HeadlessShowRunner::open(&fixture.project).unwrap();
+    runner.select(Decimal::ONE).unwrap();
+    runner.go().unwrap();
+    runner.advance_blocks(3).unwrap();
+    assert_eq!(video_pts(&runner.take_trace()), vec![0.0, 0.02]);
+
+    let instance = runner.snapshot().video.as_ref().unwrap().instance_id;
+    runner.pause().unwrap();
+    runner.seek(instance, 0.04).unwrap();
+    runner.advance_blocks(5).unwrap();
+    assert!(video_pts(&runner.take_trace()).is_empty());
+    runner.resume().unwrap();
+    runner.advance_blocks(1).unwrap();
+    assert_eq!(video_pts(&runner.take_trace()), vec![0.04]);
+
+    runner.advance_blocks(20).unwrap();
+    assert!(runner.snapshot().video.is_none());
 }
 
 #[test]

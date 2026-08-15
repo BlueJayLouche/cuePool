@@ -6,6 +6,7 @@
 use crate::SampleProvider;
 use rubato::{FastFixedOut, PolynomialDegree, Resampler};
 use std::cell::UnsafeCell;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Resampling processor.
 ///
@@ -14,6 +15,8 @@ use std::cell::UnsafeCell;
 pub struct ResamplerProcessor {
     source: Box<dyn SampleProvider>,
     inner: UnsafeCell<ResamplerInner>,
+    /// Target-rate samples returned to the downstream consumer.
+    output_position: AtomicUsize,
 }
 
 struct ResamplerInner {
@@ -67,6 +70,7 @@ impl ResamplerProcessor {
 
         Ok(Self {
             source,
+            output_position: AtomicUsize::new(0),
             inner: UnsafeCell::new(ResamplerInner {
                 resampler,
                 target_rate,
@@ -170,6 +174,7 @@ impl SampleProvider for ResamplerProcessor {
             written += to_copy;
         }
 
+        self.output_position.fetch_add(written, Ordering::Relaxed);
         written
     }
 
@@ -182,6 +187,7 @@ impl SampleProvider for ResamplerProcessor {
         self.source.seek(source_frame.saturating_mul(channels));
         inner.ring_read = 0;
         inner.ring_write = 0;
+        self.output_position.store(sample, Ordering::Relaxed);
         // Re-create resampler to reset state
         let ratio = inner.target_rate as f64 / inner.source_rate as f64;
         if let Ok(new_r) = FastFixedOut::new(
@@ -198,12 +204,7 @@ impl SampleProvider for ResamplerProcessor {
     }
 
     fn position(&self) -> usize {
-        // Report in target-rate samples to stay consistent with `length()`.
-        // (Currently shadowed by BufferedSource's own read position, but keep the
-        // trait contract self-consistent for any direct consumer.)
-        let inner = self.inner();
-        (self.source.position() as f64 * inner.target_rate as f64 / inner.source_rate as f64)
-            as usize
+        self.output_position.load(Ordering::Relaxed)
     }
 
     fn length(&self) -> Option<usize> {
@@ -271,6 +272,27 @@ mod tests {
         resampler.seek(48_000 * 2);
 
         assert_eq!(sought_sample.load(Ordering::Relaxed), 44_100 * 2);
+        assert_eq!(resampler.position(), 48_000 * 2);
+    }
+
+    #[test]
+    fn position_tracks_emitted_samples_instead_of_input_read_ahead() {
+        let resampler = ResamplerProcessor::new(
+            Box::new(FnSource::new(
+                |buffer| {
+                    buffer.fill(0.5);
+                    buffer.len()
+                },
+                24_000,
+                1,
+            )),
+            48_000,
+        )
+        .unwrap();
+        let mut output = [0.0; 128];
+
+        assert_eq!(resampler.read(&mut output), output.len());
+        assert_eq!(resampler.position(), output.len());
     }
 
     #[test]

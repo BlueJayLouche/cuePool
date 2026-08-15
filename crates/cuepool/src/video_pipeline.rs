@@ -3,7 +3,9 @@ use crate::video_timing::fade_elapsed;
 use crate::{AppEvent, IDENTIFY_COLORS};
 use cuepool_core::{CanvasFit, LockExt};
 use cuepool_gui::{SharedStateHandle, VideoDiagnostics, VideoTimings};
-use cuepool_video::{FramePool, VideoFrame, VideoSource, ZeroCopyAvailability};
+use cuepool_video::{
+    FramePool, HapAcceleration, HapFallbackSession, VideoFrame, VideoSource, ZeroCopyAvailability,
+};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -14,6 +16,7 @@ use winit::window::WindowId;
 pub(crate) enum VideoMessage {
     Frame(VideoFrame),
     Eof,
+    Failed,
 }
 
 /// Frame content published by the consume thread for the output render threads.
@@ -302,6 +305,7 @@ pub(crate) fn video_consume_thread(
     let mut canvas: Option<cuepool_video::CanvasTexture> = None;
     let mut overlay: Option<cuepool_video::CanvasTexture> = None;
     let mut yuv_converter: Option<cuepool_video::YuvConverter> = None;
+    let mut hap_converter: Option<cuepool_video::HapConverter> = None;
     // Decode channel taken out of the control struct; None when stopped/EOF.
     let mut rx: Option<std::sync::mpsc::Receiver<VideoMessage>> = None;
     // Epoch captured with `rx`; all frame work is discarded if control moves on.
@@ -419,7 +423,7 @@ pub(crate) fn video_consume_thread(
             }
         }
 
-        let mut eof_epoch = None;
+        let mut terminal = None;
 
         // ── Control handshake: new stream, stop, paused seek ──
         {
@@ -484,10 +488,22 @@ pub(crate) fn video_consume_thread(
                     }
                     Some(Ok(VideoMessage::Eof)) => {
                         rx = None;
-                        eof_epoch = rx_epoch;
+                        terminal = rx_epoch.map(|epoch| (epoch, false));
                         ctl.peek_pts = None;
                     }
-                    Some(Err(_)) => log::warn!("Video seek: no frame delivered after seek"),
+                    Some(Ok(VideoMessage::Failed)) => {
+                        rx = None;
+                        terminal = rx_epoch.map(|epoch| (epoch, true));
+                        ctl.peek_pts = None;
+                    }
+                    Some(Err(std::sync::mpsc::RecvTimeoutError::Disconnected)) => {
+                        rx = None;
+                        terminal = rx_epoch.map(|epoch| (epoch, true));
+                        ctl.peek_pts = None;
+                    }
+                    Some(Err(std::sync::mpsc::RecvTimeoutError::Timeout)) => {
+                        log::warn!("Video seek: no frame delivered after seek");
+                    }
                     None => {}
                 }
             }
@@ -536,14 +552,21 @@ pub(crate) fn video_consume_thread(
         // Keep one frame peeked while paused, and notice an immediately-following
         // EOF even without a running target clock. A future frame still holds EOF
         // behind it until playback resumes and presents that frame.
-        if peek.is_none() && eof_epoch.is_none() {
+        if peek.is_none() && terminal.is_none() {
             match rx.as_ref().map(|r| r.try_recv()) {
                 Some(Ok(VideoMessage::Frame(f))) => peek = Some(f),
                 Some(Ok(VideoMessage::Eof)) => {
                     rx = None;
-                    eof_epoch = rx_epoch;
+                    terminal = rx_epoch.map(|epoch| (epoch, false));
                 }
-                Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => rx = None,
+                Some(Ok(VideoMessage::Failed)) => {
+                    rx = None;
+                    terminal = rx_epoch.map(|epoch| (epoch, true));
+                }
+                Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
+                    rx = None;
+                    terminal = rx_epoch.map(|epoch| (epoch, true));
+                }
                 _ => {}
             }
         }
@@ -557,9 +580,16 @@ pub(crate) fn video_consume_thread(
                         Some(Ok(VideoMessage::Frame(f))) => peek = Some(f),
                         Some(Ok(VideoMessage::Eof)) => {
                             rx = None;
-                            eof_epoch = rx_epoch;
+                            terminal = rx_epoch.map(|epoch| (epoch, false));
                         }
-                        Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => rx = None,
+                        Some(Ok(VideoMessage::Failed)) => {
+                            rx = None;
+                            terminal = rx_epoch.map(|epoch| (epoch, true));
+                        }
+                        Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
+                            rx = None;
+                            terminal = rx_epoch.map(|epoch| (epoch, true));
+                        }
                         _ => {}
                     }
                 }
@@ -591,15 +621,12 @@ pub(crate) fn video_consume_thread(
             }
             rx = None;
             rx_epoch = None;
-            eof_epoch = None;
+            terminal = None;
         }
 
         // ── Upload the newest due frame to the canvas (GPU work) ──
         if let Some(frame) = consumed {
-            #[cfg(windows)]
             let mut frame_presented = true;
-            #[cfg(not(windows))]
-            let frame_presented = true;
             #[cfg(windows)]
             let mut direct_submitted = false;
             let mut uploaded = false;
@@ -614,6 +641,42 @@ pub(crate) fn video_consume_thread(
                             .upload
                             .set_ms(upload_timing.record(upload_started.elapsed()));
                         uploaded = true;
+                    }
+                }
+                cuepool_video::FramePixels::Hap { .. } => {
+                    if hap_converter.is_none() {
+                        hap_converter = Some(cuepool_video::HapConverter::new(
+                            &device,
+                            wgpu::TextureFormat::Rgba8Unorm,
+                        ));
+                    }
+                    if let (Some(c), Some(conv)) = (canvas.as_ref(), hap_converter.as_mut()) {
+                        let _configure_guard =
+                            configure_gate.read().unwrap_or_else(|e| e.into_inner());
+                        let upload_started = Instant::now();
+                        match conv.upload(&device, &queue, &frame, [c.width, c.height], fit) {
+                            Ok(()) => {
+                                timings
+                                    .upload
+                                    .set_ms(upload_timing.record(upload_started.elapsed()));
+                                let conversion_started = Instant::now();
+                                let mut encoder = device.create_command_encoder(
+                                    &wgpu::CommandEncoderDescriptor {
+                                        label: Some("canvas-hap-convert"),
+                                    },
+                                );
+                                conv.encode(&mut encoder, &c.render_view());
+                                queue.submit(std::iter::once(encoder.finish()));
+                                timings.conversion_submit.set_ms(
+                                    conversion_submit_timing.record(conversion_started.elapsed()),
+                                );
+                                uploaded = true;
+                            }
+                            Err(error) => {
+                                log::warn!("Video HAP upload skipped: {error}");
+                                frame_presented = false;
+                            }
+                        }
                     }
                 }
                 #[cfg(windows)]
@@ -820,7 +883,7 @@ pub(crate) fn video_consume_thread(
                 rx = None;
                 rx_epoch = None;
                 peek = None;
-                eof_epoch = None;
+                terminal = None;
             }
             #[cfg(windows)]
             if direct_submitted {
@@ -843,15 +906,20 @@ pub(crate) fn video_consume_thread(
                 rx = None;
                 rx_epoch = None;
                 peek = None;
-                eof_epoch = None;
+                terminal = None;
             }
         }
 
         // The marker is observed only after every preceding frame has left the
         // FIFO. Emit after the final due upload/write-back, tagged for winit.
-        if let Some(epoch) = eof_epoch {
+        if let Some((epoch, failed)) = terminal {
             if rx_epoch == Some(epoch) {
-                let _ = proxy.send_event(AppEvent::VideoEof(epoch));
+                let event = if failed {
+                    AppEvent::VideoFailed(epoch)
+                } else {
+                    AppEvent::VideoEof(epoch)
+                };
+                let _ = proxy.send_event(event);
             }
             rx = None;
             rx_epoch = None;
@@ -1274,6 +1342,8 @@ pub(crate) fn video_decode_thread(
     frame_pool: Arc<FramePool>,
     timings: VideoTimings,
     zero_copy: ZeroCopyAvailability,
+    hap_acceleration: HapAcceleration,
+    hap_fallback_session: HapFallbackSession,
 ) {
     if stop_flag.load(Ordering::Acquire) {
         return;
@@ -1283,14 +1353,22 @@ pub(crate) fn video_decode_thread(
     } else {
         zero_copy
     };
-    let mut source =
-        match VideoSource::open_with_zero_copy(path, Arc::clone(&frame_pool), zero_copy) {
-            Ok(s) => s,
-            Err(e) => {
-                log::error!("Failed to open video source {}: {e}", path);
-                return;
-            }
-        };
+    let mut source = match VideoSource::open_with_acceleration_and_session_cancellable(
+        path,
+        Arc::clone(&frame_pool),
+        zero_copy,
+        hap_acceleration,
+        hap_fallback_session,
+        Arc::clone(&stop_flag),
+    ) {
+        Ok(s) => s,
+        Err(_) if stop_flag.load(Ordering::Acquire) => return,
+        Err(e) => {
+            log::error!("Failed to open video source {}: {e}", path);
+            send_video_message(&frame_tx, &stop_flag, VideoMessage::Failed);
+            return;
+        }
+    };
     if stop_flag.load(Ordering::Acquire) {
         return;
     }
@@ -1346,7 +1424,7 @@ pub(crate) fn video_decode_thread(
             if stop_flag.load(Ordering::Relaxed) {
                 return;
             }
-            match timed_read_frame(&mut source, &mut timing_windows, &timings) {
+            match timed_read_frame(&mut source, &mut timing_windows, &timings, &stop_flag) {
                 Some(f) if f.pts + 1e-4 < t => {
                     if let Some(discarded) = prev.replace(f) {
                         frame_pool.recycle_frame(discarded);
@@ -1364,6 +1442,21 @@ pub(crate) fn video_decode_thread(
                     break;
                 }
                 None => {
+                    if source.failed() {
+                        if let Some(video) = diag_state.lock_unpoisoned().diagnostics.video.as_mut()
+                        {
+                            video.decode_path = source.decode_path().to_string();
+                            video.fallback_reason = source.fallback_reason().map(str::to_owned);
+                        }
+                        log::error!(
+                            "Video decode stopped during seek recovery: {}",
+                            source
+                                .fallback_reason()
+                                .unwrap_or("unknown decoder failure")
+                        );
+                        send_video_message(&frame_tx, &stop_flag, VideoMessage::Failed);
+                        return;
+                    }
                     // t is past the last frame: deliver that frame and end.
                     if let Some(p) = prev.take()
                         && !send_video_message(&frame_tx, &stop_flag, VideoMessage::Frame(p))
@@ -1381,20 +1474,30 @@ pub(crate) fn video_decode_thread(
     // after VIDEO_QUEUE_CAP frames anyway, and keeping it topped up (without
     // dropping frames) is what makes frame-stepping through a pause possible.
     let _ = &pause_flag;
-    // Re-publish the decode path once frames actually flow: at open it's
-    // tentative (hw device created ≠ hw decode engaged — e.g. Hap has none).
-    let mut diag_path_pending = true;
+    // Re-publish whenever the active backend changes: hardware engagement and
+    // a mid-stream HAP variant fallback both happen after open.
+    let mut reported_decode_path = source.decode_path().to_string();
+    let mut reported_fallback_reason = source.fallback_reason().map(str::to_owned);
+    if let Some(video) = diag_state.lock_unpoisoned().diagnostics.video.as_mut() {
+        video.decode_path = reported_decode_path.clone();
+        video.fallback_reason = reported_fallback_reason.clone();
+    }
     while !stop_flag.load(Ordering::Relaxed) {
-        match timed_read_frame(&mut source, &mut timing_windows, &timings) {
+        let frame = timed_read_frame(&mut source, &mut timing_windows, &timings, &stop_flag);
+        let decode_path = source.decode_path().to_string();
+        let fallback_reason = source.fallback_reason().map(str::to_owned);
+        if (decode_path != reported_decode_path || fallback_reason != reported_fallback_reason)
+            && let Some(v) = diag_state.lock_unpoisoned().diagnostics.video.as_mut()
+        {
+            reported_decode_path = decode_path.clone();
+            reported_fallback_reason = fallback_reason.clone();
+            v.decode_path = decode_path;
+            v.fallback_reason = fallback_reason;
+        }
+        match frame {
             Some(frame) => {
                 #[cfg(windows)]
                 let handoff = frame.d3d11_handoff();
-                if std::mem::take(&mut diag_path_pending)
-                    && let Some(v) = diag_state.lock_unpoisoned().diagnostics.video.as_mut()
-                {
-                    v.decode_path = source.decode_path().to_string();
-                    v.fallback_reason = source.fallback_reason().map(str::to_owned);
-                }
                 if !send_video_message(&frame_tx, &stop_flag, VideoMessage::Frame(frame)) {
                     return;
                 }
@@ -1419,7 +1522,17 @@ pub(crate) fn video_decode_thread(
                 }
             }
             None => {
-                send_video_message(&frame_tx, &stop_flag, VideoMessage::Eof);
+                if source.failed() {
+                    log::error!(
+                        "Video decode stopped without signalling EOF: {}",
+                        source
+                            .fallback_reason()
+                            .unwrap_or("unknown decoder failure")
+                    );
+                    send_video_message(&frame_tx, &stop_flag, VideoMessage::Failed);
+                } else {
+                    send_video_message(&frame_tx, &stop_flag, VideoMessage::Eof);
+                }
                 break;
             }
         }
@@ -1454,8 +1567,9 @@ fn timed_read_frame(
     source: &mut VideoSource,
     timing_windows: &mut VideoTimingWindows,
     timings: &VideoTimings,
+    stop_flag: &AtomicBool,
 ) -> Option<VideoFrame> {
-    let frame = source.read_frame();
+    let frame = source.read_frame_cancellable(stop_flag);
     let frame_timings = source.last_timings();
     timings
         .decode
@@ -1477,15 +1591,24 @@ pub(crate) fn pixmap_decode_thread(
     stop_flag: Arc<AtomicBool>,
     frame_tx: std::sync::mpsc::SyncSender<VideoFrame>,
     frame_pool: Arc<FramePool>,
+    hap_acceleration: HapAcceleration,
 ) {
     let looping = matches!(
         loop_mode,
         cuepool_core::LoopMode::Looped | cuepool_core::LoopMode::LoopedInfinite
     );
     let mut last_dims = (0u32, 0u32);
+    let hap_fallback_session = HapFallbackSession::default();
     'outer: loop {
-        let mut source = match VideoSource::open_with_pool(path, Arc::clone(&frame_pool)) {
+        let mut source = match VideoSource::open_with_hap_acceleration_and_session_cancellable(
+            path,
+            Arc::clone(&frame_pool),
+            hap_acceleration.clone(),
+            hap_fallback_session.clone(),
+            Arc::clone(&stop_flag),
+        ) {
             Ok(s) => s,
+            Err(_) if stop_flag.load(Ordering::Acquire) => return,
             Err(e) => {
                 log::error!("PixelMap: failed to open {}: {e}", path);
                 return;
@@ -1493,7 +1616,19 @@ pub(crate) fn pixmap_decode_thread(
         };
         let start = Instant::now();
         while !stop_flag.load(Ordering::Relaxed) {
-            let Some(frame) = source.read_frame() else {
+            let Some(frame) = source.read_frame_cancellable(&stop_flag) else {
+                if stop_flag.load(Ordering::Relaxed) {
+                    return;
+                }
+                if source.failed() {
+                    log::error!(
+                        "PixelMap decode stopped without looping: {}",
+                        source
+                            .fallback_reason()
+                            .unwrap_or("unknown decoder failure")
+                    );
+                    return;
+                }
                 if looping {
                     continue 'outer; // reopen from the top
                 }

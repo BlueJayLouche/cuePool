@@ -50,6 +50,10 @@ impl FramePool {
     pub fn recycle_frame(&self, frame: VideoFrame) {
         match frame.pixels {
             FramePixels::Rgba(data) => self.recycle(data),
+            // ponytail: HAP buffers are large enough that retaining a queue's
+            // worth can pin tens of MB. Reuse them only if profiling proves the
+            // compressed-frame allocator is the next bottleneck.
+            FramePixels::Hap { .. } => {}
             FramePixels::YuvPlanar { y, u, v, .. } => {
                 self.recycle(y.data);
                 self.recycle(u.data);

@@ -18,6 +18,7 @@ pollster = { workspace = true }
 
 # Video decoding
 ffmpeg-next = { workspace = true }
+hap-parser = { workspace = true }
 
 # Utils
 log = { workspace = true }
@@ -40,3 +41,4 @@ windows = { version = "0.62", features = [
 cc = "1"
 
 [dev-dependencies]
+hap-qt = "0.2.0"

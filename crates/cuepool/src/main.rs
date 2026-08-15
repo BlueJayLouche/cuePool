@@ -23,7 +23,10 @@ use cuepool_protocols::midi::mtc::{MtcFrameRate, MtcReceiver, MtcState};
 use cuepool_protocols::midi::{MidiEvent, MidiManager};
 use cuepool_protocols::msc::{MscCommandFlags, MscEvent, MscManager};
 use cuepool_protocols::osc::{OscEvent, OscManager};
-use cuepool_video::{FramePool, VideoFrame, ZeroCopyAvailability, ZeroCopyPreference};
+use cuepool_video::{
+    FramePool, HapAcceleration, HapFallbackSession, VideoFrame, ZeroCopyAvailability,
+    ZeroCopyPreference,
+};
 use std::ffi::OsString;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
@@ -275,6 +278,8 @@ fn control_surface_retry_delay(failures: u32) -> Duration {
 enum AppEvent {
     /// The consume thread uploaded the stream's final due frame.
     VideoEof(u64),
+    /// The decoder terminated without a recoverable frame; unlike EOF this never loops.
+    VideoFailed(u64),
     /// An output worker needs winit to recreate its window-owned surface.
     OutputSurfaceLost(WindowId),
     /// The shared GPU device is gone; recovery requires rebuilding all resources.
@@ -291,6 +296,7 @@ struct VideoDecodeRequest {
     start_before: Option<f64>,
     seek_frame: Option<VideoSeekFrameRequest>,
     clamp_to_media: bool,
+    hap_fallback_session: HapFallbackSession,
 }
 
 fn take_ready_video_decode(
@@ -415,6 +421,9 @@ struct App {
     video_pause_flag: Arc<AtomicBool>,
     frame_pool: Arc<FramePool>,
     zero_copy: ZeroCopyAvailability,
+    hap_acceleration: HapAcceleration,
+    hap_fallback_session: HapFallbackSession,
+    hap_fallback_instance_id: Option<u64>,
     /// QID of the cue whose video is currently playing (for loop sync).
     current_video_qid: Option<rust_decimal::Decimal>,
     current_video_instance_id: Option<u64>,
@@ -483,6 +492,7 @@ struct App {
     /// independent of the projector canvas). Sized to the playing media.
     pixmap_texture: Option<cuepool_video::CanvasTexture>,
     pixmap_yuv: Option<cuepool_video::YuvConverter>,
+    pixmap_hap: Option<cuepool_video::HapConverter>,
     pixmap_frame_rx: Option<std::sync::mpsc::Receiver<VideoFrame>>,
     pixmap_stop_flag: Arc<AtomicBool>,
     current_pixmap_qid: Option<rust_decimal::Decimal>,
@@ -529,6 +539,8 @@ enum ShowControlCommand {
 }
 
 impl App {
+    // ponytail: Keep startup wiring explicit; introduce a GPU context only if more state is added.
+    #[allow(clippy::too_many_arguments)]
     fn new(
         instance: wgpu::Instance,
         adapter: wgpu::Adapter,
@@ -536,6 +548,7 @@ impl App {
         queue: wgpu::Queue,
         proxy: winit::event_loop::EventLoopProxy<AppEvent>,
         zero_copy: ZeroCopyAvailability,
+        hap_acceleration: HapAcceleration,
         cuepool: CuePoolApp,
     ) -> Self {
         let show_engine = ShowEngine::new(cuepool.state().clone(), None);
@@ -788,6 +801,9 @@ impl App {
             video_pause_flag: Arc::new(AtomicBool::new(false)),
             frame_pool,
             zero_copy,
+            hap_acceleration,
+            hap_fallback_session: HapFallbackSession::default(),
+            hap_fallback_instance_id: None,
             current_video_qid: None,
             current_video_instance_id: None,
             last_project_generation: 0,
@@ -824,6 +840,7 @@ impl App {
             last_pixel_sample: Instant::now(),
             pixmap_texture: None,
             pixmap_yuv: None,
+            pixmap_hap: None,
             pixmap_frame_rx: None,
             pixmap_stop_flag: Arc::new(AtomicBool::new(false)),
             current_pixmap_qid: None,
@@ -1393,9 +1410,12 @@ impl App {
         self.pixmap_frame_rx = Some(rx);
         let stop = Arc::clone(&self.pixmap_stop_flag);
         let frame_pool = Arc::clone(&self.frame_pool);
+        let hap_acceleration = self.hap_acceleration.clone();
         if let Err(e) = std::thread::Builder::new()
             .name("pixmap-decode".into())
-            .spawn(move || pixmap_decode_thread(&resolved, loop_mode, stop, tx, frame_pool))
+            .spawn(move || {
+                pixmap_decode_thread(&resolved, loop_mode, stop, tx, frame_pool, hap_acceleration)
+            })
         {
             // Drop the receiver again so the render tick sees "no stream"
             // instead of a channel that never fills; the cue degrades to a
@@ -1446,6 +1466,34 @@ impl App {
             self.ensure_pixmap_texture(w, h);
             let tex = self.pixmap_texture.as_ref().unwrap();
             tex.upload_frame(&self.queue, &frame, cuepool_core::CanvasFit::Stretch);
+        } else if matches!(&frame.pixels, cuepool_video::FramePixels::Hap { .. }) {
+            self.ensure_pixmap_texture(w, h);
+            if self.pixmap_hap.is_none() {
+                self.pixmap_hap = Some(cuepool_video::HapConverter::new(
+                    &self.device,
+                    wgpu::TextureFormat::Rgba8Unorm,
+                ));
+            }
+            let conv = self.pixmap_hap.as_mut().unwrap();
+            match conv.upload(
+                &self.device,
+                &self.queue,
+                &frame,
+                [w, h],
+                cuepool_core::CanvasFit::Stretch,
+            ) {
+                Ok(()) => {
+                    let tex = self.pixmap_texture.as_ref().unwrap();
+                    let mut encoder =
+                        self.device
+                            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                                label: Some("pixmap-hap"),
+                            });
+                    conv.encode(&mut encoder, &tex.render_view());
+                    self.queue.submit(Some(encoder.finish()));
+                }
+                Err(error) => log::warn!("PixelMap HAP upload skipped: {error}"),
+            }
         } else {
             // YUV planes → GPU convert pass straight into the pixmap texture.
             self.ensure_pixmap_texture(w, h);
@@ -1887,6 +1935,10 @@ impl App {
         duration: cuepool_core::Timespan,
         event_loop: &ActiveEventLoop,
     ) {
+        if self.hap_fallback_instance_id != Some(instance_id) {
+            self.hap_fallback_session = HapFallbackSession::default();
+            self.hap_fallback_instance_id = Some(instance_id);
+        }
         // Only open output windows on the first video; looping should not respawn them.
         if self.output_windows.is_empty() {
             self.create_output_windows(event_loop);
@@ -1961,6 +2013,7 @@ impl App {
                 start_before,
                 seek_frame,
                 clamp_to_media,
+                hap_fallback_session: self.hap_fallback_session.clone(),
             },
         );
         self.video_stop_flag.store(true, Ordering::Relaxed);
@@ -1988,6 +2041,7 @@ impl App {
             start_before,
             seek_frame,
             clamp_to_media,
+            hap_fallback_session,
         } = request;
         // Bounded channel = backpressure: the decode thread can't outrun the consumer
         // (the consume thread matching PTS against the wall-clock video clock), so
@@ -2012,6 +2066,7 @@ impl App {
         let diag_state = Arc::clone(self.cuepool.state());
         let video_control = Arc::clone(&self.video_control);
         let zero_copy = self.zero_copy.clone();
+        let hap_acceleration = self.hap_acceleration.clone();
 
         match std::thread::Builder::new()
             .name("video-decode".into())
@@ -2029,6 +2084,8 @@ impl App {
                     frame_pool,
                     timings,
                     zero_copy,
+                    hap_acceleration,
+                    hap_fallback_session,
                 );
             }) {
             Ok(join) => self.video_decode_join = Some(join),
@@ -2051,6 +2108,7 @@ impl App {
         self.lighting.shutdown();
         self.pixmap_texture = None;
         self.pixmap_yuv = None;
+        self.pixmap_hap = None;
         self.pixel_sampler = None;
         self.output_windows.clear();
         self.output_windows_built_from = None;
@@ -2068,6 +2126,8 @@ impl App {
     fn stop_video_playback(&mut self) {
         self.video_stop_flag.store(true, Ordering::Relaxed);
         self.pending_video_decode = None;
+        self.hap_fallback_session = HapFallbackSession::default();
+        self.hap_fallback_instance_id = None;
         {
             let mut ctl = self.video_control.lock_unpoisoned();
             ctl.stream_epoch += 1;
@@ -3696,6 +3756,40 @@ impl ApplicationHandler<AppEvent> for App {
                     }
                 }
             }
+            AppEvent::VideoFailed(epoch) => {
+                let current_epoch = self.video_control.lock_unpoisoned().stream_epoch;
+                if epoch != current_epoch {
+                    log::debug!(
+                        "Ignoring stale video failure epoch {epoch} (current {current_epoch})"
+                    );
+                    return;
+                }
+                log::error!("Video decoder failed; stopping the current picture without looping");
+                if let Some(video) = self.show_engine.snapshot().video {
+                    let failed_diagnostics = self
+                        .cuepool
+                        .state()
+                        .lock_unpoisoned()
+                        .diagnostics
+                        .video
+                        .clone();
+                    let now = self.engine_now();
+                    let actions = self.show_engine.event(
+                        EngineEvent::VideoFailed {
+                            instance_id: video.instance_id,
+                            epoch: video.epoch,
+                        },
+                        now,
+                    );
+                    if let Err(error) = self.apply_engine_actions(actions, event_loop) {
+                        log::error!("Video failure action failed: {error}");
+                    }
+                    if let Some(diagnostics) = failed_diagnostics {
+                        self.cuepool.state().lock_unpoisoned().diagnostics.video =
+                            Some(diagnostics);
+                    }
+                }
+            }
             AppEvent::OutputSurfaceLost(window_id) => {
                 if self.output_windows.iter().any(|out| out.id == window_id) {
                     log::warn!("Output surface lost — rebuilding output windows");
@@ -4443,6 +4537,19 @@ fn startup_error(title: &str, message: String) -> anyhow::Error {
     anyhow::anyhow!(message)
 }
 
+fn optional_feature_candidates(
+    zero_copy: wgpu::Features,
+    hap: wgpu::Features,
+) -> Vec<wgpu::Features> {
+    let mut candidates = Vec::with_capacity(4);
+    for features in [zero_copy | hap, zero_copy, hap, wgpu::Features::empty()] {
+        if !candidates.contains(&features) {
+            candidates.push(features);
+        }
+    }
+    candidates
+}
+
 fn main() -> anyhow::Result<()> {
     let log_file = match cuepool_gui::logging::init_logger(&persistent_log_path()) {
         Ok(path) => path.display().to_string(),
@@ -4566,6 +4673,11 @@ fn run(log_file: String) -> anyhow::Result<()> {
     let zero_copy_preference = ZeroCopyPreference::from_env();
     let zero_copy_features =
         ZeroCopyAvailability::required_features(&adapter, zero_copy_preference);
+    let hap_features = if std::env::var("QPLAYER_NO_HWACCEL").as_deref() == Ok("1") {
+        wgpu::Features::empty()
+    } else {
+        adapter.features() & wgpu::Features::TEXTURE_COMPRESSION_BC
+    };
     let request_device = |features| {
         pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("cuepool-device"),
@@ -4575,27 +4687,60 @@ fn run(log_file: String) -> anyhow::Result<()> {
             ..Default::default()
         }))
     };
-    let (device, queue, device_fallback) = match request_device(zero_copy_features) {
-        Ok((device, queue)) => (device, queue, None),
-        Err(error) if !zero_copy_features.is_empty() => {
-            let reason = format!("zero-copy device feature request failed: {error}");
-            log::warn!("Video zero-copy fallback: {reason}; retrying the stock device");
-            let (device, queue) = request_device(wgpu::Features::empty())?;
-            (device, queue, Some(reason))
+    let mut failures = Vec::new();
+    let mut selected = None;
+    for features in optional_feature_candidates(zero_copy_features, hap_features) {
+        match request_device(features) {
+            Ok((device, queue)) => {
+                selected = Some((device, queue, features));
+                break;
+            }
+            Err(error) => failures.push((features, error.to_string())),
         }
-        Err(error) => return Err(error.into()),
+    }
+    let Some((device, queue, enabled_optional_features)) = selected else {
+        let reason = failures
+            .last()
+            .map(|(_, reason)| reason.as_str())
+            .unwrap_or("no device candidates were attempted");
+        return Err(anyhow::anyhow!("GPU device request failed: {reason}"));
     };
-    let device_fallback_logged = device_fallback.is_some();
-    let zero_copy = device_fallback.map_or_else(
-        || ZeroCopyAvailability::finish(&adapter, &device, &queue, zero_copy_preference),
-        ZeroCopyAvailability::declined,
-    );
+    if !failures.is_empty() {
+        log::warn!(
+            "Video acceleration device negotiation selected {enabled_optional_features:?} after {} failed request(s)",
+            failures.len()
+        );
+    }
+    let negotiation_reason = |label: &str| {
+        let attempted = failures
+            .iter()
+            .map(|(features, reason)| format!("{features:?}: {reason}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        format!("{label} device feature request failed ({attempted})")
+    };
+    let zero_copy = if zero_copy_features.is_empty()
+        || enabled_optional_features.contains(zero_copy_features)
+    {
+        ZeroCopyAvailability::finish(&adapter, &device, &queue, zero_copy_preference)
+    } else {
+        ZeroCopyAvailability::declined(negotiation_reason("zero-copy"))
+    };
     if zero_copy_preference.enabled()
-        && !device_fallback_logged
         && let Some(reason) = zero_copy.fallback_reason()
     {
         log::warn!("Video zero-copy fallback: {reason}; using the stock readback path");
     }
+    let hap_acceleration =
+        if !hap_features.is_empty() && enabled_optional_features.contains(hap_features) {
+            HapAcceleration::available(device.limits().max_texture_dimension_2d)
+        } else if !hap_features.is_empty() {
+            HapAcceleration::unavailable(negotiation_reason("GPU-native HAP"))
+        } else {
+            HapAcceleration::unavailable(
+                "GPU-native HAP unavailable: GPU device lacks BC texture compression",
+            )
+        };
     let device_lost_proxy = proxy.clone();
     device.set_device_lost_callback(move |reason, message| {
         log::error!("GPU device lost ({reason:?}): {message}");
@@ -4604,7 +4749,16 @@ fn run(log_file: String) -> anyhow::Result<()> {
         }
     });
 
-    let mut app = App::new(instance, adapter, device, queue, proxy, zero_copy, cuepool);
+    let mut app = App::new(
+        instance,
+        adapter,
+        device,
+        queue,
+        proxy,
+        zero_copy,
+        hap_acceleration,
+        cuepool,
+    );
 
     // Ctrl-C / SIGTERM handler for graceful emergency save
     {
@@ -4670,6 +4824,21 @@ mod tests {
             .map(|failures| control_surface_retry_delay(failures).as_millis())
             .collect();
         assert_eq!(delays, [100, 200, 400, 800, 1600, 3200, 5000, 5000, 5000]);
+    }
+
+    #[test]
+    fn optional_gpu_features_retry_independent_acceleration_paths() {
+        let zero_copy = wgpu::Features::TIMESTAMP_QUERY;
+        let hap = wgpu::Features::TEXTURE_COMPRESSION_BC;
+
+        assert_eq!(
+            optional_feature_candidates(zero_copy, hap),
+            vec![zero_copy | hap, zero_copy, hap, wgpu::Features::empty()]
+        );
+        assert_eq!(
+            optional_feature_candidates(wgpu::Features::empty(), hap),
+            vec![hap, wgpu::Features::empty()]
+        );
     }
 
     #[test]
@@ -4867,6 +5036,7 @@ mod tests {
                 start_before: Some(1.0),
                 seek_frame: None,
                 clamp_to_media: true,
+                hap_fallback_session: HapFallbackSession::default(),
             },
         );
         queue_latest_video_decode(
@@ -4876,6 +5046,7 @@ mod tests {
                 start_before: Some(2.0),
                 seek_frame: None,
                 clamp_to_media: true,
+                hap_fallback_session: HapFallbackSession::default(),
             },
         );
 

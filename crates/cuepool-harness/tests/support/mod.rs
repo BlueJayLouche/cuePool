@@ -27,6 +27,7 @@ impl Fixture {
         fs::create_dir(&dir)?;
         write_wav(&dir.join("tone.wav"), 4_800)?;
         write_y4m(&dir.join("video.y4m"), 5)?;
+        write_hap(&dir.join("video-hapq.mov"), 5)?;
         let show = ShowFile {
             cues,
             ..ShowFile::default()
@@ -101,6 +102,16 @@ pub fn video(qid: i64, loop_mode: LoopMode) -> Cue {
     }
 }
 
+pub fn hap_video(qid: i64, loop_mode: LoopMode) -> Cue {
+    let mut cue = video(qid, loop_mode);
+    let Cue::Video { path, duration, .. } = &mut cue else {
+        unreachable!()
+    };
+    *path = "video-hapq.mov".into();
+    *duration = Timespan::from_secs_f64(0.1);
+    cue
+}
+
 fn write_wav(path: &Path, frames: u32) -> io::Result<()> {
     let channels = 2u16;
     let sample_rate = 48_000u32;
@@ -137,4 +148,20 @@ fn write_y4m(path: &Path, frames: u8) -> io::Result<()> {
         file.write_all(&[160 - frame; 4])?;
     }
     Ok(())
+}
+
+fn write_hap(path: &Path, frames: u8) -> io::Result<()> {
+    use hap_qt::{HapFormat, HapFrameEncoder, QtHapWriter, VideoConfig};
+
+    let (width, height) = (8, 8);
+    let encoder = HapFrameEncoder::new(HapFormat::HapY, width, height).map_err(io::Error::other)?;
+    let mut writer =
+        QtHapWriter::create(path, VideoConfig::new(width, height, 50.0, HapFormat::HapY))
+            .map_err(io::Error::other)?;
+    for frame in 0..frames {
+        let rgba = [40 + frame * 10, 100, 180, 255].repeat((width * height) as usize);
+        let encoded = encoder.encode(&rgba).map_err(io::Error::other)?;
+        writer.write_frame(&encoded).map_err(io::Error::other)?;
+    }
+    writer.finalize().map_err(io::Error::other)
 }

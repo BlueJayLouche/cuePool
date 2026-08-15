@@ -360,7 +360,8 @@ impl YuvConverter {
                     }),
                 );
             }
-            FramePixels::Rgba(_) => {} // caller shouldn't reach here, but safe no-op
+            // Caller shouldn't reach these variants, but keep the converter a safe no-op.
+            FramePixels::Rgba(_) | FramePixels::Hap { .. } => {}
         }
     }
 
@@ -771,7 +772,7 @@ fn upload_plane(queue: &Queue, tex: &wgpu::Texture, p: &crate::frame::YuvPlane) 
 
 /// Source/dest UV rects for a frame placed on the canvas under `fit`. Mirrors the
 /// CPU `compose_canvas` geometry, but expressed as normalized rects for the shader.
-fn fit_rects(
+pub(crate) fn fit_rects(
     fw: u32,
     fh: u32,
     cw: u32,
