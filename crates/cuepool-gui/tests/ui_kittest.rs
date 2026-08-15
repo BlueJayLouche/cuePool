@@ -1,5 +1,6 @@
 //! Update visual baselines with `UPDATE_SNAPSHOTS=1 cargo test -p cuepool-gui`.
 
+use cuepool_gui::app::RELEASE_NOTES_VERSION;
 use cuepool_gui::{AppCommand, CuePoolApp, SharedStateHandle, ShowMode, build_identity, preview};
 use egui::accesskit::Role;
 use egui_kittest::{
@@ -73,6 +74,39 @@ fn launch_splash_shows_the_build_and_blocks_the_workspace() {
     harness.input_mut().time = Some(started_at + 2.5);
     harness.step();
     assert!(harness.query_by_label(&build_identity()).is_none());
+}
+
+#[test]
+fn release_notes_follow_the_splash_and_are_acknowledged_once() {
+    let app = CuePoolApp::new();
+    let (mut harness, state) = app_harness(app);
+
+    assert!(harness.query_by_label("GPU-native HAP playback").is_none());
+    let started_at = 1.0 / 60.0;
+    harness.input_mut().time = Some(started_at + 2.5);
+    harness.step();
+    assert!(harness.query_by_label("GPU-native HAP playback").is_some());
+
+    harness.key_press(egui::Key::Space);
+    harness.step();
+    assert!(state.lock().unwrap().command_queue.is_empty());
+
+    harness.remove_cursor();
+    harness.step();
+    if has_wgpu_adapter() {
+        harness.snapshot_options(
+            "release_notes",
+            &SnapshotOptions::new().failed_pixel_count_threshold(OsThreshold::new(0).linux(1)),
+        );
+    }
+
+    harness.get_by_label("Continue").click();
+    harness.run();
+    assert_eq!(
+        state.lock().unwrap().last_seen_release_notes.as_deref(),
+        Some(RELEASE_NOTES_VERSION)
+    );
+    assert!(harness.query_by_label("GPU-native HAP playback").is_none());
 }
 
 #[test]

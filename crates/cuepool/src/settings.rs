@@ -1,6 +1,10 @@
+use cuepool_gui::SharedStateHandle;
+
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub(crate) struct AppSettings {
     pub(crate) recent_files: Vec<std::path::PathBuf>,
+    pub(crate) last_seen_release_notes: Option<String>,
 }
 
 fn settings_path() -> Option<std::path::PathBuf> {
@@ -25,5 +29,28 @@ pub(crate) fn save_settings(settings: &AppSettings) {
         if let Ok(data) = serde_json::to_string_pretty(settings) {
             let _ = std::fs::write(path, data);
         }
+    }
+}
+
+pub(crate) fn save_settings_from_state(state: &SharedStateHandle) {
+    let settings = state
+        .lock()
+        .map(|state| AppSettings {
+            recent_files: state.recent_files.clone(),
+            last_seen_release_notes: state.last_seen_release_notes.clone(),
+        })
+        .unwrap_or_default();
+    save_settings(&settings);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_settings_leave_release_notes_unseen() {
+        let settings: AppSettings = serde_json::from_str(r#"{"recent_files": []}"#).unwrap();
+
+        assert_eq!(settings.last_seen_release_notes, None);
     }
 }

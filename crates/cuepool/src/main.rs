@@ -58,7 +58,7 @@ use recorder::Recorder;
 mod remote_commands;
 use remote_commands::{parse_osc_command, resolve_udp_command, send_udp_command, strip_udp_prefix};
 mod settings;
-use settings::{AppSettings, load_settings, save_settings};
+use settings::{load_settings, save_settings_from_state};
 mod video_pipeline;
 mod video_timing;
 #[cfg(windows)]
@@ -2152,13 +2152,7 @@ impl App {
     /// everything on `process::exit`, just like the Ctrl-C handler and Dock-quit.
     fn hard_exit(&self, reason: &str) -> ! {
         log::info!(target: PERSIST_TARGET, "Shutdown requested: {reason}");
-        let recent_files = self
-            .cuepool
-            .state()
-            .lock()
-            .map(|s| s.recent_files.clone())
-            .unwrap_or_default();
-        save_settings(&AppSettings { recent_files });
+        save_settings_from_state(self.cuepool.state());
         #[cfg(windows)]
         win_timer::release();
         log::info!(target: PERSIST_TARGET, "Shutdown complete: {reason}");
@@ -4631,7 +4625,11 @@ fn run(log_file: String) -> anyhow::Result<()> {
 
     let cuepool = CuePoolApp::new();
     let settings = load_settings();
-    cuepool.state().lock_unpoisoned().recent_files = settings.recent_files;
+    {
+        let mut state = cuepool.state().lock_unpoisoned();
+        state.recent_files = settings.recent_files;
+        state.last_seen_release_notes = settings.last_seen_release_notes;
+    }
     if let Some(path) = &project_path {
         load_startup_project(&cuepool, path).map_err(|message| {
             startup_error(
@@ -4766,6 +4764,7 @@ fn run(log_file: String) -> anyhow::Result<()> {
         ctrlc::set_handler(move || {
             log::info!(target: PERSIST_TARGET, "Shutdown requested: termination signal");
             emergency_save(&state, "termination signal");
+            save_settings_from_state(&state);
             log::info!(target: PERSIST_TARGET, "Shutdown complete: termination signal");
             log::logger().flush();
             std::process::exit(0);
@@ -4778,13 +4777,7 @@ fn run(log_file: String) -> anyhow::Result<()> {
     }
 
     // Save persisted settings
-    let recent_files = app
-        .cuepool
-        .state()
-        .lock()
-        .map(|s| s.recent_files.clone())
-        .unwrap_or_default();
-    save_settings(&AppSettings { recent_files });
+    save_settings_from_state(app.cuepool.state());
 
     // Graceful exit (never reached via hard_exit, which process::exit()s):
     // stop and join the consume thread like the render threads.

@@ -15,6 +15,7 @@ const ASCII_TORUS_WIDTH: usize = 64;
 const ASCII_TORUS_HEIGHT: usize = 22;
 const ASCII_TORUS_RAMP: &[u8] = b".,-~:;=!*#$@";
 const MAX_AUTOMATION_PROJECT_BYTES: u64 = 16 * 1024 * 1024;
+pub const RELEASE_NOTES_VERSION: &str = "0.4";
 
 /// A full snapshot of editable state for undo/redo.
 #[derive(Debug, Clone)]
@@ -427,6 +428,8 @@ pub struct SharedState {
     pub meter_data: GuiMeterData,
     /// Recently opened/saved project paths (most recent first, max 10).
     pub recent_files: Vec<PathBuf>,
+    /// Release-notes series acknowledged by the operator, persisted by the binary.
+    pub last_seen_release_notes: Option<String>,
     /// Whether the project settings window is open.
     pub show_settings_window: bool,
     /// Current audio output device name.
@@ -562,6 +565,7 @@ impl Default for SharedState {
             active_cues: Vec::new(),
             meter_data: GuiMeterData::default(),
             recent_files: Vec::new(),
+            last_seen_release_notes: None,
             show_settings_window: false,
             audio_device_name: String::new(),
             audio_error: None,
@@ -889,6 +893,7 @@ impl CuePoolApp {
             state: Arc::new(Mutex::new(SharedState {
                 show_file: show,
                 project_path: path,
+                last_seen_release_notes: Some(RELEASE_NOTES_VERSION.into()),
                 ..SharedState::default()
             })),
             take_editor: Default::default(),
@@ -1050,12 +1055,20 @@ impl CuePoolApp {
         // the context.
         let ctx = &ui.ctx().clone();
         let launch_splash_timing = self.launch_splash_timing(ctx.input(|i| i.time));
+        let show_release_notes = launch_splash_timing.is_none()
+            && self
+                .state
+                .lock()
+                .map(|state| {
+                    state.last_seen_release_notes.as_deref() != Some(RELEASE_NOTES_VERSION)
+                })
+                .unwrap_or(false);
         // Keyboard shortcuts. Skip bare cue-selection/deletion keys while a
-        // text field is focused so editing isn't hijacked. The launch splash also
-        // blocks shortcuts, so a startup Space/Escape cannot operate the show.
+        // text field is focused so editing isn't hijacked. Startup overlays also
+        // block shortcuts, so Space/Escape cannot operate the show behind them.
         let editing_text = ctx.egui_wants_keyboard_input();
         ctx.input(|i| {
-            if launch_splash_timing.is_some() {
+            if launch_splash_timing.is_some() || show_release_notes {
                 return;
             }
             let modifiers = i.modifiers;
@@ -1811,6 +1824,64 @@ impl CuePoolApp {
             {
                 state.import_request = Some(request);
             }
+        }
+
+        if show_release_notes {
+            egui::Modal::new(egui::Id::new("release_notes")).show(ctx, |ui| {
+                ui.set_width(480.0);
+                ui.label(
+                    egui::RichText::new(format!("What's new · {RELEASE_NOTES_VERSION}"))
+                        .monospace()
+                        .strong()
+                        .color(egui::Color32::from_rgb(255, 184, 92)),
+                );
+                ui.add_space(4.0);
+                ui.heading("GPU-native HAP playback");
+                ui.label(
+                    "CuePool keeps supported HAP video compressed through decode, then converts it directly on the GPU.",
+                );
+                ui.add_space(12.0);
+                ui.separator();
+                ui.add_space(8.0);
+
+                for (title, detail) in [
+                    ("Supported formats", "HAP, HAP Alpha and HAP Q."),
+                    (
+                        "GPU when available",
+                        "Uses the native path when the GPU supports BC textures and frame dimensions.",
+                    ),
+                    (
+                        "Automatic fallback",
+                        "Falls back to FFmpeg software for unsupported hardware, variants or packets, with the reason logged.",
+                    ),
+                ] {
+                    ui.label(
+                        egui::RichText::new(title)
+                            .strong()
+                            .color(egui::Color32::from_rgb(92, 168, 255)),
+                    );
+                    ui.label(detail);
+                    ui.add_space(6.0);
+                }
+
+                ui.label(
+                    egui::RichText::new(
+                        "Projection, overlays, edge blending, fit modes and PixelMap behave as before.",
+                    )
+                    .small()
+                    .color(egui::Color32::from_gray(180)),
+                );
+                ui.add_space(12.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add_sized([104.0, 40.0], egui::Button::new("Continue"))
+                        .clicked()
+                        && let Ok(mut state) = self.state.lock()
+                    {
+                        state.last_seen_release_notes = Some(RELEASE_NOTES_VERSION.into());
+                    }
+                });
+            });
         }
 
         if let Some((elapsed, remaining)) = launch_splash_timing {
