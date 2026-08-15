@@ -3,7 +3,7 @@ members = ["crates/*"]
 resolver = "3"
 
 [workspace.package]
-version = "0.5.0"
+version = "0.5.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/BlueJayLouche/rustjay-engine"
@@ -31,12 +31,12 @@ hap-parser = "0.2.0"
 # frame-pacing-diag is a fork-only feature (see [patch.crates-io]): fence-lock
 # timing for the Help → Status "Frame Pacing (wgpu)" section, built for the
 # #139 delivery-stall investigation. Trivial overhead; kept on in field builds.
-wgpu = { version = "29.0", features = ["frame-pacing-diag"] }
+wgpu = { version = "30.0", features = ["frame-pacing-diag"] }
 winit = "0.30"
-egui = "0.34"
-egui-wgpu = "0.34"
-egui-winit = "0.34"
-eframe = "0.34"
+egui = "0.36"
+egui-wgpu = "0.36"
+egui-winit = "0.36"
+eframe = "0.36"
 pollster = "0.3"
 
 # Networking / Protocols
@@ -79,8 +79,12 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 
+# wgpu-30 fork carrying only the frame-pacing-diag feature (branch
+# cuepool/frame-pacing-diag-30). The v29-era interop patches are gone: wgpu 30
+# provides the DX12 resource import and fence staging natively, and the #139
+# fence-lock split landed upstream (gfx-rs/wgpu#9475).
 [patch.crates-io]
-wgpu = { git = "https://github.com/scroix/wgpu", rev = "a3f84d243aca193b33111b935701a8b7521ea6b5" }
-wgpu-core = { git = "https://github.com/scroix/wgpu", rev = "a3f84d243aca193b33111b935701a8b7521ea6b5" }
-wgpu-hal = { git = "https://github.com/scroix/wgpu", rev = "a3f84d243aca193b33111b935701a8b7521ea6b5" }
-wgpu-types = { git = "https://github.com/scroix/wgpu", rev = "a3f84d243aca193b33111b935701a8b7521ea6b5" }
+wgpu = { git = "https://github.com/scroix/wgpu", rev = "0316ceebc36f89e48f71dae67144cffce3f11941" }
+wgpu-core = { git = "https://github.com/scroix/wgpu", rev = "0316ceebc36f89e48f71dae67144cffce3f11941" }
+wgpu-hal = { git = "https://github.com/scroix/wgpu", rev = "0316ceebc36f89e48f71dae67144cffce3f11941" }
+wgpu-types = { git = "https://github.com/scroix/wgpu", rev = "0316ceebc36f89e48f71dae67144cffce3f11941" }

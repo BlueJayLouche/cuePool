@@ -11,22 +11,26 @@
 
 mod canvas_texture;
 #[cfg(windows)]
-mod d3d11_zero_copy;
+mod d3d12_zero_copy;
 mod frame;
 mod frame_lease;
 mod frame_pool;
 mod hap_converter;
 mod pixel_sampler;
 mod projection_renderer;
+mod submit_queue;
 mod video_source;
 mod yuv_converter;
 mod zero_copy;
 
 pub use canvas_texture::CanvasTexture;
 #[cfg(windows)]
-pub use d3d11_zero_copy::{D3d11Frame, D3d11Handoff};
+pub use d3d12_zero_copy::{D3d12Frame, D3d12Handoff};
 pub use frame_lease::{LeaseBudget, LeasePermit, MAX_ZERO_COPY_LEASES, SubmissionRetirement};
 pub use frame_pool::FramePool;
+#[cfg(windows)]
+pub use submit_queue::DecodeFence;
+pub use submit_queue::SharedQueue;
 
 /// FFmpeg library version (libavutil, encoded major<<16 | minor<<8 | micro),
 /// for the Status diagnostics window.
@@ -42,6 +46,19 @@ pub use video_source::{
 };
 pub use yuv_converter::YuvConverter;
 pub use zero_copy::ZeroCopyAvailability;
+
+/// Serializes GPU device creation/use across tests. With the default parallel
+/// test harness, concurrent device create/destroy cycles from several test
+/// threads can spin inside the NVIDIA user-mode driver when another process
+/// (the venue soak) is actively rendering — observed wedging the suite for an
+/// hour on ASHOF-PC02. Every GPU test takes this lock first.
+#[cfg(test)]
+pub(crate) fn gpu_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static GPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+}
 
 #[cfg(test)]
 pub(crate) fn test_device_queue(
