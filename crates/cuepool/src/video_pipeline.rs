@@ -251,7 +251,11 @@ fn frame_pacing_decision(
         });
     if !stepping && let Some(interval) = healthy_interval {
         return FramePacingDecision {
-            target: woke_on_tick.then(|| position.saturating_add(interval)),
+            target: Some(if woke_on_tick {
+                position.saturating_add(interval)
+            } else {
+                position
+            }),
             tick_paced: true,
         };
     }
@@ -280,10 +284,10 @@ fn update_vsync_interval(
 /// WSI serializes a thread's GPU calls behind the vsync-blocked render
 /// threads (20-60 ms per call), which dragged the whole event loop to ~10 Hz.
 ///
-/// While output 0 presents regularly, only its ticks consume frames and a
-/// one-interval lookahead selects what the next scanout should show. Timeout
-/// wakes still handle control and publishing. Missing/stale ticks and stepping
-/// use the original wall-clock selection and sleep behavior unchanged.
+/// While output 0 presents regularly, its ticks use a one-interval lookahead
+/// to select what the next scanout should show. Timeout wakes may drain frames
+/// already behind the wall clock so a serial decoder can catch up after startup.
+/// Missing/stale ticks and stepping use wall-clock selection unchanged.
 ///
 /// Lock order: `control` and `frame_state` are both leaf locks, never held
 /// together across GPU calls and never held while sleeping or blocking on
@@ -1646,7 +1650,7 @@ mod tests {
     }
 
     #[test]
-    fn frame_pacing_quantizes_healthy_ticks_and_preserves_fallbacks() {
+    fn frame_pacing_looks_ahead_on_ticks_and_catches_up_on_timeouts() {
         let position = Duration::from_secs(10);
         let interval = Duration::from_millis(20);
         let decide = |stepping, woke_on_tick, age, interval| {
@@ -1658,7 +1662,7 @@ mod tests {
         assert!(tick.tick_paced);
 
         let timeout = decide(false, false, Some(Duration::from_millis(5)), Some(interval));
-        assert_eq!(timeout.target, None);
+        assert_eq!(timeout.target, Some(position));
         assert!(timeout.tick_paced);
 
         let absent = decide(false, false, None, None);
