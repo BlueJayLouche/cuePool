@@ -1992,9 +1992,52 @@ impl CuePoolApp {
     }
 }
 
+/// The CuePool mark as flat geometry: a ring bowl with a tapered tail on the
+/// 45° axis, so it reads as a Q and as a cue ball being struck.
+///
+/// Coordinates are fractions of the mark's own box, lifted from
+/// `packaging/cuepool-02-cue.svg`, which stays the source of truth. Painting it
+/// rather than shipping a bitmap keeps it crisp at any DPI.
+const CUE_MARK_BOWL_CENTRE: f32 = 0.446;
+const CUE_MARK_BOWL_RADIUS: f32 = 0.259;
+const CUE_MARK_BOWL_STROKE: f32 = 0.194;
+const CUE_MARK_TAIL: [(f32, f32); 4] = [
+    (0.541, 0.655),
+    (0.655, 0.541),
+    (0.910, 0.773),
+    (0.773, 0.910),
+];
+
+fn paint_cue_mark(ui: &mut egui::Ui, size: f32) {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Image, ui.is_enabled(), "CuePool")
+    });
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    let colour = ui.visuals().text_color();
+    let painter = ui.painter();
+    let origin = rect.left_top();
+    painter.circle_stroke(
+        origin + egui::Vec2::splat(CUE_MARK_BOWL_CENTRE * size),
+        CUE_MARK_BOWL_RADIUS * size,
+        egui::Stroke::new(CUE_MARK_BOWL_STROKE * size, colour),
+    );
+    painter.add(egui::Shape::convex_polygon(
+        CUE_MARK_TAIL
+            .iter()
+            .map(|(x, y)| origin + egui::vec2(x * size, y * size))
+            .collect(),
+        colour,
+        egui::Stroke::NONE,
+    ));
+}
+
 impl CuePoolApp {
     fn menu_bar(&mut self, ui: &mut egui::Ui) {
         egui::MenuBar::new().ui(ui, |ui| {
+            paint_cue_mark(ui, ui.text_style_height(&egui::TextStyle::Body));
             ui.menu_button("File", |ui| {
                 if ui.button("New").clicked() {
                     if let Ok(mut state) = self.state.lock() {

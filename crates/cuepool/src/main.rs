@@ -560,6 +560,24 @@ enum ShowControlCommand {
     Shutdown,
 }
 
+/// The window icon, decoded once from the mark shipped in `packaging/`.
+///
+/// Windows and Linux read this for the taskbar and title bar; the packaged
+/// `.ico` only reaches the Start-menu shortcut. macOS ignores it and takes the
+/// bundle's `AppIcon.icns`. A missing or corrupt icon is not worth refusing to
+/// launch over, so this degrades to the platform default.
+fn window_icon() -> Option<winit::window::Icon> {
+    const ICON_PNG: &[u8] = include_bytes!("../../../packaging/window-icon.png");
+    let image = image::load_from_memory(ICON_PNG)
+        .inspect_err(|error| log::warn!("window icon failed to decode: {error}"))
+        .ok()?
+        .into_rgba8();
+    let (width, height) = image.dimensions();
+    winit::window::Icon::from_rgba(image.into_raw(), width, height)
+        .inspect_err(|error| log::warn!("window icon rejected by winit: {error}"))
+        .ok()
+}
+
 impl App {
     // ponytail: Keep startup wiring explicit; introduce a GPU context only if more state is added.
     #[allow(clippy::too_many_arguments)]
@@ -946,6 +964,7 @@ impl App {
                 .create_window(
                     winit::window::WindowAttributes::default()
                         .with_title("CuePool")
+                        .with_window_icon(window_icon())
                         .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 800.0)),
                 )
                 .map_err(|error| format!("control window creation failed: {error}; {context}"))?,
