@@ -39,17 +39,22 @@ fn demo_harness() -> (Harness<'static>, SharedStateHandle) {
     app_harness(preview::demo_app())
 }
 
-// Keep the visual baselines stable across version glyph and accent changes.
-// Semantic and unit assertions still verify the exact dynamic values.
-// GitHub's Linux WGPU backend differs by one additional edge pixel.
-fn card_snapshot_options() -> SnapshotOptions {
-    let pixel_threshold = if has_wgpu_adapter() {
-        OsThreshold::new(9).linux(10)
-    } else {
-        OsThreshold::new(9)
-    };
-    SnapshotOptions::new().max_failed_pixels(pixel_threshold)
-}
+/// The parts both presentations draw. `CardPresentation` promises About is the
+/// same drawing as the launch splash, so both tests check this same list: one
+/// asserts it is present, the other that the credits are not.
+const SHARED_CARD_LABELS: [&str; 3] = [
+    "Animated CuePool donut",
+    "CUEPOOL",
+    "AUDIO  /  VIDEO  /  LIGHTING  /  CONTROL",
+];
+
+/// What `CardPresentation::Invoked` adds on top of [`SHARED_CARD_LABELS`].
+const ABOUT_ONLY_LABELS: [&str; 4] = [
+    "A professional audio/video playback application",
+    "GitHub",
+    "License: GPL-3.0",
+    "Close",
+];
 
 /// The card's donut is tinted per release series, so check the rendered pixels
 /// really carry this build's palette entry. A snapshot cannot do this: every
@@ -114,6 +119,19 @@ fn launch_card_shows_the_build_then_fades_out() {
     let (mut harness, _state) = app_harness(CuePoolApp::new());
 
     assert!(harness.query_by_label(&build_identity()).is_some());
+    for label in SHARED_CARD_LABELS {
+        assert!(
+            harness.query_by_label(label).is_some(),
+            "the launch card should draw the shared card element {label:?}"
+        );
+    }
+    // The credits belong to About alone; the launch card must stay uncluttered.
+    for label in ABOUT_ONLY_LABELS {
+        assert!(
+            harness.query_by_label(label).is_none(),
+            "the launch card should not carry the credit {label:?}"
+        );
+    }
     harness.remove_cursor();
     harness.step();
     if has_wgpu_adapter() {
@@ -153,16 +171,21 @@ fn about_reopens_the_same_card_with_credits() {
     state.lock().unwrap().show_about_window = true;
     harness.step();
 
-    // Same identity as the launch presentation, plus the credits it adds.
+    // Same drawing as the launch presentation...
     assert!(harness.query_by_label(&build_identity()).is_some());
-    assert!(harness.query_by_label("License: GPL-3.0").is_some());
-    harness.remove_cursor();
-    harness.step();
-    // Snapshotted as rendered, not version-neutralised: that helper assumes a
-    // uniform backdrop behind the donut, and About deliberately leaves the
-    // workspace visible, so it would rewrite real pixels inside the donut's
-    // bounding box. This baseline moves when the release series changes.
-    harness.snapshot_options("about_card", &card_snapshot_options());
+    for label in SHARED_CARD_LABELS {
+        assert!(
+            harness.query_by_label(label).is_some(),
+            "About should draw the shared card element {label:?}"
+        );
+    }
+    // ...plus the credits only this presentation carries.
+    for label in ABOUT_ONLY_LABELS {
+        assert!(
+            harness.query_by_label(label).is_some(),
+            "About should add the credit {label:?}"
+        );
+    }
 
     harness.get_by_label("Close").click();
     harness.run();
