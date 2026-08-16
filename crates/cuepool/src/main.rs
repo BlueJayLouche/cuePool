@@ -4926,6 +4926,10 @@ fn resolve_zero_copy_preference(
     }
 }
 
+fn prefer_dx12_backend(zero_copy_enabled: bool) -> bool {
+    cfg!(windows) || zero_copy_enabled
+}
+
 fn load_startup_project(cuepool: &CuePoolApp, path: &Path) -> Result<(), String> {
     let data = std::fs::read_to_string(path)
         .map_err(|error| format!("Cannot read startup project '{}': {error}", path.display()))?;
@@ -5088,18 +5092,17 @@ fn run(log_file: String, profile: AppProfile) -> anyhow::Result<()> {
     };
     let zero_copy_preference =
         resolve_zero_copy_preference(cli.zero_copy, ZeroCopyPreference::from_env());
-    // Zero-copy consumes FFmpeg's D3D12VA output on wgpu's own ID3D12Device,
-    // which requires the DX12 backend; an enabled preference therefore biases
-    // adapter selection to DX12 and falls back to the stock selection (where
-    // zero-copy declines with a reason) if no DX12 adapter exists.
+    // Prefer DX12 on Windows because Vulkan FIFO presentation can stall shared
+    // GPU work and make otherwise-fast video frames arrive late. Zero-copy also
+    // requires DX12 so FFmpeg and wgpu can share the same ID3D12Device.
     let (instance, adapter) = {
         let mut selected = None;
-        if zero_copy_preference.enabled() {
+        if prefer_dx12_backend(zero_copy_preference.enabled()) {
             let dx12 = make_instance(wgpu::Backends::DX12);
             match request_headless_adapter(&dx12) {
                 Ok(adapter) => selected = Some((dx12, adapter)),
                 Err(error) => {
-                    log::warn!("Video zero-copy: no DX12 adapter ({error}); using stock selection");
+                    log::warn!("No DX12 adapter ({error}); using stock GPU backend selection");
                 }
             }
         }
@@ -5453,6 +5456,12 @@ mod tests {
         ])
         .unwrap_err();
         assert!(conflict.contains("Only one of"), "{conflict}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_prefers_dx12_without_enabling_zero_copy() {
+        assert!(prefer_dx12_backend(false));
     }
 
     #[test]
