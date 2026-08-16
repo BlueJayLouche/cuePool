@@ -351,6 +351,17 @@ fn video_seek_clock(
     Some((clock, paused.then_some(now)))
 }
 
+fn video_start_clock(
+    now: Instant,
+    media_offset_secs: f64,
+    engine_now: Duration,
+    clock_origin: Duration,
+) -> Option<Instant> {
+    let elapsed = engine_now.saturating_sub(clock_origin).as_secs_f64();
+    video_seek_clock(now, video_media_secs(elapsed, media_offset_secs), false)
+        .map(|(clock, _)| clock)
+}
+
 struct App {
     // ── wgpu core ──
     instance: wgpu::Instance,
@@ -1113,6 +1124,7 @@ impl App {
                 EngineAction::PlayVideo {
                     qid,
                     instance_id,
+                    clock_origin,
                     path,
                     start_time,
                     duration,
@@ -1120,7 +1132,15 @@ impl App {
                     mtc_start,
                     ..
                 } => {
-                    self.play_video(&path, qid, instance_id, start_time, duration, event_loop);
+                    self.play_video(
+                        &path,
+                        qid,
+                        instance_id,
+                        clock_origin,
+                        start_time,
+                        duration,
+                        event_loop,
+                    );
                     if follow_mtc {
                         self.mtc_follow = Some(MtcFollowState {
                             qid,
@@ -1940,11 +1960,13 @@ impl App {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)] // Mirrors the PlayVideo engine action at the runtime boundary.
     fn play_video(
         &mut self,
         path: &str,
         qid: rust_decimal::Decimal,
         instance_id: u64,
+        clock_origin: Duration,
         start_time: cuepool_core::Timespan,
         duration: cuepool_core::Timespan,
         event_loop: &ActiveEventLoop,
@@ -1957,6 +1979,7 @@ impl App {
         if self.output_windows.is_empty() {
             self.create_output_windows(event_loop);
         }
+        let engine_now = self.engine_now();
         // A newly-started video should always play, even if the system was paused.
         self.video_pause_flag.store(false, Ordering::Relaxed);
 
@@ -1967,12 +1990,11 @@ impl App {
         {
             let mut ctl = self.video_control.lock_unpoisoned();
             ctl.stream_epoch += 1;
-            // Start the playback clock now; PTS are matched against it (and frames
-            // late vs the clock are skipped, so video catches up to audio even if
-            // decode open / first-frame took a while).
+            // Preserve the audio-master cue origin across output-window creation.
+            // Frames late vs this clock are skipped, so decoder startup catches up
+            // without turning setup time into a permanent audio lead.
             let media_offset = start_time.as_secs_f64().max(0.0);
-            ctl.clock =
-                video_seek_clock(Instant::now(), media_offset, false).map(|(clock, _)| clock);
+            ctl.clock = video_start_clock(Instant::now(), media_offset, engine_now, clock_origin);
             ctl.pause_started = None;
             ctl.peek_pts = None;
             ctl.last_pts = None;
@@ -5193,6 +5215,21 @@ mod tests {
         let (clock, pause_started) = video_seek_clock(now, target, true).unwrap();
         assert_eq!(pause_started, Some(now));
         assert_eq!(now.duration_since(clock), Duration::from_secs_f64(target));
+    }
+
+    #[test]
+    fn video_start_clock_keeps_audio_anchor_after_output_setup() {
+        let now = Instant::now();
+        let clock_origin = Duration::from_secs(10);
+        let engine_now = clock_origin + Duration::from_millis(275);
+        let media_offset = 3.25;
+
+        let clock = video_start_clock(now, media_offset, engine_now, clock_origin).unwrap();
+
+        assert_eq!(
+            now.duration_since(clock),
+            Duration::from_secs_f64(media_offset) + Duration::from_millis(275)
+        );
     }
 
     #[test]

@@ -46,6 +46,7 @@ pub enum EngineAction {
         qid: Decimal,
         instance_id: u64,
         epoch: u64,
+        clock_origin: Duration,
         path: String,
         start_time: Timespan,
         duration: Timespan,
@@ -1309,6 +1310,7 @@ impl ShowEngine {
             qid: video.qid,
             instance_id: video.instance_id,
             epoch: video.epoch,
+            clock_origin: video.clock_origin,
             path: video.path.clone(),
             start_time: video.start_time,
             duration: video.duration,
@@ -1607,6 +1609,22 @@ mod tests {
         engine.resume();
         engine.now = Duration::from_secs(10);
         assert_eq!(engine.show_elapsed(), Some(Duration::from_secs(4)));
+    }
+
+    #[test]
+    fn video_action_carries_engine_clock_origin() {
+        let (mut engine, _, _) = looped_video_engine(LoopMode::Looped);
+        let clock_origin = Duration::from_secs(12);
+        engine.now = clock_origin;
+        engine.push_video_action(engine.current_video.clone().unwrap());
+
+        assert!(matches!(
+            engine.take_actions().as_slice(),
+            [EngineAction::PlayVideo {
+                clock_origin: action_origin,
+                ..
+            }] if *action_origin == clock_origin
+        ));
     }
 
     #[test]
