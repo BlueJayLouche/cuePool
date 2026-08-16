@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 mod identity_card;
 
+pub use identity_card::torus_colour;
 use identity_card::{CardPresentation, LAUNCH_HOLD, identity_card, launch_opacity};
 
 const OPERATOR_ALERT_DURATION: Duration = Duration::from_secs(10);

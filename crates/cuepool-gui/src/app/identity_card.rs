@@ -119,7 +119,9 @@ pub(crate) fn launch_opacity(remaining: Duration) -> f32 {
     remaining * remaining
 }
 
-fn torus_colour(major: &str, minor: &str) -> egui::Color32 {
+/// Accent colour for the card's donut, rotating once per release series.
+/// Public so the UI test can check the rendered pixels against this build's entry.
+pub fn torus_colour(major: &str, minor: &str) -> egui::Color32 {
     let major = major
         .parse::<usize>()
         .expect("Cargo major version is numeric");

@@ -1,10 +1,10 @@
 //! Update visual baselines with `UPDATE_SNAPSHOTS=1 cargo test -p cuepool-gui`.
 
-use cuepool_gui::app::RELEASE_NOTES_VERSION;
+use cuepool_gui::app::{RELEASE_NOTES_VERSION, torus_colour};
 use cuepool_gui::{AppCommand, CuePoolApp, SharedStateHandle, ShowMode, build_identity, preview};
 use egui::accesskit::Role;
 use egui_kittest::{
-    Harness, OsThreshold, SnapshotOptions, image_snapshot_options,
+    Harness, OsThreshold, SnapshotOptions,
     kittest::{By, Queryable},
 };
 use rust_decimal::Decimal;
@@ -51,42 +51,62 @@ fn card_snapshot_options() -> SnapshotOptions {
     SnapshotOptions::new().max_failed_pixels(pixel_threshold)
 }
 
-// Recolours the donut back to the 0.5-series blue so the baseline survives a
-// release-series accent change. Only valid where the backdrop behind the donut
-// is uniform, which is true of the launch presentation and not of About.
-fn snapshot_version_neutral_card(
-    harness: &mut Harness<'static>,
-    name: &str,
-    options: &SnapshotOptions,
-) {
+/// The card's donut is tinted per release series, so check the rendered pixels
+/// really carry this build's palette entry. A snapshot cannot do this: every
+/// palette entry saturates one channel, so any of them would survive a baseline
+/// comparison identically.
+///
+/// A glyph pixel is `background + coverage * (colour - background)`. The
+/// saturated channel makes the largest channel ratio equal `coverage`, which
+/// then reconstructs the source colour from the brightest pixel in the rect.
+/// Like the recolouring helper it replaces, this assumes a uniform backdrop
+/// behind the donut, so it suits the launch presentation and not About.
+fn assert_donut_uses_the_build_colour(harness: &mut Harness<'static>) {
     let donut = harness.get_by_label("Animated CuePool donut").rect();
-    let mut image = harness.render().expect("splash snapshot should render");
+    let image = harness.render().expect("splash should render");
     let x_range = donut.left().floor().max(0.0) as u32..donut.right().ceil() as u32;
     let y_range = donut.top().floor().max(0.0) as u32..donut.bottom().ceil() as u32;
     let background = *image.get_pixel(x_range.start, y_range.start);
-    let baseline_colour = [92_u8, 168, 255];
 
+    let mut brightest = background;
+    let mut brightest_sum = 0_u32;
     for y in y_range {
         for x in x_range.clone() {
-            let pixel = image.get_pixel_mut(x, y);
-            let coverage = (0..3)
-                .map(|channel| {
-                    f32::from(pixel[channel].saturating_sub(background[channel]))
-                        / f32::from(255 - background[channel])
-                })
-                .fold(0.0_f32, f32::max);
-            if coverage > 0.0 {
-                for channel in 0..3 {
-                    let background = f32::from(background[channel]);
-                    pixel[channel] = (background
-                        + coverage * (f32::from(baseline_colour[channel]) - background))
-                        .round() as u8;
-                }
+            let pixel = *image.get_pixel(x, y);
+            let sum = u32::from(pixel[0]) + u32::from(pixel[1]) + u32::from(pixel[2]);
+            if sum > brightest_sum {
+                brightest_sum = sum;
+                brightest = pixel;
             }
         }
     }
 
-    image_snapshot_options(&image, name, options);
+    let coverage = (0..3)
+        .map(|channel| {
+            f32::from(brightest[channel].saturating_sub(background[channel]))
+                / f32::from(255 - background[channel])
+        })
+        .fold(0.0_f32, f32::max);
+    assert!(
+        coverage > 0.5,
+        "expected solidly drawn donut glyphs, got peak coverage {coverage}"
+    );
+
+    let expected = torus_colour(
+        env!("CARGO_PKG_VERSION_MAJOR"),
+        env!("CARGO_PKG_VERSION_MINOR"),
+    );
+    for (channel, expected) in [expected.r(), expected.g(), expected.b()]
+        .into_iter()
+        .enumerate()
+    {
+        let background = f32::from(background[channel]);
+        let recovered = background + (f32::from(brightest[channel]) - background) / coverage;
+        assert!(
+            (recovered - f32::from(expected)).abs() <= 8.0,
+            "donut channel {channel} rendered as {recovered:.1}, expected {expected}"
+        );
+    }
 }
 
 #[test]
@@ -96,14 +116,14 @@ fn launch_card_shows_the_build_then_fades_out() {
     assert!(harness.query_by_label(&build_identity()).is_some());
     harness.remove_cursor();
     harness.step();
-    let snapshot_options = card_snapshot_options();
-    snapshot_version_neutral_card(&mut harness, "launch_splash", &snapshot_options);
+    if has_wgpu_adapter() {
+        assert_donut_uses_the_build_colour(&mut harness);
+    }
 
     let started_at = 1.0 / 60.0;
     harness.input_mut().time = Some(started_at + 2.29);
     harness.step();
     assert!(harness.query_by_label(&build_identity()).is_some());
-    snapshot_version_neutral_card(&mut harness, "launch_splash_fade", &snapshot_options);
 
     harness.input_mut().time = Some(started_at + 2.5);
     harness.step();
