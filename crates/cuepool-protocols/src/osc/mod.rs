@@ -95,6 +95,10 @@ pub enum OscEvent {
     RawMessage(OscMessage),
 }
 
+/// How long the RX thread waits on an idle socket before checking whether it
+/// has been asked to stop. It bounds how long shutdown takes, so it is short.
+const RX_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// Low-level UDP OSC driver.
 pub struct OscDriver {
     socket: Arc<UdpSocket>,
@@ -115,7 +119,10 @@ impl OscDriver {
     pub fn bind(tx_host: Ipv4Addr, rx_port: u16, tx_port: u16) -> anyhow::Result<Self> {
         let bind_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, rx_port);
         let socket = UdpSocket::bind(bind_addr)?;
-        socket.set_nonblocking(false)?;
+        // Blocking reads, but bounded: the RX loop only notices the stop flag
+        // between reads, so without a timeout `Drop` would join a thread parked
+        // in `recv_from` until the next datagram — on a quiet port, forever.
+        socket.set_read_timeout(Some(RX_POLL_INTERVAL))?;
         // The destination is user-chosen and may well be a broadcast address;
         // without this, sending to one fails EACCES rather than going nowhere.
         socket.set_broadcast(true)?;
@@ -153,9 +160,13 @@ impl OscDriver {
                             log::warn!("OSC decode error from {src}: {e}");
                         }
                     },
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(std::time::Duration::from_millis(1));
-                    }
+                    // An idle port: the read timeout expired with nothing to
+                    // show. Unix reports it as WouldBlock, Windows as TimedOut.
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) => {}
                     Err(e) => {
                         log::warn!("OSC recv error: {e}");
                     }
@@ -271,34 +282,43 @@ impl OscRouter {
     ///
     /// `src` is the address the datagram arrived from, and is passed through to
     /// every handler that matches.
-    pub fn route(&self, msg: &OscMessage, src: std::net::SocketAddr) {
+    ///
+    /// Returns whether any handler ran. A `false` means the address is not one
+    /// CuePool subscribes to and the message was discarded, which the caller
+    /// should report — a typo'd or foreign address is otherwise indistinguishable
+    /// from a network fault.
+    pub fn route(&self, msg: &OscMessage, src: std::net::SocketAddr) -> bool {
         let addr = msg.addr.clone();
         let parts: Vec<&str> = addr.split('/').filter(|s| !s.is_empty()).collect();
-        Self::route_node(&self.root, &parts, 0, msg, src);
+        Self::route_node(&self.root, &parts, 0, msg, src)
     }
 
+    /// Fires every handler on the path and returns whether any of them ran.
     fn route_node(
         node: &RouterNode,
         parts: &[&str],
         idx: usize,
         msg: &OscMessage,
         src: std::net::SocketAddr,
-    ) {
+    ) -> bool {
         // Fire handlers at this node
+        let mut matched = !node.handlers.is_empty();
         for h in &node.handlers {
             h(msg, src);
         }
         if idx >= parts.len() {
-            return;
+            return matched;
         }
-        // Exact match
+        // Exact match. `|=` rather than `||` — both branches must be walked, so
+        // an exact hit cannot short-circuit the wildcard one.
         if let Some(child) = node.children.get(parts[idx]) {
-            Self::route_node(child, parts, idx + 1, msg, src);
+            matched |= Self::route_node(child, parts, idx + 1, msg, src);
         }
         // Wildcard match
         if let Some(ref wildcard) = node.wildcard {
-            Self::route_node(wildcard, parts, idx + 1, msg, src);
+            matched |= Self::route_node(wildcard, parts, idx + 1, msg, src);
         }
+        matched
     }
 }
 
@@ -482,8 +502,17 @@ impl OscManager {
         }
 
         let router_clone = Arc::clone(&router);
+        let mut unmatched = std::collections::HashSet::new();
         driver.start(move |msg, src| {
-            router_clone.lock_unpoisoned().route(&msg, src);
+            if !router_clone.lock_unpoisoned().route(&msg, src)
+                && is_first_sighting(&mut unmatched, &msg.addr)
+            {
+                log::warn!(
+                    "OSC address {} from {src} matched no subscription; the message was \
+                     discarded. Later messages to this address are not logged.",
+                    msg.addr
+                );
+            }
         });
 
         Ok(Self {
@@ -504,6 +533,20 @@ impl OscManager {
     pub fn tx_addr(&self) -> std::net::SocketAddr {
         self.driver.tx_addr()
     }
+}
+
+/// Distinct unmatched OSC addresses reported before reporting stops. A
+/// misconfigured controller sends one or two; anything beyond this is a device
+/// speaking a namespace CuePool does not implement, and the log has made that
+/// point already.
+const UNMATCHED_ADDR_LIMIT: usize = 32;
+
+/// Whether an unmatched address is worth a log line. The first datagram to a
+/// given address is; repeats are not, because a fader or a repeating timer on a
+/// wrong address arrives every frame and would fill the log ring buffer. `seen`
+/// grows from network input, so it stops at [`UNMATCHED_ADDR_LIMIT`].
+fn is_first_sighting(seen: &mut std::collections::HashSet<String>, addr: &str) -> bool {
+    seen.len() < UNMATCHED_ADDR_LIMIT && seen.insert(addr.to_string())
 }
 
 fn arg_to_string(arg: &OscType) -> Option<String> {
@@ -646,6 +689,56 @@ mod tests {
             Some(sender),
             "handlers must see the address the datagram arrived from, so a pong \
              can be sent back to the requester instead of broadcast"
+        );
+    }
+
+    /// The diagnosis this exists for: a controller on a typo'd address, a wrong
+    /// port, or a namespace CuePool does not implement all look like a network
+    /// fault unless the router says the message hit nothing.
+    #[test]
+    fn test_router_reports_whether_anything_matched() {
+        let mut router = OscRouter::new();
+        router.subscribe("/qplayer/go", |_msg, _src| {});
+        router.subscribe("/dmx/?/?", |_msg, _src| {});
+
+        let route = |router: &OscRouter, addr: &str| {
+            router.route(
+                &OscMessage {
+                    addr: addr.into(),
+                    args: vec![],
+                },
+                test_src(),
+            )
+        };
+
+        assert!(route(&router, "/qplayer/go"), "exact match");
+        assert!(route(&router, "/dmx/1/5"), "wildcard match");
+        assert!(!route(&router, "/qplayer/gt"), "typo'd address");
+        assert!(!route(&router, "/cue/1/start"), "foreign namespace");
+        assert!(
+            !route(&router, "/qplayer"),
+            "a prefix of a subscribed address has no handler of its own"
+        );
+    }
+
+    #[test]
+    fn test_unmatched_addresses_are_reported_once_then_capped() {
+        let mut seen = std::collections::HashSet::new();
+
+        assert!(is_first_sighting(&mut seen, "/qplayer/gt"));
+        assert!(
+            !is_first_sighting(&mut seen, "/qplayer/gt"),
+            "a fader repeating a bad address must not repeat the log line"
+        );
+        assert!(is_first_sighting(&mut seen, "/qplayer/dwn"));
+
+        for i in 0..UNMATCHED_ADDR_LIMIT {
+            is_first_sighting(&mut seen, &format!("/junk/{i}"));
+        }
+        assert_eq!(seen.len(), UNMATCHED_ADDR_LIMIT);
+        assert!(
+            !is_first_sighting(&mut seen, "/junk/new"),
+            "addresses arrive off the network, so the set must stop growing"
         );
     }
 
