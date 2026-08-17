@@ -32,8 +32,8 @@ pub mod waveform;
 
 pub use app::{
     ActiveCueInfo, AppCommand, CuePoolApp, DecodeTiming, Diagnostics, GuiMeterData,
-    OutputDiagnostics, PreparedProject, SharedState, SharedStateHandle, ShowMode, VideoDiagnostics,
-    VideoTimings, prepare_unattended_project,
+    OutputDiagnostics, PreparedProject, RELEASE_NOTES_VERSION, SharedState, SharedStateHandle,
+    ShowMode, VideoDiagnostics, VideoTimings, prepare_unattended_project,
 };
 
 pub(crate) fn cue_type_label(cue: &cuepool_core::Cue) -> &'static str {

@@ -508,6 +508,9 @@ struct App {
     last_active_cue_publish: Instant,
     /// When the control window was last asked to repaint (throttles its ~60 Hz redraw).
     last_control_redraw: std::time::Instant,
+    /// Whether the "occluded while a quit is pending" warning has been logged.
+    /// One line per process is enough to tell the two #173 stories apart.
+    occluded_close_warned: bool,
     /// Last seen set of physical monitors, to detect hotplug / projector warm-up and
     /// re-apply the output→monitor assignment.
     last_monitor_set: Vec<cuepool_core::MonitorId>,
@@ -954,6 +957,7 @@ impl App {
             last_project_generation: 0,
             last_active_cue_publish: Instant::now() - Duration::from_secs(1),
             last_control_redraw: std::time::Instant::now(),
+            occluded_close_warned: false,
             last_monitor_set: Vec::new(),
             last_monitor_check: std::time::Instant::now(),
             identify_until: None,
@@ -3806,7 +3810,22 @@ impl App {
             wgpu::CurrentSurfaceTexture::Success(o)
             | wgpu::CurrentSurfaceTexture::Suboptimal(o) => o,
             // Control window covered/minimized — skip this frame quietly (no spam).
-            wgpu::CurrentSurfaceTexture::Occluded => return,
+            // Skipping the frame also skips the egui pass, so while a close is
+            // pending the quit-confirm modal cannot be drawn and no input is
+            // processed. That may be the remaining half of #173; the field has no
+            // other way to tell it apart from the modal-layer bug, so say it once.
+            wgpu::CurrentSurfaceTexture::Occluded => {
+                if !self.occluded_close_warned
+                    && self.cuepool.state().lock_unpoisoned().pending_close_confirm
+                {
+                    self.occluded_close_warned = true;
+                    log::warn!(
+                        "Control window is occluded with a quit confirmation pending; \
+                         the dialog cannot appear until the window is visible again"
+                    );
+                }
+                return;
+            }
             wgpu::CurrentSurfaceTexture::Outdated => {
                 drop(submit_guard);
                 log::debug!("Control surface outdated, reconfiguring");
@@ -4124,16 +4143,14 @@ impl ApplicationHandler<AppEvent> for App {
                 WindowEvent::CloseRequested => {
                     // Unsaved changes / running cues -> show the in-app quit-confirm
                     // modal (a native dialog deadlocks the loop). Otherwise quit now.
-                    let dirty = self
-                        .cuepool
-                        .state()
-                        .lock()
-                        .map(|s| s.dirty)
-                        .unwrap_or(false);
+                    //
+                    // lock_unpoisoned, as everywhere else in this binary: the
+                    // fallible form swallowed the close request outright under a
+                    // poisoned lock, and read `dirty` as false, which sent a dirty
+                    // project down the hard_exit branch with no prompt (#173).
+                    let dirty = self.cuepool.state().lock_unpoisoned().dirty;
                     if !self.show_engine.snapshot().active_cues.is_empty() || dirty {
-                        if let Ok(mut state) = self.cuepool.state().lock() {
-                            state.pending_close_confirm = true;
-                        }
+                        self.cuepool.state().lock_unpoisoned().pending_close_confirm = true;
                     } else {
                         self.hard_exit("control window closed");
                     }
@@ -4339,8 +4356,10 @@ impl ApplicationHandler<AppEvent> for App {
             return;
         }
         // Quit confirmed by the in-app modal — hard-exit (see hard_exit for why).
-        if self.cuepool.state().lock().map(|s| s.quit).unwrap_or(false) {
-            self.hard_exit("operator confirmed discard and quit");
+        // lock_unpoisoned for the same reason as the CloseRequested arm: the
+        // fallible read left a confirmed quit unactioned under a poisoned lock.
+        if self.cuepool.state().lock_unpoisoned().quit {
+            self.hard_exit("operator confirmed quit");
         }
 
         let show_status = self

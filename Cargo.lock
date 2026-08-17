@@ -1320,6 +1320,7 @@ dependencies = [
  "chrono",
  "cuepool-audio",
  "cuepool-core",
+ "dirs",
  "eframe",
  "egui",
  "egui-wgpu",

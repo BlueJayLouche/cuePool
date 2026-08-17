@@ -617,6 +617,31 @@ pub struct ProgressOverlay {
     pub progress: f32, // 0.0 to 1.0
 }
 
+/// What the operator picked in the quit-confirm modal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuitChoice {
+    Save,
+    Discard,
+    Cancel,
+}
+
+/// Shared by the modal and the `move_to_top` that keeps it reachable, so the
+/// two cannot drift apart.
+fn quit_modal_id() -> egui::Id {
+    egui::Id::new("quit_confirm")
+}
+
+/// Where a project that has never been saved goes on "Save & Quit": next to the
+/// crash-recovery file, stamped so two quits cannot collide.
+fn unsaved_show_path() -> Result<std::path::PathBuf, String> {
+    let dir = dirs::data_dir()
+        .ok_or("no user data directory")?
+        .join("CuePool");
+    std::fs::create_dir_all(&dir).map_err(|error| format!("{}: {error}", dir.display()))?;
+    let stamp = chrono::Local::now().format("%Y-%m-%d %H%M%S");
+    Ok(dir.join(format!("Unsaved Show {stamp}.qproj")))
+}
+
 /// A short-lived, non-blocking runtime error shown above the status bar.
 #[derive(Debug, Clone)]
 pub struct OperatorAlert {
@@ -2035,26 +2060,60 @@ impl CuePoolApp {
             .map(|s| s.pending_close_confirm)
             .unwrap_or(false);
         if pending_close {
-            egui::Modal::new(egui::Id::new("quit_confirm")).show(ctx, |ui| {
-                ui.set_width(320.0);
+            // egui hands the modal layer to the most recently created modal area
+            // and blocks input to every layer below it, so a modal opening after
+            // this one left a visible but unclickable "Quit CuePool?" on screen
+            // with no way out (#173). Claim the top each frame: a pending quit
+            // outranks anything else on screen, and whatever it covers is
+            // reachable again after Cancel.
+            ctx.move_to_top(egui::LayerId::new(egui::Order::Foreground, quit_modal_id()));
+            let response = egui::Modal::new(quit_modal_id()).show(ctx, |ui| {
+                ui.set_width(380.0);
                 ui.heading("Quit CuePool?");
                 ui.add_space(4.0);
-                ui.label("You have unsaved changes or running cues. Discard and quit?");
+                ui.label("You have unsaved changes or running cues.");
                 ui.add_space(12.0);
+                let mut choice = None;
                 ui.horizontal(|ui| {
-                    if ui.button("Discard & Quit").clicked()
-                        && let Ok(mut s) = self.state.lock()
-                    {
+                    if ui.button("Save & Quit").clicked() {
+                        choice = Some(QuitChoice::Save);
+                    }
+                    if ui.button("Discard & Quit").clicked() {
+                        choice = Some(QuitChoice::Discard);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        choice = Some(QuitChoice::Cancel);
+                    }
+                });
+                choice
+            });
+            // Escape and a backdrop click mean cancel. Dropping the ModalResponse
+            // left both doing nothing, which is most of what "the app soft-locks"
+            // looked like to an operator whose reflex is Escape.
+            let choice = response
+                .inner
+                .or_else(|| response.should_close().then_some(QuitChoice::Cancel));
+            if !response.is_top_modal {
+                // move_to_top only takes effect at end of frame, so this can be
+                // false for a frame after another modal appears. Ask for the
+                // repaint that resolves it rather than waiting on the next event.
+                ctx.request_repaint();
+            }
+            match choice {
+                Some(QuitChoice::Save) => self.save_and_quit(),
+                Some(QuitChoice::Discard) => {
+                    if let Ok(mut s) = self.state.lock() {
                         s.pending_close_confirm = false;
                         s.quit = true;
                     }
-                    if ui.button("Cancel").clicked()
-                        && let Ok(mut s) = self.state.lock()
-                    {
+                }
+                Some(QuitChoice::Cancel) => {
+                    if let Ok(mut s) = self.state.lock() {
                         s.pending_close_confirm = false;
                     }
-                });
-            });
+                }
+                None => {}
+            }
         }
 
         // Discard-confirm modal for New / Open, in-app for the same reason.
@@ -3091,6 +3150,49 @@ impl CuePoolApp {
             && let Ok(mut state) = self.state.lock()
         {
             state.command_queue.extend(unhandled);
+        }
+    }
+
+    /// Save, then quit only if the save landed. A project with no path would
+    /// otherwise fall through to `AppCommand::SaveProject`'s native Save As
+    /// dialog, which runs inside the egui frame: the exact thing this in-app
+    /// modal exists to avoid. Those go to the CuePool data directory instead.
+    fn save_and_quit(&self) {
+        let existing = self
+            .state
+            .lock()
+            .ok()
+            .and_then(|state| state.project_path.clone());
+        let path = match existing {
+            Some(path) => path,
+            None => match unsaved_show_path() {
+                Ok(path) => path,
+                Err(error) => {
+                    log::error!("Save before quit failed: {error}");
+                    if let Ok(mut state) = self.state.lock() {
+                        state.report_operator_error(format!(
+                            "Could not save before quitting: {error}"
+                        ));
+                    }
+                    return;
+                }
+            },
+        };
+        if let Err(error) = self.save_to_path(&path) {
+            log::error!("Save before quit failed for '{}': {error}", path.display());
+            if let Ok(mut state) = self.state.lock() {
+                state.report_operator_error(format!("Could not save before quitting: {error}"));
+            }
+            return;
+        }
+        log::info!(
+            target: crate::logging::PERSIST_TARGET,
+            "Saved before quit: {}",
+            path.display()
+        );
+        if let Ok(mut state) = self.state.lock() {
+            state.pending_close_confirm = false;
+            state.quit = true;
         }
     }
 
