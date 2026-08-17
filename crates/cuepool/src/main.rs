@@ -3448,12 +3448,20 @@ impl App {
                             state.recorder_file = file;
                         }
                     }
-                    OscEvent::RemotePing => {
+                    OscEvent::RemotePing { src } => {
+                        // Reply to whoever asked, rather than broadcasting on the
+                        // TX port: a broadcast pong carries no identity, so with
+                        // more than one CuePool on the subnet the requester cannot
+                        // tell which machine answered. The payload stays empty so
+                        // existing health checks keep matching it byte for byte.
                         if let Some(osc) = &self.osc_manager {
-                            let _ = osc.send(rosc::OscMessage {
-                                addr: "/qplayer/remote/pong".into(),
-                                args: vec![],
-                            });
+                            let _ = osc.send_to(
+                                rosc::OscMessage {
+                                    addr: "/qplayer/remote/pong".into(),
+                                    args: vec![],
+                                },
+                                src,
+                            );
                         }
                     }
                     OscEvent::RemoteDiscovery { name, addr } => {

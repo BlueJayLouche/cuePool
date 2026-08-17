@@ -41,7 +41,7 @@ fn arbitrary_addresses_and_patterns_never_panic_or_hang() {
     let mut router = OscRouter::new();
     for pattern in PATTERNS {
         let h = Arc::clone(&hits);
-        router.subscribe(pattern, move |_msg: &OscMessage| {
+        router.subscribe(pattern, move |_msg: &OscMessage, _src| {
             h.fetch_add(1, Ordering::Relaxed);
         });
     }
@@ -54,7 +54,7 @@ fn arbitrary_addresses_and_patterns_never_panic_or_hang() {
             addr,
             args: random_args(&mut rng),
         };
-        router.route(&msg);
+        router.route(&msg, std::net::SocketAddr::from(([127, 0, 0, 1], 9000)));
     }
 
     done_tx.send(()).expect("watchdog must still be listening");

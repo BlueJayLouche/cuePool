@@ -60,7 +60,11 @@ pub enum OscEvent {
         qid: String,
         time: f32,
     },
-    RemotePing,
+    /// A remote node asked whether we are alive. `src` is the requester, so the
+    /// pong can be sent back to it directly rather than broadcast.
+    RemotePing {
+        src: std::net::SocketAddr,
+    },
     RemoteUpdateShowAck {
         name: String,
         block: i32,
@@ -207,7 +211,7 @@ pub struct OscRouter {
 // ponytail: Keep callback storage inline; introduce aliases when the router API next changes.
 #[allow(clippy::type_complexity)]
 struct RouterNode {
-    handlers: Vec<Box<dyn Fn(&OscMessage) + Send>>,
+    handlers: Vec<Box<dyn Fn(&OscMessage, std::net::SocketAddr) + Send>>,
     children: HashMap<String, RouterNode>,
     wildcard: Option<Box<RouterNode>>,
 }
@@ -231,9 +235,12 @@ impl OscRouter {
 
     /// Subscribe a handler to an address pattern.
     /// Patterns are of the form `/foo/bar` or `/foo/?/bar`.
+    ///
+    /// Handlers receive the source address the message arrived from, so that
+    /// request/response patterns can reply to the requester directly.
     pub fn subscribe<F>(&mut self, pattern: &str, handler: F)
     where
-        F: Fn(&OscMessage) + Send + 'static,
+        F: Fn(&OscMessage, std::net::SocketAddr) + Send + 'static,
     {
         let parts: Vec<&str> = pattern.split('/').filter(|s| !s.is_empty()).collect();
         let mut node = &mut self.root;
@@ -265,27 +272,36 @@ impl OscRouter {
     }
 
     /// Route a message to all matching handlers.
-    pub fn route(&self, msg: &OscMessage) {
+    ///
+    /// `src` is the address the datagram arrived from, and is passed through to
+    /// every handler that matches.
+    pub fn route(&self, msg: &OscMessage, src: std::net::SocketAddr) {
         let addr = msg.addr.clone();
         let parts: Vec<&str> = addr.split('/').filter(|s| !s.is_empty()).collect();
-        Self::route_node(&self.root, &parts, 0, msg);
+        Self::route_node(&self.root, &parts, 0, msg, src);
     }
 
-    fn route_node(node: &RouterNode, parts: &[&str], idx: usize, msg: &OscMessage) {
+    fn route_node(
+        node: &RouterNode,
+        parts: &[&str],
+        idx: usize,
+        msg: &OscMessage,
+        src: std::net::SocketAddr,
+    ) {
         // Fire handlers at this node
         for h in &node.handlers {
-            h(msg);
+            h(msg, src);
         }
         if idx >= parts.len() {
             return;
         }
         // Exact match
         if let Some(child) = node.children.get(parts[idx]) {
-            Self::route_node(child, parts, idx + 1, msg);
+            Self::route_node(child, parts, idx + 1, msg, src);
         }
         // Wildcard match
         if let Some(ref wildcard) = node.wildcard {
-            Self::route_node(wildcard, parts, idx + 1, msg);
+            Self::route_node(wildcard, parts, idx + 1, msg, src);
         }
     }
 }
@@ -317,59 +333,59 @@ impl OscManager {
         {
             let mut r = router.lock_unpoisoned();
             let tx = event_tx.clone();
-            r.subscribe("/qplayer/go", move |msg| {
+            r.subscribe("/qplayer/go", move |msg, _src| {
                 let qid = msg.args.first().and_then(arg_to_string);
                 let _ = tx.send(OscEvent::Go { qid });
             });
             let tx = event_tx.clone();
-            r.subscribe("/qplayer/stop", move |msg| {
+            r.subscribe("/qplayer/stop", move |msg, _src| {
                 let qid = msg.args.first().and_then(arg_to_string);
                 let _ = tx.send(OscEvent::Stop { qid });
             });
             let tx = event_tx.clone();
-            r.subscribe("/qplayer/pause", move |msg| {
+            r.subscribe("/qplayer/pause", move |msg, _src| {
                 let qid = msg.args.first().and_then(arg_to_string);
                 let _ = tx.send(OscEvent::Pause { qid });
             });
             let tx = event_tx.clone();
-            r.subscribe("/qplayer/unpause", move |msg| {
+            r.subscribe("/qplayer/unpause", move |msg, _src| {
                 let qid = msg.args.first().and_then(arg_to_string);
                 let _ = tx.send(OscEvent::Unpause { qid });
             });
             let tx = event_tx.clone();
-            r.subscribe("/qplayer/preload", move |msg| {
+            r.subscribe("/qplayer/preload", move |msg, _src| {
                 let qid = msg.args.first().and_then(arg_to_string);
                 let time = msg.args.get(1).and_then(arg_to_f32);
                 let _ = tx.send(OscEvent::Preload { qid, time });
             });
             let tx = event_tx.clone();
-            r.subscribe("/qplayer/select", move |msg| {
+            r.subscribe("/qplayer/select", move |msg, _src| {
                 if let Some(qid) = msg.args.first().and_then(arg_to_string) {
                     let _ = tx.send(OscEvent::Select { qid });
                 }
             });
             let tx = event_tx.clone();
-            r.subscribe("/qplayer/up", move |_msg| {
+            r.subscribe("/qplayer/up", move |_msg, _src| {
                 let _ = tx.send(OscEvent::Up);
             });
             let tx = event_tx.clone();
-            r.subscribe("/qplayer/down", move |_msg| {
+            r.subscribe("/qplayer/down", move |_msg, _src| {
                 let _ = tx.send(OscEvent::Down);
             });
             let tx = event_tx.clone();
-            r.subscribe("/qplayer/save", move |_msg| {
+            r.subscribe("/qplayer/save", move |_msg, _src| {
                 let _ = tx.send(OscEvent::Save);
             });
 
             // Remote control
             let tx = event_tx.clone();
-            r.subscribe("/qplayer/remote/discovery", move |msg| {
+            r.subscribe("/qplayer/remote/discovery", move |msg, _src| {
                 if let Some(name) = msg.args.first().and_then(arg_to_string) {
                     let _ = tx.send(OscEvent::RemoteDiscovery { name, addr: None });
                 }
             });
             let tx = event_tx.clone();
-            r.subscribe("/qplayer/remote/go", move |msg| {
+            r.subscribe("/qplayer/remote/go", move |msg, _src| {
                 if let (Some(t), Some(q)) = (
                     msg.args.first().and_then(arg_to_string),
                     msg.args.get(1).and_then(arg_to_string),
@@ -378,7 +394,7 @@ impl OscManager {
                 }
             });
             let tx = event_tx.clone();
-            r.subscribe("/qplayer/remote/pause", move |msg| {
+            r.subscribe("/qplayer/remote/pause", move |msg, _src| {
                 if let (Some(t), Some(q)) = (
                     msg.args.first().and_then(arg_to_string),
                     msg.args.get(1).and_then(arg_to_string),
@@ -387,7 +403,7 @@ impl OscManager {
                 }
             });
             let tx = event_tx.clone();
-            r.subscribe("/qplayer/remote/unpause", move |msg| {
+            r.subscribe("/qplayer/remote/unpause", move |msg, _src| {
                 if let (Some(t), Some(q)) = (
                     msg.args.first().and_then(arg_to_string),
                     msg.args.get(1).and_then(arg_to_string),
@@ -396,7 +412,7 @@ impl OscManager {
                 }
             });
             let tx = event_tx.clone();
-            r.subscribe("/qplayer/remote/stop", move |msg| {
+            r.subscribe("/qplayer/remote/stop", move |msg, _src| {
                 if let (Some(t), Some(q)) = (
                     msg.args.first().and_then(arg_to_string),
                     msg.args.get(1).and_then(arg_to_string),
@@ -405,7 +421,7 @@ impl OscManager {
                 }
             });
             let tx = event_tx.clone();
-            r.subscribe("/qplayer/remote/preload", move |msg| {
+            r.subscribe("/qplayer/remote/preload", move |msg, _src| {
                 if let (Some(t), Some(q), Some(time)) = (
                     msg.args.first().and_then(arg_to_string),
                     msg.args.get(1).and_then(arg_to_string),
@@ -419,11 +435,11 @@ impl OscManager {
                 }
             });
             let tx = event_tx.clone();
-            r.subscribe("/qplayer/remote/ping", move |_msg| {
-                let _ = tx.send(OscEvent::RemotePing);
+            r.subscribe("/qplayer/remote/ping", move |_msg, src| {
+                let _ = tx.send(OscEvent::RemotePing { src });
             });
             let tx = event_tx.clone();
-            r.subscribe("/qplayer/remote/update-show-ack", move |msg| {
+            r.subscribe("/qplayer/remote/update-show-ack", move |msg, _src| {
                 if let (Some(name), Some(block)) = (
                     msg.args.first().and_then(arg_to_string),
                     msg.args.get(1).and_then(arg_to_i32),
@@ -432,7 +448,7 @@ impl OscManager {
                 }
             });
             let tx = event_tx.clone();
-            r.subscribe("/qplayer/remote/update-show-nack", move |msg| {
+            r.subscribe("/qplayer/remote/update-show-nack", move |msg, _src| {
                 if let (Some(name), Some(block)) = (
                     msg.args.first().and_then(arg_to_string),
                     msg.args.get(1).and_then(arg_to_i32),
@@ -443,7 +459,7 @@ impl OscManager {
 
             // DMX recorder: literal channel input + transport verbs.
             let tx = event_tx.clone();
-            r.subscribe("/dmx/?/?", move |msg| {
+            r.subscribe("/dmx/?/?", move |msg, _src| {
                 if let Some((universe, channel)) = parse_dmx_addr(&msg.addr)
                     && let Some(value) = msg.args.first().and_then(arg_to_dmx)
                 {
@@ -462,7 +478,7 @@ impl OscManager {
                 ("revert", OscEvent::RecorderRevert),
             ] {
                 let tx = event_tx.clone();
-                r.subscribe(&format!("/recorder/{verb}"), move |msg| {
+                r.subscribe(&format!("/recorder/{verb}"), move |msg, _src| {
                     // TouchOSC push buttons send 1.0 on press and 0.0 on
                     // release — fire on press only (bare messages also fire).
                     if is_press(msg) {
@@ -471,7 +487,7 @@ impl OscManager {
                 });
             }
             let tx = event_tx.clone();
-            r.subscribe("/recorder/select", move |msg| {
+            r.subscribe("/recorder/select", move |msg, _src| {
                 if let Some(name) = msg.args.first().and_then(arg_to_string) {
                     let _ = tx.send(OscEvent::RecorderSelect { name });
                 }
@@ -479,8 +495,8 @@ impl OscManager {
         }
 
         let router_clone = Arc::clone(&router);
-        driver.start(move |msg, _src| {
-            router_clone.lock_unpoisoned().route(&msg);
+        driver.start(move |msg, src| {
+            router_clone.lock_unpoisoned().route(&msg, src);
         });
 
         Ok(Self {
@@ -574,19 +590,28 @@ fn arg_to_i32(arg: &OscType) -> Option<i32> {
 mod tests {
     use super::*;
 
+    /// Stand-in source address for router tests that do not care who sent the
+    /// message.
+    fn test_src() -> std::net::SocketAddr {
+        std::net::SocketAddr::from(([127, 0, 0, 1], 9000))
+    }
+
     #[test]
     fn test_router_exact_match() {
         let mut router = OscRouter::new();
         let received = Arc::new(Mutex::new(false));
         let r = Arc::clone(&received);
-        router.subscribe("/qplayer/go", move |_msg| {
+        router.subscribe("/qplayer/go", move |_msg, _src| {
             *r.lock().unwrap() = true;
         });
 
-        router.route(&OscMessage {
-            addr: "/qplayer/go".into(),
-            args: vec![],
-        });
+        router.route(
+            &OscMessage {
+                addr: "/qplayer/go".into(),
+                args: vec![],
+            },
+            test_src(),
+        );
 
         assert!(*received.lock().unwrap());
     }
@@ -596,16 +621,45 @@ mod tests {
         let mut router = OscRouter::new();
         let received = Arc::new(Mutex::new(String::new()));
         let r = Arc::clone(&received);
-        router.subscribe("/qplayer/?/go", move |msg| {
+        router.subscribe("/qplayer/?/go", move |msg, _src| {
             *r.lock().unwrap() = msg.addr.clone();
         });
 
-        router.route(&OscMessage {
-            addr: "/qplayer/123/go".into(),
-            args: vec![],
-        });
+        router.route(
+            &OscMessage {
+                addr: "/qplayer/123/go".into(),
+                args: vec![],
+            },
+            test_src(),
+        );
 
         assert_eq!(*received.lock().unwrap(), "/qplayer/123/go");
+    }
+
+    #[test]
+    fn test_router_passes_source_address() {
+        let mut router = OscRouter::new();
+        let seen = Arc::new(Mutex::new(None));
+        let s = Arc::clone(&seen);
+        router.subscribe("/qplayer/remote/ping", move |_msg, src| {
+            *s.lock().unwrap() = Some(src);
+        });
+
+        let sender = std::net::SocketAddr::from(([10, 10, 30, 136], 54321));
+        router.route(
+            &OscMessage {
+                addr: "/qplayer/remote/ping".into(),
+                args: vec![],
+            },
+            sender,
+        );
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            Some(sender),
+            "handlers must see the address the datagram arrived from, so a pong \
+             can be sent back to the requester instead of broadcast"
+        );
     }
 
     #[test]
