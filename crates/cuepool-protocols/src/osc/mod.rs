@@ -32,8 +32,6 @@ pub enum OscEvent {
     Select {
         qid: String,
     },
-    Up,
-    Down,
     Save,
     RemoteDiscovery {
         name: String,
@@ -360,14 +358,6 @@ impl OscManager {
                 if let Some(qid) = msg.args.first().and_then(arg_to_string) {
                     let _ = tx.send(OscEvent::Select { qid });
                 }
-            });
-            let tx = event_tx.clone();
-            r.subscribe("/qplayer/up", move |_msg, _src| {
-                let _ = tx.send(OscEvent::Up);
-            });
-            let tx = event_tx.clone();
-            r.subscribe("/qplayer/down", move |_msg, _src| {
-                let _ = tx.send(OscEvent::Down);
             });
             let tx = event_tx.clone();
             r.subscribe("/qplayer/save", move |_msg, _src| {
