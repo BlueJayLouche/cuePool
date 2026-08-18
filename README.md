@@ -13,6 +13,24 @@ cd examples/cuepool
 cargo run --release
 ```
 
+## macOS app bundle
+
+Cargo produces a bare executable, and macOS takes an icon only from an `.app`
+bundle, so launching that binary from Finder or the Dock shows the generic green
+`exec` tile. `packaging/window-icon.png` does not apply here either, because
+winit window icons are a no-op on macOS. For a real CuePool.app:
+
+```sh
+cargo build --release
+./package-macos.sh
+```
+
+That writes `dist/CuePool.app` at the repo root from the same `Info.plist` and
+`packaging/AppIcon.icns` the release workflow ships, so it matches the published
+build. Run `brew install dylibbundler` first to pull the FFmpeg dylib closure
+into the bundle and make it shareable. Without it the bundle still loads FFmpeg
+from Homebrew and runs only on the machine that built it.
+
 ## Command line
 
 ```text
