@@ -14,7 +14,16 @@ use identity_card::{CardPresentation, LAUNCH_HOLD, identity_card, launch_opacity
 
 const OPERATOR_ALERT_DURATION: Duration = Duration::from_secs(10);
 const MAX_AUTOMATION_PROJECT_BYTES: u64 = 16 * 1024 * 1024;
-pub const RELEASE_NOTES_VERSION: &str = "0.4";
+/// The generation of "What's new" copy the modal currently shows, matched
+/// against each operator's stored `last_seen_release_notes` so the modal
+/// appears once per generation.
+///
+/// Hand-written rather than derived from `CARGO_PKG_VERSION` on purpose: a
+/// patch bump must not re-fire the modal, and a minor bump must not relabel
+/// the previous release's copy with the new version. `release_notes_match_the_release`
+/// fails while this trails the package minor, which is the reminder to rewrite
+/// the modal body before bumping it (see AGENTS.md).
+pub const RELEASE_NOTES_VERSION: &str = "0.10";
 
 /// A full snapshot of editable state for undo/redo.
 #[derive(Debug, Clone)]
@@ -2214,23 +2223,30 @@ impl CuePoolApp {
                         .color(egui::Color32::from_rgb(255, 184, 92)),
                 );
                 ui.add_space(4.0);
-                ui.heading("GPU-native HAP playback");
+                ui.heading("Timecode, in and out");
                 ui.label(
-                    "CuePool keeps supported HAP video compressed through decode, then converts it directly on the GPU.",
+                    "CuePool can now follow an incoming LTC signal, or generate one from the show clock, each on an audio device and channel you choose.",
                 );
                 ui.add_space(12.0);
                 ui.separator();
                 ui.add_space(8.0);
 
                 for (title, detail) in [
-                    ("Supported formats", "HAP, HAP Alpha and HAP Q."),
                     (
-                        "GPU when available",
-                        "Uses the native path when the GPU supports BC textures and frame dimensions.",
+                        "Chase LTC",
+                        "Lock the show clock to LTC arriving on a selected audio input, picked by driver and channel in Settings.",
                     ),
                     (
-                        "Automatic fallback",
-                        "Falls back to FFmpeg software for unsupported hardware, variants or packets, with the reason logged.",
+                        "Generate LTC",
+                        "Send LTC from the show clock on its own output. Both directions accept 32- and 24-bit integer streams.",
+                    ),
+                    (
+                        "Faster video on Windows",
+                        "D3D12VA zero-copy decode on wgpu 30, with DX12 preferred and the active decode path shown in the status bar.",
+                    ),
+                    (
+                        "Settings that survive a crash",
+                        "A corrupt or half-written settings.json is kept and reported rather than silently replaced, and a panicked thread can no longer overwrite your recent files.",
                     ),
                 ] {
                     ui.label(
@@ -2244,7 +2260,7 @@ impl CuePoolApp {
 
                 ui.label(
                     egui::RichText::new(
-                        "Projection, overlays, edge blending, fit modes and PixelMap behave as before.",
+                        "Also: PixelMap cues respond to stop and pause, AfterLast waits for the end of a video's picture, the launch splash and About are one card, and OSC states its destination instead of deriving it from a NIC.",
                     )
                     .small()
                     .color(egui::Color32::from_gray(180)),
@@ -3373,6 +3389,29 @@ fn common_path_prefix(paths: &[std::path::PathBuf]) -> std::path::PathBuf {
 mod tests {
     use super::*;
     use cuepool_core::CueBase;
+
+    /// A minor release ships refreshed "What's new" copy, or it ships a modal
+    /// nobody sees. `RELEASE_NOTES_VERSION` gates the modal against each
+    /// operator's stored `last_seen_release_notes`, so leaving it behind means
+    /// returning operators never see the notes again while fresh installs read
+    /// the *previous* release's copy. This caught it once already: the constant
+    /// sat at "0.4" from 0.4.0 through 0.10.2.
+    ///
+    /// When this fails, rewrite the modal body in `CuePoolApp::update` for the
+    /// current release, then bump the constant to match.
+    #[test]
+    fn release_notes_match_the_release() {
+        const PACKAGE_MINOR: &str = concat!(
+            env!("CARGO_PKG_VERSION_MAJOR"),
+            ".",
+            env!("CARGO_PKG_VERSION_MINOR")
+        );
+        assert_eq!(
+            RELEASE_NOTES_VERSION, PACKAGE_MINOR,
+            "the \"What's new\" copy still describes {RELEASE_NOTES_VERSION}; \
+             rewrite it for {PACKAGE_MINOR}, then bump RELEASE_NOTES_VERSION"
+        );
+    }
 
     #[test]
     fn video_badge_separates_acceleration_from_fallback() {

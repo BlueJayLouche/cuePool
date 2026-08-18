@@ -23,6 +23,14 @@ Sound and video use the production decoder paths. Network, text, image, PixelMap
 
 Generate test projects and media in a unique standard-library temporary directory, reference media with relative paths, and remove the directory after the test. Do not commit media fixtures or require the FFmpeg CLI. See `crates/cuepool-harness/tests/headless_show.rs` and its `support` module for the established pattern.
 
+## Release notes
+
+`RELEASE_NOTES_VERSION` in `crates/cuepool-gui/src/app/mod.rs` gates the "What's new" modal. It names the release whose copy the modal currently shows, as `major.minor`, and is compared against each operator's stored `last_seen_release_notes` so the modal appears once per generation.
+
+A minor bump is not finished until the modal body is rewritten for that release and the constant is bumped to match. `release_notes_match_the_release` fails until both are done. Patch bumps leave both alone — a bug fix must not re-show the modal.
+
+Do not derive the constant from `CARGO_PKG_VERSION`. That re-fires the modal on every patch bump and labels the previous release's copy with the new version, which is how the notes silently sat at 0.4 from 0.4.0 through 0.10.2.
+
 ## Verification
 
 Run the focused checks first:

@@ -198,11 +198,15 @@ fn release_notes_follow_the_splash_and_are_acknowledged_once() {
     let app = CuePoolApp::new();
     let (mut harness, state) = app_harness(app);
 
-    assert!(harness.query_by_label("GPU-native HAP playback").is_none());
+    // Key off the version banner, not the headline: the body is rewritten every
+    // minor release, and this test guards when the modal shows, not what it says.
+    let banner = format!("What's new · {RELEASE_NOTES_VERSION}");
+
+    assert!(harness.query_by_label(&banner).is_none());
     let started_at = 1.0 / 60.0;
     harness.input_mut().time = Some(started_at + 2.5);
     harness.step();
-    assert!(harness.query_by_label("GPU-native HAP playback").is_some());
+    assert!(harness.query_by_label(&banner).is_some());
 
     harness.key_press(egui::Key::Space);
     harness.step();
@@ -223,7 +227,7 @@ fn release_notes_follow_the_splash_and_are_acknowledged_once() {
         state.lock().unwrap().last_seen_release_notes.as_deref(),
         Some(RELEASE_NOTES_VERSION)
     );
-    assert!(harness.query_by_label("GPU-native HAP playback").is_none());
+    assert!(harness.query_by_label(&banner).is_none());
 }
 
 #[test]
