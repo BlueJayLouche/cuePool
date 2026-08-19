@@ -19,6 +19,7 @@ log = "0.4"
 rust_decimal = { version = "1.36", features = ["serde"] }
 flate2 = "1"
 roxmltree = "0.20"
+gethostname = "1.1"
 
 # Audio / Video
 cpal = "0.18.1"

@@ -361,6 +361,74 @@ fn operator_alert_is_visible_dismissible_and_expires() {
     assert!(harness.query_by_label(MESSAGE).is_none());
 }
 
+/// The Remote Node field is free text, so each way it can silently misfire has
+/// to be visible while the cue is being authored rather than discovered at GO.
+#[test]
+fn remote_node_field_warns_about_every_silent_misfire() {
+    let (mut harness, state) = demo_harness();
+
+    let address_to = |node: &str, remote_on: bool| {
+        let mut state = state.lock().unwrap();
+        state.show_file.show_settings.enable_remote_control = remote_on;
+        state.show_file.show_settings.node_name = "sound-desk".into();
+        let cue = state
+            .selected_cue_mut()
+            .expect("demo show should open with a cue selected");
+        cue.base_mut().remote_node = node.into();
+        cue.base().qid
+    };
+
+    // Remote control on, node never detected: the cue leaves and arrives nowhere.
+    address_to("video-rig", true);
+    harness.run();
+    assert!(
+        harness
+            .query_by_label("⚠ No node named 'video-rig' detected — the cue will play nowhere")
+            .is_some()
+    );
+
+    // Remote control off: the cue quietly plays out of this machine instead.
+    let qid = address_to("video-rig", false);
+    harness.run();
+    let off_warning = format!("⚠ Remote Control is off — Q{qid} plays here, not on 'video-rig'");
+    assert!(harness.query_by_label(off_warning.as_str()).is_some());
+
+    // Addressed to this machine: legal, but not what "Remote Node" implies.
+    address_to("sound-desk", true);
+    harness.run();
+    assert!(
+        harness
+            .query_by_label("⚠ 'sound-desk' is this machine — the cue plays here")
+            .is_some()
+    );
+
+    // Known but gone quiet — the machine is off, or off the network.
+    let known = |last_seen| {
+        vec![cuepool_core::RemoteNode {
+            name: "video-rig".into(),
+            address: "10.0.0.9:9000".into(),
+            last_seen,
+        }]
+    };
+    state.lock().unwrap().show_file.show_settings.remote_nodes =
+        known(Some(Instant::now() - Duration::from_secs(60)));
+    address_to("video-rig", true);
+    harness.run();
+    assert!(
+        harness
+            .query_by_label(
+                "⚠ 'video-rig' has not answered recently — check the machine is running"
+            )
+            .is_some()
+    );
+
+    // A node that is actually on the network draws no warning at all.
+    state.lock().unwrap().show_file.show_settings.remote_nodes = known(Some(Instant::now()));
+    address_to("video-rig", true);
+    harness.run();
+    assert!(harness.query(By::new().label_contains("⚠")).is_none());
+}
+
 #[test]
 fn active_progress_scrubs_only_in_edit_mode() {
     let (mut harness, state) = demo_harness();

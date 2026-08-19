@@ -1,5 +1,7 @@
 use cuepool_audio::{AudioEngine, CueChainParams, FileDecoder, SampleProvider};
-use cuepool_core::{Cue, LockExt, LoopMode, ShowFile, StopMode, Timespan, TriggerMode};
+use cuepool_core::{
+    Cue, CueBase, LockExt, LoopMode, ShowFile, ShowSettings, StopMode, Timespan, TriggerMode,
+};
 use cuepool_gui::SharedStateHandle;
 use cuepool_gui::app::CueState;
 use rust_decimal::Decimal;
@@ -440,6 +442,14 @@ impl ShowEngine {
         }
     }
 
+    /// Surface a misconfiguration the operator can still act on: the alert panel
+    /// during the show, the log window after it. A cue that goes to the wrong
+    /// machine — or to none — is not something to find out about from a log file.
+    fn warn_operator(&self, message: String) {
+        log::warn!("{message}");
+        self.state.lock_unpoisoned().report_operator_error(message);
+    }
+
     fn play_cue(&mut self, cue: Cue) {
         if !cue.enabled() {
             return;
@@ -449,14 +459,37 @@ impl ShowEngine {
             return;
         }
 
-        if !cue.base().remote_node.is_empty() {
+        // Routing is resolved before anything is prepared locally: a cue bound to
+        // another machine must not touch this one's outputs.
+        if !cue.base().remote_node.trim().is_empty() {
             let settings = self.state.lock_unpoisoned().show_file.show_settings.clone();
-            if settings.enable_remote_control && cue.base().remote_node != settings.node_name {
-                self.actions.push_back(EngineAction::RemoteGo {
-                    node: cue.base().remote_node.clone(),
-                    qid,
-                });
-                return;
+            match resolve_remote_routing(cue.base(), &settings) {
+                RemoteRouting::Local => {}
+                RemoteRouting::Remote(node) => {
+                    // Sent even when the node is unknown to us: discovery is a
+                    // broadcast, and a switch that filters broadcast makes a live
+                    // node look absent. Refusing here would kill a working cue, so
+                    // the mismatch is reported instead of enforced.
+                    if !settings
+                        .remote_nodes
+                        .iter()
+                        .any(|known| known.name.trim() == node)
+                    {
+                        self.warn_operator(format!(
+                            "Q{qid} targets remote node '{node}', which has not been \
+                             detected — sending anyway. Check the name and that the node \
+                             is on the network."
+                        ));
+                    }
+                    self.actions.push_back(EngineAction::RemoteGo { node, qid });
+                    return;
+                }
+                RemoteRouting::LocalRemoteControlOff(node) => {
+                    self.warn_operator(format!(
+                        "Q{qid} targets remote node '{node}', but Remote Control is off \
+                         — playing it on this machine instead."
+                    ));
+                }
             }
         }
 
@@ -1516,6 +1549,36 @@ fn next_after_last(cues: &[Cue], qid: Decimal) -> Option<&Cue> {
         .find(|cue| cue.enabled())
 }
 
+/// Which machine a cue fires on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteRouting {
+    /// Fire here: no remote node is set, or the one set names this machine.
+    Local,
+    /// Dispatch to a named peer over OSC.
+    Remote(String),
+    /// The cue names a peer, but remote control is off — so it falls back to
+    /// this machine. Kept distinct from `Local` because it is a fallback the
+    /// operator has to be told about: a cue authored for the video rig playing
+    /// out of the sound desk is not a silent event.
+    LocalRemoteControlOff(String),
+}
+
+/// Resolve where `base` fires.
+///
+/// Names are compared trimmed. The Remote Node field is free text, so a stray
+/// trailing space would otherwise route the cue to a name no node can ever
+/// match — the cue would leave this machine and arrive nowhere.
+pub fn resolve_remote_routing(base: &CueBase, settings: &ShowSettings) -> RemoteRouting {
+    let target = base.remote_node.trim();
+    if target.is_empty() || target == settings.node_name.trim() {
+        return RemoteRouting::Local;
+    }
+    if !settings.enable_remote_control {
+        return RemoteRouting::LocalRemoteControlOff(target.to_string());
+    }
+    RemoteRouting::Remote(target.to_string())
+}
+
 fn resolve_goto_target(cues: &[Cue], goto_qid: Decimal, first_target: Decimal) -> Option<Decimal> {
     let mut current = first_target;
     let mut visited = HashSet::from([goto_qid]);
@@ -1680,6 +1743,72 @@ mod tests {
                 ..
             }] if *action_origin == clock_origin
         ));
+    }
+
+    fn remote_settings(node_name: &str, enabled: bool) -> ShowSettings {
+        ShowSettings {
+            node_name: node_name.into(),
+            enable_remote_control: enabled,
+            ..Default::default()
+        }
+    }
+
+    fn addressed_to(node: &str) -> CueBase {
+        CueBase {
+            remote_node: node.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn unaddressed_cue_fires_locally() {
+        assert_eq!(
+            resolve_remote_routing(&addressed_to(""), &remote_settings("foh", true)),
+            RemoteRouting::Local
+        );
+        // Whitespace is not a node name.
+        assert_eq!(
+            resolve_remote_routing(&addressed_to("   "), &remote_settings("foh", true)),
+            RemoteRouting::Local
+        );
+    }
+
+    #[test]
+    fn cue_addressed_to_this_machine_fires_locally() {
+        assert_eq!(
+            resolve_remote_routing(&addressed_to("foh"), &remote_settings("foh", true)),
+            RemoteRouting::Local
+        );
+    }
+
+    #[test]
+    fn node_names_are_matched_trimmed() {
+        // A stray space in the inspector's free-text field used to address the
+        // cue to a name nothing could match, so it played nowhere at all.
+        assert_eq!(
+            resolve_remote_routing(&addressed_to(" foh "), &remote_settings("foh", true)),
+            RemoteRouting::Local
+        );
+        assert_eq!(
+            resolve_remote_routing(&addressed_to(" video "), &remote_settings("foh", true)),
+            RemoteRouting::Remote("video".into())
+        );
+    }
+
+    #[test]
+    fn addressed_cue_dispatches_when_remote_control_is_on() {
+        assert_eq!(
+            resolve_remote_routing(&addressed_to("video"), &remote_settings("foh", true)),
+            RemoteRouting::Remote("video".into())
+        );
+    }
+
+    #[test]
+    fn addressed_cue_falls_back_locally_when_remote_control_is_off() {
+        assert_eq!(
+            resolve_remote_routing(&addressed_to("video"), &remote_settings("foh", false)),
+            RemoteRouting::LocalRemoteControlOff("video".into())
+        );
     }
 
     #[test]

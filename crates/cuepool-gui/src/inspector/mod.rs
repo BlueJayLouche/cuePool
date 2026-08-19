@@ -126,6 +126,21 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
     let mut lighting_live = state.lighting_live;
     let tc_fps = state.show_file.show_settings.timecode_fps;
 
+    // Remote-node context, snapshotted before the cue is mutably borrowed so the
+    // Remote Node field can be validated against the machines actually on the
+    // network rather than accepting any string.
+    let remote_control_on = state.show_file.show_settings.enable_remote_control;
+    let local_node_name = state.show_file.show_settings.node_name.trim().to_string();
+    let now = std::time::Instant::now();
+    let detected_nodes: Vec<(String, bool)> = state
+        .show_file
+        .show_settings
+        .remote_nodes
+        .iter()
+        .map(|node| (node.name.trim().to_string(), node.is_live(now)))
+        .filter(|(name, _)| !name.is_empty())
+        .collect();
+
     // ponytail: one whole-state clone per inspector frame so every edit is undoable.
     // For very large show files this could be replaced with per-field snapshots.
     let pre_edit_snapshot = crate::app::Snapshot::from_state(&state).with_merge_key("inspector");
@@ -252,9 +267,68 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
     });
     ui.horizontal(|ui| {
         ui.label("Remote Node:");
-        let response = ui.text_edit_singleline(&mut base.remote_node);
-        changed |= response.changed();
+        // Right-to-left so the picker takes its width off the end and the text
+        // field fills what is left. Laying it out the other way makes the row
+        // ask for more width than it has, which widens the whole panel.
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            // Free text stays editable — a node that has not broadcast yet still
+            // has to be nameable — but the picker is how you avoid typing it wrong.
+            ui.menu_button("⏷", |ui| {
+                if ui.button("(this machine)").clicked() {
+                    base.remote_node.clear();
+                    changed = true;
+                    ui.close();
+                }
+                if detected_nodes.is_empty() {
+                    ui.separator();
+                    ui.label(RichText::new("No other nodes detected").weak());
+                }
+                for (name, live) in &detected_nodes {
+                    let marker = if *live { "●" } else { "○" };
+                    if ui.button(format!("{marker} {name}")).clicked() {
+                        base.remote_node = name.clone();
+                        changed = true;
+                        ui.close();
+                    }
+                }
+            })
+            .response
+            .on_hover_text("Pick a detected node");
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut base.remote_node)
+                    .desired_width(ui.available_width()),
+            );
+            changed |= response.changed();
+        });
     });
+    // Every way this field can silently misfire, named at the point of authoring.
+    let target = base.remote_node.trim();
+    if !target.is_empty() {
+        let warning = if target == local_node_name {
+            Some(format!("⚠ '{target}' is this machine — the cue plays here"))
+        } else if !remote_control_on {
+            Some(format!(
+                "⚠ Remote Control is off — Q{} plays here, not on '{target}'",
+                base.qid
+            ))
+        } else {
+            match detected_nodes.iter().find(|(name, _)| name == target) {
+                None => Some(format!(
+                    "⚠ No node named '{target}' detected — the cue will play nowhere"
+                )),
+                // Seen once, since gone quiet. Worth saying: after a show file is
+                // loaded this clears as soon as the node answers, so a warning
+                // that persists means the machine really is not there.
+                Some((_, false)) => Some(format!(
+                    "⚠ '{target}' has not answered recently — check the machine is running"
+                )),
+                Some((_, true)) => None,
+            }
+        };
+        if let Some(text) = warning {
+            ui.colored_label(egui::Color32::from_rgb(230, 160, 60), text);
+        }
+    }
     ui.horizontal(|ui| {
         ui.label("Description:");
         let response = ui.text_edit_multiline(&mut base.description);

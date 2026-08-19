@@ -296,6 +296,10 @@ impl Default for ShowSettings {
     }
 }
 
+/// How long a discovered node stays "live" after its last discovery broadcast.
+/// Discovery is periodic, so this is a few missed beacons rather than one.
+pub const REMOTE_NODE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct RemoteNode {
     #[serde(default)]
@@ -304,6 +308,18 @@ pub struct RemoteNode {
     pub address: String,
     #[serde(skip)]
     pub last_seen: Option<std::time::Instant>,
+}
+
+impl RemoteNode {
+    /// Whether the node has been heard from recently enough to count as present.
+    ///
+    /// `last_seen` is `#[serde(skip)]`, so a node restored from a show file reads
+    /// as not live until it broadcasts again — which is correct: the file records
+    /// that we once saw it, not that it is on the network now.
+    pub fn is_live(&self, now: std::time::Instant) -> bool {
+        self.last_seen
+            .is_some_and(|seen| now.duration_since(seen) < REMOTE_NODE_TIMEOUT)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -452,8 +468,19 @@ fn default_udp_tx_port() -> u16 {
 fn default_true() -> bool {
     true
 }
+/// Node name for a show file that does not carry one.
+///
+/// Hostname-derived rather than a bare "CuePool": when every machine defaults to
+/// the same name they cannot discover each other (discovery skips same-named
+/// peers) and a remote GO addressed to that name fires on all of them at once.
+/// The bare name remains the fallback for a host with no usable hostname.
 fn default_node_name() -> String {
-    "CuePool".into()
+    gethostname::gethostname()
+        .into_string()
+        .ok()
+        .map(|host| host.trim().trim_end_matches(".local").to_string())
+        .filter(|host| !host.is_empty())
+        .unwrap_or_else(|| "CuePool".into())
 }
 fn default_msc_port() -> i32 {
     6004

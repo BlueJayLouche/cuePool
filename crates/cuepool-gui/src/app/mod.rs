@@ -1873,7 +1873,7 @@ impl CuePoolApp {
                             let now = std::time::Instant::now();
                             let mut to_remove = Vec::new();
                             for (idx, node) in settings.remote_nodes.iter().enumerate() {
-                                let is_active = node.last_seen.map(|t| now.duration_since(t).as_secs_f64() < 5.0).unwrap_or(false);
+                                let is_active = node.is_live(now);
                                 let color = if is_active {
                                     egui::Color32::from_rgb(100, 220, 100)
                                 } else {

@@ -17,6 +17,7 @@ rust_decimal = { workspace = true }
 log = { workspace = true }
 flate2 = { workspace = true }
 roxmltree = { workspace = true }
+gethostname = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

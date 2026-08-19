@@ -267,7 +267,9 @@ fn configured_audio_error(
 fn remote_discovery_message(settings: &cuepool_core::ShowSettings) -> Option<rosc::OscMessage> {
     settings.enable_remote_control.then(|| rosc::OscMessage {
         addr: "/qplayer/remote/discovery".into(),
-        args: vec![rosc::OscType::String(settings.node_name.clone())],
+        // Trimmed on the way out so peers store the same name the engine
+        // addresses cues to, whatever padding the settings field carries.
+        args: vec![rosc::OscType::String(settings.node_name.trim().to_string())],
     })
 }
 
@@ -2007,7 +2009,9 @@ impl App {
             };
             state.show_file.show_settings.node_name.clone()
         };
-        target == local_name || target == "*"
+        // Trimmed on both sides: the sender addresses cues to a trimmed name, so
+        // padding on either machine's node name must not decide whether a GO lands.
+        target.trim() == local_name.trim() || target.trim() == "*"
     }
 
     /// Apply the project's exact driver/device request. Any failure drops the
@@ -3476,8 +3480,10 @@ impl App {
                     }
                     OscEvent::RemoteDiscovery { name, addr } => {
                         if let Ok(mut state) = self.cuepool.state().lock() {
-                            let local_name = state.show_file.show_settings.node_name.clone();
-                            if name != local_name {
+                            let local_name =
+                                state.show_file.show_settings.node_name.trim().to_string();
+                            let name = name.trim().to_string();
+                            if !name.is_empty() && name != local_name {
                                 let now = Instant::now();
                                 let nodes = &mut state.show_file.show_settings.remote_nodes;
                                 if let Some(idx) = nodes.iter().position(|n| n.name == name) {
@@ -3616,20 +3622,8 @@ impl App {
             }
         }
 
-        // Remote node liveness: mark nodes inactive after 5s without discovery
-        {
-            let Ok(mut state) = self.cuepool.state().lock() else {
-                return;
-            };
-            let now = Instant::now();
-            for node in &mut state.show_file.show_settings.remote_nodes {
-                if let Some(last) = node.last_seen
-                    && now.duration_since(last) > Duration::from_secs(5)
-                {
-                    // Node timed out — keep it in the list but last_seen is stale
-                }
-            }
-        }
+        // Node liveness is derived where it is displayed, from `RemoteNode::is_live`
+        // against the last discovery beacon — there is no staleness state to sweep.
     }
 
     /// Render the control window (egui).
