@@ -103,8 +103,27 @@ filters), so a lighting desk can GO CuePool — or vice versa.
 ## Remote nodes
 
 *Project Settings → OSC / Remote* also enables **remote control**: multiple
-CuePool machines discover each other over OSC by node name. One node is the
-host; the others are clients. With *sync show file on save* enabled, saving
-on the host pushes the project to the clients. Set a cue's *Remote Node*
-field to make it fire on that named machine instead of locally — e.g. a
-video machine at front of house triggered from the sound desk.
+CuePool machines discover each other over OSC by node name. Each machine takes
+its hostname as its node name, so two of them are already distinguishable
+before you configure anything. One node is the host; the others are clients.
+With *sync show file on save* enabled, saving on the host pushes the project to
+the clients. Set a cue's *Remote Node* field to make it fire on that named
+machine instead of locally — e.g. a video machine at front of house triggered
+from the sound desk.
+
+The field takes free text, because a node that has not broadcast yet still has
+to be nameable, but the ⏷ picker beside it lists the machines actually
+detected. The Inspector says so when a cue would not play where you meant it to:
+
+- **The named node has never been detected.** The cue is still sent — a network
+  that filters broadcast can hide a node that is really there — but nothing
+  answers if the name is simply wrong, and the cue plays nowhere at all.
+- **The node was detected but has gone quiet.** Usually the machine is off or
+  off the network. This clears within a few seconds of the node answering, so a
+  warning that persists after loading a show file is a real one.
+- **Remote control is off.** The cue falls back to this machine.
+- **The name is this machine's own node name.** The cue plays here.
+
+The last two are deliberate fallbacks rather than errors, but neither is silent:
+each raises an operator alert if it happens during a show, and is logged to
+*Window → Log*.

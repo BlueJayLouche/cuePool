@@ -12,7 +12,7 @@
 | Enabled | Disabled cues are skipped. |
 | Loop | **OneShot**, **Looped** (× Loop Count), **LoopedInfinite**, **HoldLast** (hold the final frame/state). |
 | Retriggerable | When off, firing the cue again while it is still playing is ignored — prevents stacked audio or flashing video from a double GO. |
-| Remote Node | Fire this cue on a named [remote node](show-control.md#remote-nodes) instead of locally. |
+| Remote Node | Fire this cue on a named [remote node](show-control.md#remote-nodes) instead of locally. Pick from the detected machines rather than typing — the Inspector flags a name nothing answers to. |
 | Triggers | Optional per-cue hotkey / MIDI / wall-clock / timecode triggers — see [Show Control](show-control.md#per-cue-triggers). |
 
 ## Cue types
@@ -51,7 +51,12 @@ its members according to their trigger modes.
 ### Stop
 
 Stops another cue: target Q#, **Immediate** or **LoopEnd** (finish the
-current loop first), with an optional fade-out time and curve.
+current loop first), with an optional fade-out time and curve. A video cue's
+picture and its audio track fade out together. Targeting a Group stops every
+member, nested groups included, and a stop also cancels a target still
+waiting on its Delay. **Stop All** stops everything instead of one target —
+with a fade it brings the whole show down gently, while the transport's Stop
+button is always an instant cut.
 
 ### Volume
 

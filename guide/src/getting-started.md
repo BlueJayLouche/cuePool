@@ -70,5 +70,9 @@ instance.
 | Cmd/Ctrl+↑ / ↓ | Move selected cue up / down |
 | Delete / Backspace | Delete selected cue |
 
+While a text field has keyboard focus — renaming a cue, editing a Q number —
+the field keeps its keystrokes. Only *New*, *Open*, *Save*, *Duplicate* and
+*Add sound cue* stay live; the rest resume when the edit ends.
+
 Individual cues can also have their own [hotkey, MIDI, wall-clock, and
 timecode triggers](show-control.md#per-cue-triggers).
