@@ -460,3 +460,97 @@ fn discarding_changes_is_confirmed_in_app_before_a_new_project() {
     assert!(harness.query_by_label("Discard & Continue").is_none());
     assert!(state.lock().unwrap().show_file.cues.is_empty());
 }
+
+/// Select a cue in the list and retype its number in the inspector's QID field.
+///
+/// The number shows twice — the cue list row and the inspector — and the
+/// inspector panel is declared before the central list, so it comes first in
+/// the accessibility tree.
+fn retype_inspector_qid(harness: &mut Harness<'static>, name: &str, from: &str, to: &str) {
+    harness
+        .get(By::new().role(Role::TextInput).value(name))
+        .click();
+    harness.run();
+    harness.step();
+
+    assert_eq!(
+        harness
+            .get_all(By::new().role(Role::TextInput).value(from))
+            .count(),
+        2,
+        "expected Q{from} in both the cue list and the inspector"
+    );
+    harness
+        .get_all(By::new().role(Role::TextInput).value(from))
+        .next()
+        .expect("inspector QID field")
+        .focus();
+    harness.run();
+
+    harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+    harness.run();
+    harness
+        .get_all(By::new().role(Role::TextInput).value(from))
+        .next()
+        .expect("inspector QID field")
+        .type_text(to);
+    harness.run();
+
+    // Enter surrenders focus, which is when the edit commits.
+    harness.key_press(egui::Key::Enter);
+    harness.run();
+    harness.step();
+}
+
+fn qids(state: &SharedStateHandle) -> Vec<Decimal> {
+    state
+        .lock()
+        .unwrap()
+        .show_file
+        .cues
+        .iter()
+        .map(|cue| cue.base().qid)
+        .collect()
+}
+
+#[test]
+fn inspector_refuses_to_renumber_a_cue_onto_an_existing_qid() {
+    let (mut harness, state) = demo_harness();
+    let before = qids(&state);
+
+    // Q2 is already taken by "House Lights Half".
+    retype_inspector_qid(&mut harness, "Arm Projection", "3", "2");
+
+    assert_eq!(
+        qids(&state),
+        before,
+        "a QID collision must be refused, not create two cues sharing a number"
+    );
+}
+
+#[test]
+fn inspector_renumbering_carries_every_reference_to_the_old_qid() {
+    let (mut harness, state) = demo_harness();
+
+    // Q1 "Opening Sequence" is the parent of Q1.1/Q1.2/Q1.3 and the target of
+    // the Q5 Stop cue.
+    retype_inspector_qid(&mut harness, "Opening Sequence", "1", "7");
+
+    let state = state.lock().unwrap();
+    let cues = &state.show_file.cues;
+    assert_eq!(cues[0].base().qid, Decimal::from(7));
+    assert_eq!(state.selected_cue_id, Some(Decimal::from(7)));
+    assert!(
+        cues[1..4]
+            .iter()
+            .all(|cue| cue.base().parent == Some(Decimal::from(7))),
+        "children must follow their group's new number"
+    );
+    assert!(
+        matches!(
+            &cues[7],
+            cuepool_core::Cue::Stop { stop_qid, .. } if *stop_qid == Decimal::from(7)
+        ),
+        "the Stop cue must still point at the group it stops"
+    );
+}

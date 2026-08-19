@@ -173,7 +173,18 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
     });
     ui.horizontal(|ui| {
         ui.label("QID:");
-        changed |= qid_edit(ui, "inspector_qid", &mut base.qid);
+        // A cue's own QID is its identity, not just another field: every lookup
+        // (selection, delete, Stop/Volume/Goto targets, parenting) matches on
+        // it. Writing base.qid here would let two cues share a number, and each
+        // of those lookups would then hit both. Queue the same command the cue
+        // list uses, which refuses duplicates and repoints existing references.
+        let mut new_qid = base.qid;
+        if qid_edit(ui, "inspector_qid", &mut new_qid) {
+            pending_commands.push(crate::app::AppCommand::UpdateCueQid {
+                qid: base.qid,
+                new_qid,
+            });
+        }
     });
     ui.horizontal(|ui| {
         let mut enabled = base.enabled;
