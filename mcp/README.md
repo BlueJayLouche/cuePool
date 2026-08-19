@@ -7,7 +7,7 @@ show-control logic of its own.
 Requires Node.js 20 or newer. Build it once:
 
 ```sh
-cd examples/cuepool/mcp
+cd mcp
 npm ci
 npm run build
 ```
@@ -20,7 +20,7 @@ Then add it to an MCP client's configuration using an absolute path:
     "cuepool": {
       "command": "node",
       "args": [
-        "/absolute/path/to/rustjay-engine/examples/cuepool/mcp/dist/index.js"
+        "/absolute/path/to/cuePool/mcp/dist/index.js"
       ],
       "env": {
         "CUEPOOL_API_URL": "http://127.0.0.1:7133"

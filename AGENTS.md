@@ -1,6 +1,9 @@
 # CuePool development
 
-CuePool is a standalone Cargo workspace. Run its commands from this directory, not the repository root.
+CuePool is a standalone Cargo workspace. It was extracted from `examples/cuepool` in
+[rustjay-engine](https://github.com/BlueJayLouche/rustjay-engine); the only remaining tie is
+`rustjay-lighting`, consumed from crates.io. Local edits to that crate in the engine tree do not
+reach CuePool until they are published — bump the version in `Cargo.toml` to pick them up.
 
 ## Show behavior
 

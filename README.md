@@ -6,10 +6,7 @@ confusion with the original project. Audio via symphonia/cpal, video via FFmpeg,
 plus OSC/MIDI show control, projection-mapped video outputs, and lighting cues
 (sACN / Art-Net).
 
-This is a standalone nested workspace: build from this directory, not the repo root.
-
 ```sh
-cd examples/cuepool
 cargo run --release
 ```
 
@@ -290,3 +287,19 @@ previous cue finishes).
 Projects are JSON `.qproj` files. *File → Pack Project* copies all referenced
 media next to the project file for touring. OSC receive/transmit ports and the
 network interface live in Project Settings (defaults: rx 9000 / tx 9001).
+
+## Guide
+
+Full user guide: <https://bluejaylouche.github.io/cuePool/> (source under `guide/`).
+
+## License
+
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
+[MIT license](LICENSE-MIT) at your option. Unless you explicitly state
+otherwise, any contribution intentionally submitted for inclusion in this work
+shall be dual licensed as above, without any additional terms or conditions.
+
+CuePool is a Rust port of [QPlayer](https://github.com/space928/QPlayer) by
+space928, renamed to avoid confusion with the original project. It builds on
+[rustjay-engine](https://github.com/BlueJayLouche/rustjay-engine) and consumes
+`rustjay-lighting` (MIT) from crates.io.

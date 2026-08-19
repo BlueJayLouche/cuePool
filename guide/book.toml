@@ -1,0 +1,16 @@
+[book]
+title = "CuePool Guide"
+authors = ["BlueJayLouche"]
+language = "en"
+src = "src"
+
+[output.html]
+default-theme = "navy"
+preferred-dark-theme = "navy"
+site-url = "/cuePool/"
+git-repository-url = "https://github.com/BlueJayLouche/cuePool"
+additional-css = ["theme/custom.css"]
+
+[output.html.fold]
+enable = true
+level = 1

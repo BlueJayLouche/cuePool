@@ -1,0 +1,144 @@
+name: Release
+
+# Builds + packages CuePool and attaches it to a GitHub release.
+#   macOS   -> .app bundle in a .dmg (ad-hoc signed)
+#   Windows -> portable .zip + .msi installer (WiX, Start-menu shortcut)
+#
+# Trigger: push a tag like `v0.11.0`, or run manually (workflow_dispatch).
+# With `release_tag` empty a manual run is a dry run (artifacts only); set it
+# to an existing v* tag to re-release — same-name assets are replaced.
+#
+# Icon slots, picked up automatically if present:
+#   packaging/AppIcon.icns -> macOS bundle icon
+#   packaging/icon.ico     -> Windows Start-menu shortcut icon
+#
+# Linux is not built here: CuePool's FFmpeg closure is untested on Linux.
+# CI still builds and tests the workspace on Linux every PR.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Existing v* tag to attach the packages to (empty = artifacts-only dry run)"
+        default: ""
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  DISPLAY_NAME: CuePool
+
+jobs:
+  build:
+    name: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@1.97.1
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install FFmpeg (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ffmpeg dylibbundler
+
+      - name: Install FFmpeg SDK (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # Pinned to the immutable 8.0 SDK: it matches the FFMPEG_DIR SDK and
+          # runtime DLLs on the venue rigs, and CuePool's D3D12VA layout guard
+          # rejects the 8.1.2+ ABI (struct rework) by design. BtbN's
+          # "n8.1-latest" is a moving target that crossed that rework.
+          curl.exe -L -o ffmpeg.zip "https://github.com/GyanD/codexffmpeg/releases/download/8.0/ffmpeg-8.0-full_build-shared.zip"
+          Expand-Archive ffmpeg.zip -DestinationPath "$env:RUNNER_TEMP\ffmpeg"
+          $dir = Get-ChildItem "$env:RUNNER_TEMP\ffmpeg" -Directory | Select-Object -First 1
+          "FFMPEG_DIR=$($dir.FullName)" >> $env:GITHUB_ENV
+
+      - name: Build identity from Cargo and Git
+        shell: bash
+        run: |
+          package_id="$(cargo pkgid -p cuepool)"
+          echo "VERSION=${package_id##*#}" >> "$GITHUB_ENV"
+          echo "CUEPOOL_BUILD_ID=$(git rev-parse --short=7 HEAD)" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: cargo build --release --locked -p cuepool --all-features
+
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          APP="dist/$DISPLAY_NAME.app"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" out
+          cp target/release/cuepool "$APP/Contents/MacOS/"
+          [ -f packaging/AppIcon.icns ] && cp packaging/AppIcon.icns "$APP/Contents/Resources/"
+          sed -e "s/__NAME__/$DISPLAY_NAME/g" \
+              -e "s/__BIN__/cuepool/g" \
+              -e "s/__VERSION__/$VERSION/g" \
+              .github/packaging/Info.plist.tmpl > "$APP/Contents/Info.plist"
+          BIN="$APP/Contents/MacOS/cuepool"
+          # pull the brew FFmpeg dylib closure into the bundle and rewrite load paths
+          dylibbundler -cd -od -b -x "$BIN" \
+            -d "$APP/Contents/libs/" -p @executable_path/../libs/
+          # Normalize rpaths: dylibbundler rewrites every existing rpath to its
+          # -p value (leaving duplicates that macOS 26+ dyld refuses to load),
+          # and shipped apps shouldn't carry build-machine paths anyway.
+          # Strip everything, then add the one rpath the bundle needs.
+          otool -l "$BIN" | awk '/LC_RPATH/{getline; getline; print $2}' | while read -r rp; do
+            install_name_tool -delete_rpath "$rp" "$BIN" 2>/dev/null || true
+          done
+          install_name_tool -add_rpath @executable_path/../Frameworks "$BIN"
+          codesign --force --deep -s - "$APP"
+          hdiutil create -volname "$DISPLAY_NAME" -srcfolder "$APP" -ov -format UDZO \
+            out/cuepool-macos-arm64.dmg
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $dist = "dist\cuepool"
+          New-Item -ItemType Directory -Force $dist, out | Out-Null
+          Copy-Item "target\release\cuepool.exe" $dist
+          Copy-Item "$env:FFMPEG_DIR\bin\*.dll" $dist
+          Compress-Archive -Path "$dist\*" -DestinationPath "out\cuepool-windows-x86_64.zip"
+          # Explorer file association: .qproj -> CuePool.
+          .github\scripts\make-msi.ps1 -Name $env:DISPLAY_NAME -Version $env:VERSION `
+            -SourceDir $dist -Exe "cuepool.exe" `
+            -Icon "packaging\icon.ico" `
+            -Out "out\cuepool-windows-x86_64.msi" -FileExt "qproj"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: cuepool-${{ matrix.os }}
+          path: out/*
+
+  release:
+    name: Create Release
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.release_tag != ''
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_tag || github.ref_name }}
+          generate_release_notes: true
+          body: |
+            **macOS**: the app is ad-hoc signed, not notarized. On first launch macOS will block it:
+            right-click → Open, or approve under System Settings → Privacy & Security, or
+            `xattr -dr com.apple.quarantine "/Applications/CuePool.app"`.
+          files: artifacts/**/*
