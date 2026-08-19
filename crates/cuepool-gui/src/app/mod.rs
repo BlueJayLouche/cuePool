@@ -1014,6 +1014,12 @@ pub struct CuePoolApp {
     launch_card_started_at: Option<f64>,
     /// When Help → About opened the card, so its torus animates from zero.
     invoked_card_opened_at: Option<f64>,
+    /// Did a widget hold keyboard focus when the last frame ended?
+    ///
+    /// egui drops focus in `Focus::begin_pass` when Escape arrives, so by the
+    /// time the shortcut handler runs, the field that Escape is cancelling
+    /// already reads as unfocused. This remembers the frame before.
+    keyboard_focus_at_frame_end: bool,
 }
 
 impl Default for CuePoolApp {
@@ -1031,6 +1037,7 @@ impl CuePoolApp {
             launch_card_pending: true,
             launch_card_started_at: None,
             invoked_card_opened_at: None,
+            keyboard_focus_at_frame_end: false,
         }
     }
 
@@ -1047,6 +1054,7 @@ impl CuePoolApp {
             launch_card_pending: false,
             launch_card_started_at: None,
             invoked_card_opened_at: None,
+            keyboard_focus_at_frame_end: false,
         }
     }
 
@@ -1211,28 +1219,24 @@ impl CuePoolApp {
                     state.last_seen_release_notes.as_deref() != Some(RELEASE_NOTES_VERSION)
                 })
                 .unwrap_or(false);
-        // Keyboard shortcuts. Skip bare cue-selection/deletion keys while a
-        // text field is focused so editing isn't hijacked. Startup overlays also
-        // block shortcuts, so the keypress that dismisses the launch card cannot
-        // also operate the show behind it.
-        let editing_text = ctx.egui_wants_keyboard_input();
+        // Keyboard shortcuts. A focused field owns every keystroke that a text
+        // caret could claim — the bare keys it is being typed into, plus Cmd+Z
+        // (the field runs its own undo) and Cmd+arrows (start/end of text on
+        // macOS). Only the shortcuts that collide with nothing stay live, as
+        // menu shortcuts do in every other app. Startup overlays block the lot,
+        // so the keypress that dismisses the launch card cannot also operate
+        // the show behind it.
+        //
+        // The focus test has to reach back a frame: egui drops focus in
+        // `Focus::begin_pass` when Escape arrives, so on the frame that cancels
+        // an edit the field already reads as unfocused, and Escape would stop
+        // the show instead of just closing the editor.
+        let editing_text = ctx.egui_wants_keyboard_input() || self.keyboard_focus_at_frame_end;
         ctx.input(|i| {
             if launch_card_timing.is_some() || show_release_notes {
                 return;
             }
             let modifiers = i.modifiers;
-
-            // Undo / Redo
-            if modifiers.command && i.key_pressed(egui::Key::Z) {
-                let cmd = if modifiers.shift {
-                    AppCommand::Redo
-                } else {
-                    AppCommand::Undo
-                };
-                if let Ok(mut state) = self.state.lock() {
-                    state.command_queue.push(cmd);
-                }
-            }
 
             // New / Open / Save
             if modifiers.command
@@ -1257,14 +1261,6 @@ impl CuePoolApp {
                 state.command_queue.push(AppCommand::SaveProject);
             }
 
-            // Delete selected cue (Delete, or Backspace which is the Mac "delete").
-            if !editing_text
-                && (i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace))
-                && let Ok(mut state) = self.state.lock()
-            {
-                state.command_queue.push(AppCommand::DeleteSelectedCue);
-            }
-
             // Duplicate selected cue
             if modifiers.command
                 && i.key_pressed(egui::Key::D)
@@ -1283,6 +1279,32 @@ impl CuePoolApp {
                 });
             }
 
+            // Everything past here is the field's while one is being edited.
+            // One gate, so a shortcut added later cannot quietly default to
+            // hijacking whatever the operator is typing.
+            if editing_text {
+                return;
+            }
+
+            // Undo / Redo
+            if modifiers.command && i.key_pressed(egui::Key::Z) {
+                let cmd = if modifiers.shift {
+                    AppCommand::Redo
+                } else {
+                    AppCommand::Undo
+                };
+                if let Ok(mut state) = self.state.lock() {
+                    state.command_queue.push(cmd);
+                }
+            }
+
+            // Delete selected cue (Delete, or Backspace which is the Mac "delete").
+            if (i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace))
+                && let Ok(mut state) = self.state.lock()
+            {
+                state.command_queue.push(AppCommand::DeleteSelectedCue);
+            }
+
             // Move selected cue up/down
             if modifiers.command {
                 if i.key_pressed(egui::Key::ArrowUp)
@@ -1297,9 +1319,8 @@ impl CuePoolApp {
                 }
             }
 
-            // Walk the standby playhead in list order. Text fields keep the
-            // unmodified arrows/Home/End for caret navigation.
-            if !editing_text && modifiers.is_none() {
+            // Walk the standby playhead in list order.
+            if modifiers.is_none() {
                 let command = if i.key_pressed(egui::Key::ArrowUp) {
                     Some(AppCommand::SelectPreviousCue)
                 } else if i.key_pressed(egui::Key::ArrowDown) {
@@ -2318,6 +2339,10 @@ impl CuePoolApp {
                 }
             }
         }
+
+        // Sampled after the panels have laid out, so the next frame can tell an
+        // Escape that cancels an edit from one that stops the show.
+        self.keyboard_focus_at_frame_end = ctx.egui_wants_keyboard_input();
 
         // Process any commands queued during the frame
         self.process_commands(ctx);

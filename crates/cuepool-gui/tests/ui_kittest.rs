@@ -554,3 +554,131 @@ fn inspector_renumbering_carries_every_reference_to_the_old_qid() {
         "the Stop cue must still point at the group it stops"
     );
 }
+
+/// The inspector's Name field for the cue called `name`.
+///
+/// The name shows twice when its cue is selected, in the inspector and in the
+/// cue list row, and the inspector panel is declared first, so it comes first
+/// in the accessibility tree (see [`retype_inspector_qid`]). Either field is
+/// the same path through the global shortcut handler.
+fn name_field<'t>(harness: &'t Harness<'static>, name: &'t str) -> egui_kittest::Node<'t> {
+    harness
+        .get_all(By::new().role(Role::TextInput).value(name))
+        .next()
+        .unwrap_or_else(|| panic!("no cue-name field holding {name:?}"))
+}
+
+/// Renaming a cue must not operate the show. Space used to fire GO on every
+/// word break, and Escape — the gesture that closes the editor — stopped
+/// everything that was playing.
+#[test]
+fn typing_into_a_cue_name_does_not_reach_the_show() {
+    let (mut harness, state) = demo_harness();
+
+    name_field(&harness, "Lobby Ambience").focus();
+    harness.run();
+    assert!(harness.ctx.text_edit_focused());
+    state.lock().unwrap().command_queue.clear();
+
+    // A real space is a Key event as well as a Text event; kittest's
+    // `type_text` sends only the latter, so press the key itself.
+    for key in [
+        egui::Key::Space,
+        egui::Key::Delete,
+        egui::Key::Backspace,
+        egui::Key::ArrowUp,
+        egui::Key::ArrowDown,
+        egui::Key::Home,
+        egui::Key::End,
+    ] {
+        harness.key_press(key);
+        harness.step();
+        assert!(
+            state.lock().unwrap().command_queue.is_empty(),
+            "{key:?} while renaming leaked into the show"
+        );
+    }
+
+    // The field runs its own undo, so Cmd+Z belongs to it, and Cmd+arrows are
+    // start/end-of-text on macOS rather than "move the cue".
+    for key in [egui::Key::Z, egui::Key::ArrowUp, egui::Key::ArrowDown] {
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, key);
+        harness.step();
+        assert!(
+            state.lock().unwrap().command_queue.is_empty(),
+            "Cmd+{key:?} while renaming leaked into the show"
+        );
+    }
+
+    // Escape closes the editor. egui has already dropped focus by the time the
+    // shortcut handler sees this frame, which is why it needs a frame's memory.
+    harness.key_press(egui::Key::Escape);
+    harness.step();
+    assert!(
+        state.lock().unwrap().command_queue.is_empty(),
+        "Escape cancelling a rename stopped the show"
+    );
+    assert!(!harness.ctx.text_edit_focused());
+
+    // ...and the very next Escape, with the editor closed, does stop it.
+    harness.key_press(egui::Key::Escape);
+    harness.step();
+    let commands: Vec<_> = state.lock().unwrap().command_queue.drain(..).collect();
+    assert!(
+        commands
+            .iter()
+            .any(|command| matches!(command, AppCommand::Stop)),
+        "Escape outside a field should stop the show, got {commands:?}"
+    );
+}
+
+/// Save has to keep working mid-rename: nothing a text caret does collides
+/// with it, and losing it is how an operator loses a cue sheet.
+#[test]
+fn menu_shortcuts_stay_live_while_renaming() {
+    let (mut harness, state) = demo_harness();
+
+    // Give the project a path, or Save falls through to a native Save As
+    // dialog, which cannot open off the main thread under a test harness.
+    let path = std::env::temp_dir().join("cuepool_shortcut_while_renaming.qproj");
+    let _ = std::fs::remove_file(&path);
+    state.lock().unwrap().project_path = Some(path.clone());
+
+    name_field(&harness, "Lobby Ambience").focus();
+    harness.run();
+
+    harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::S);
+    harness.step();
+    assert!(
+        path.exists(),
+        "Cmd+S should still save while a field is focused"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The other half of the gate: with no field focused, Space is still GO. The
+/// cue list draws plain labels in Show mode, so nothing holds focus there.
+#[test]
+fn space_still_fires_go_in_show_mode() {
+    let (mut harness, state) = demo_harness();
+
+    harness.get_by_label("Edit Mode").click();
+    harness.run();
+    assert_eq!(state.lock().unwrap().show_mode, ShowMode::Show);
+
+    harness
+        .get(By::new().role(Role::Label).value("Q1.1  Lobby Ambience"))
+        .click();
+    harness.run();
+    state.lock().unwrap().command_queue.clear();
+
+    harness.key_press(egui::Key::Space);
+    harness.step();
+    let commands: Vec<_> = state.lock().unwrap().command_queue.drain(..).collect();
+    assert!(
+        commands
+            .iter()
+            .any(|command| matches!(command, AppCommand::Go)),
+        "Space should fire GO with no field focused, got {commands:?}"
+    );
+}

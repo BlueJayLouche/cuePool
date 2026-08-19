@@ -274,6 +274,10 @@ the GPU is still decoding it.
 | Cmd/Ctrl+↑ / ↓ | Move selected cue up / down |
 | Delete / Backspace | Delete selected cue |
 
+While a text field has keyboard focus — renaming a cue, editing a Q number —
+the field keeps its keystrokes. Only *New*, *Open*, *Save*, *Duplicate* and
+*Add sound cue* stay live; the rest resume when the edit ends.
+
 ## Cue types
 
 Sound, Video, Image, Text, Group, Stop, Volume, Dummy, TimeCode, OSC, Goto,
