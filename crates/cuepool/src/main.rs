@@ -4906,6 +4906,28 @@ impl ApplicationHandler<AppEvent> for App {
             std::time::Instant::now() + std::time::Duration::from_millis(4),
         ));
     }
+
+    /// Last chance to persist settings, and on macOS the *only* one for a
+    /// menu-bar quit.
+    ///
+    /// winit installs a default macOS menu whose Quit item sends `terminate:`,
+    /// so Cmd-Q, Apple menu → Quit and Dock → Quit all arrive at
+    /// `applicationWillTerminate:`, which dispatches `LoopExiting` here and
+    /// then ends the process inside AppKit. `CloseRequested` never fires, the
+    /// quit-confirm modal never runs, and `run_app` never returns — so none of
+    /// the other three save sites (`hard_exit`, the signal handler, after
+    /// `run_app`) are reached. Without this hook every acknowledged release
+    /// note and every recent file was discarded on the most ordinary way to
+    /// quit the app.
+    ///
+    /// Flush explicitly: on the terminate path the process dies in AppKit
+    /// without unwinding, so a buffered log line would be lost with it.
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        log::info!(target: PERSIST_TARGET, "Shutdown requested: event loop exiting");
+        save_settings_from_state(&self.profile, self.cuepool.state());
+        log::info!(target: PERSIST_TARGET, "Shutdown complete: event loop exiting");
+        log::logger().flush();
+    }
 }
 
 fn shutdown_rejection(dirty: bool, active: bool) -> Option<&'static str> {
@@ -5299,7 +5321,11 @@ fn run(log_file: String, profile: AppProfile) -> anyhow::Result<()> {
         api.mark_stopping();
     }
 
-    // Save persisted settings
+    // Save persisted settings. `App::exiting` has normally just done this, but
+    // winit only documents the implication one way — `exiting` guarantees the
+    // loop is ending, not that every return from `run_app` ran it — so this
+    // stays as the backstop. The write is atomic and idempotent, so repeating
+    // it costs a rename.
     save_settings_from_state(&app.profile, app.cuepool.state());
 
     // Graceful exit (never reached via hard_exit, which process::exit()s):
