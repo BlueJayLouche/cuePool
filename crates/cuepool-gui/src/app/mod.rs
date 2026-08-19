@@ -1051,7 +1051,7 @@ pub enum CueType {
     Group,
     Dummy,
     TimeCode,
-    Osc,
+    Network,
     Text,
     Image,
     Goto,
@@ -1920,10 +1920,19 @@ impl CuePoolApp {
                                 ui.label("UDP target port:");
                                 settings_changed |= ui.add(egui::DragValue::new(&mut settings.udp_tx_port).speed(1)).changed();
                             });
+                            ui.horizontal(|ui| {
+                                ui.label("TCP default target host:")
+                                    .on_hover_text("Destination for `tcp:` cue commands without a target prefix; a CRLF is appended to each payload");
+                                settings_changed |= ui.text_edit_singleline(&mut settings.tcp_tx_host).changed();
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("TCP target port:");
+                                settings_changed |= ui.add(egui::DragValue::new(&mut settings.tcp_tx_port).speed(1)).changed();
+                            });
 
-                            // Named UDP targets (per-cue `udp:name:payload` addressing)
+                            // Named targets (per-cue `udp:name:payload` / `tcp:name:payload` addressing)
                             ui.separator();
-                            ui.label("UDP Named Targets (udp:name:payload):");
+                            ui.label("Named Targets (udp:/tcp: name:payload):");
                             let mut target_to_remove = None;
                             for (idx, target) in settings.udp_targets.iter_mut().enumerate() {
                                 ui.horizontal(|ui| {
@@ -2364,7 +2373,7 @@ impl CuePoolApp {
 
                 ui.label(
                     egui::RichText::new(
-                        "Also: volume and pan changes land on a playing cue without restarting it, typing in a cue field no longer fires the show, Show mode locks out every editing path, and undo keeps whole edits instead of their last keystroke.",
+                        "Also: camera-based projection auto-blend over OSC (/qplayer/projection/autoblend/…) measures warp, edge blend and gamma for you, with per-output bypass switches for projectors that blend in hardware; volume and pan changes land on a playing cue without restarting it, typing in a cue field no longer fires the show, Show mode locks out every editing path, and undo keeps whole edits instead of their last keystroke.",
                     )
                     .small()
                     .color(egui::Color32::from_gray(180)),
@@ -3093,7 +3102,7 @@ impl CuePoolApp {
                                 start_time: cuepool_core::Timespan::ZERO,
                                 duration: cuepool_core::Timespan::ZERO,
                             },
-                            CueType::Osc => cuepool_core::Cue::Osc {
+                            CueType::Network => cuepool_core::Cue::Network {
                                 base,
                                 command: String::new(),
                             },

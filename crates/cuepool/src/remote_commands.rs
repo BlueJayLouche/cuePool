@@ -9,7 +9,18 @@ pub(crate) fn strip_udp_prefix(command: &str) -> Option<&str> {
     }
 }
 
-/// Resolve a `udp:` remainder into (host, payload).
+/// If a cue command starts with `tcp:` (case-insensitive), return the trimmed
+/// remainder to send over a TCP connection instead of an OSC packet.
+pub(crate) fn strip_tcp_prefix(command: &str) -> Option<&str> {
+    let command = command.trim();
+    if command.get(..4)?.eq_ignore_ascii_case("tcp:") {
+        Some(command[4..].trim())
+    } else {
+        None
+    }
+}
+
+/// Resolve a `udp:`/`tcp:` remainder into (host, payload).
 ///
 /// If the remainder contains a `:`, the trimmed segment before it is a target
 /// candidate: a case-insensitive match against `targets` names wins, then a
@@ -17,10 +28,11 @@ pub(crate) fn strip_udp_prefix(command: &str) -> Option<&str> {
 /// else (no colon, or an unresolved candidate) sends the whole remainder to
 /// `default_host` — keeping bare `udp:PLAY x.mp4` cues and colon-containing
 /// filenames working.
-pub(crate) fn resolve_udp_command<'a>(
+pub(crate) fn resolve_remote_command<'a>(
     remainder: &'a str,
     targets: &[cuepool_core::UdpTarget],
     default_host: &str,
+    proto: &str,
 ) -> (String, &'a str) {
     if let Some(idx) = remainder.find(':') {
         let candidate = remainder[..idx].trim();
@@ -29,15 +41,18 @@ pub(crate) fn resolve_udp_command<'a>(
             .iter()
             .find(|t| t.name.eq_ignore_ascii_case(candidate))
         {
-            log::info!("UDP target '{}' resolved to {}", t.name, t.host);
+            log::info!("{proto} target '{}' resolved to {}", t.name, t.host);
             return (t.host.clone(), payload);
         }
         if candidate.parse::<std::net::Ipv4Addr>().is_ok() {
-            log::info!("UDP target '{}' used as a literal IPv4 address", candidate);
+            log::info!(
+                "{proto} target '{}' used as a literal IPv4 address",
+                candidate
+            );
             return (candidate.to_string(), payload);
         }
         log::warn!(
-            "UDP target '{}' not found in registry, treating whole command as payload",
+            "{proto} target '{}' not found in registry, treating whole command as payload",
             candidate
         );
     }
@@ -66,6 +81,44 @@ pub(crate) fn send_udp_command(payload: &str, host: &str, port: u16) -> std::io:
         }
         Err(error) => {
             log::error!("UDP send to {}:{} failed: {}", host, port, error);
+            Err(error)
+        }
+    }
+}
+
+/// Send `payload` + CRLF over a short-lived TCP connection to `host:port`.
+///
+// ponytail: connect-per-cue — stateless and simple, but each fire pays a TCP
+// handshake and can't drive devices that need a held session. Upgrade path:
+// a persistent connection per target with auto-reconnect.
+pub(crate) fn send_tcp_command(payload: &str, host: &str, port: u16) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::net::ToSocketAddrs;
+    if payload.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "TCP command is empty",
+        ));
+    }
+    let send = || -> std::io::Result<()> {
+        let addr: std::net::SocketAddr = (host, port)
+            .to_socket_addrs()?
+            .next()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no address"))?;
+        let mut stream =
+            std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(2))?;
+        stream.set_write_timeout(Some(std::time::Duration::from_secs(2)))?;
+        stream.write_all(payload.as_bytes())?;
+        stream.write_all(b"\r\n")?;
+        Ok(())
+    };
+    match send() {
+        Ok(_) => {
+            log::info!("TCP TX -> {}:{}: {}", host, port, payload);
+            Ok(())
+        }
+        Err(error) => {
+            log::error!("TCP send to {}:{} failed: {}", host, port, error);
             Err(error)
         }
     }
@@ -152,6 +205,14 @@ mod tests {
     }
 
     #[test]
+    fn test_strip_tcp_prefix() {
+        assert_eq!(strip_tcp_prefix("tcp:POWR 1"), Some("POWR 1"));
+        assert_eq!(strip_tcp_prefix("  TCP:stop  "), Some("stop"));
+        assert_eq!(strip_tcp_prefix("/qplayer/go,5"), None);
+        assert_eq!(strip_tcp_prefix("udp:PLAY x"), None);
+    }
+
+    #[test]
     fn test_resolve_udp_command() {
         let targets = vec![
             cuepool_core::UdpTarget {
@@ -169,7 +230,7 @@ mod tests {
             targets: &[cuepool_core::UdpTarget],
             default: &str,
         ) -> (String, &'a str) {
-            resolve_udp_command(strip_udp_prefix(cmd).unwrap(), targets, default)
+            resolve_remote_command(strip_udp_prefix(cmd).unwrap(), targets, default, "UDP")
         }
 
         // Named target hit
@@ -212,5 +273,25 @@ mod tests {
             resolve("udp:left:", &targets, default),
             ("10.0.0.11".to_string(), "")
         );
+    }
+
+    #[test]
+    fn test_send_tcp_command_loopback() {
+        use std::io::Read;
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let received = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = Vec::new();
+            stream.read_to_end(&mut buf).unwrap();
+            buf
+        });
+        send_tcp_command("POWR 1", "127.0.0.1", port).unwrap();
+        assert_eq!(received.join().unwrap(), b"POWR 1\r\n");
+    }
+
+    #[test]
+    fn test_send_tcp_command_rejects_empty() {
+        assert!(send_tcp_command("", "127.0.0.1", 1).is_err());
     }
 }

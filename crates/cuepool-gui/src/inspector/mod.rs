@@ -782,10 +782,11 @@ fn show_inner(ui: &mut egui::Ui, state: &SharedStateHandle) {
                 &mut pending_commands,
             );
         }
-        cuepool_core::Cue::Osc { base, command } => {
-            ui.label(RichText::new("OSC Cue").monospace().size(12.0));
+        cuepool_core::Cue::Network { base, command } => {
+            ui.label(RichText::new("Network Cue").monospace().size(12.0));
             ui.label("Command format: /address,arg1,arg2,…");
             ui.label("Raw UDP: udp:payload > default target · udp:name:payload or udp:IP:payload > named target (Project Settings)");
+            ui.label("Raw TCP: tcp:payload (+CRLF) > default target · tcp:name:payload or tcp:IP:payload > named target (Project Settings)");
             ui.horizontal(|ui| {
                 ui.label("Command:");
                 let response = ui.text_edit_singleline(command);

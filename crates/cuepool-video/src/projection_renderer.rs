@@ -1,6 +1,6 @@
 //! Slice + edge-blend renderer for one projector output.
 
-use cuepool_core::{EdgeBlend, EdgeBlendEdge, ProjectorOutput};
+use cuepool_core::{EdgeBlendEdge, ProjectorOutput};
 use wgpu::util::DeviceExt;
 use wgpu::{Device, Queue, RenderPipeline, Sampler, TextureFormat, TextureView};
 
@@ -50,22 +50,30 @@ struct Uniforms {
     /// Global canvas opacity (Stop-cue picture fade). Rides the pad slot, so
     /// the uniform layout is unchanged.
     opacity: f32, // offset 92
-    /// Black-level uplift (linear light) added where no edge-blend ramp is active.
+    /// Black-level uplift (linear light), applied uniformly across the output
+    /// and de-interlocked from the edge-blend ramps.
     black_uplift: f32, // offset 96
-    /// Calibration flat field: 0=off, 1=black, 2=white.
+    /// Calibration flat field: 0=off, 1=black, 2=white, 3=pattern_color.
     test_pattern: f32, // offset 100
-    _pad4: [f32; 2],       // WGSL rounds uniform struct size to 16 bytes
+    _pad4: [f32; 2],       // pad so warp rows start 16-byte aligned (offset 112)
+    /// Inverse corner-pin warp, three padded rows of the 3x3 homography.
+    warp_r0: [f32; 4], // offset 112
+    warp_r1: [f32; 4],     // offset 128
+    warp_r2: [f32; 4],     // offset 144
+    /// Per-channel output gamma (white-pass photometric calibration).
+    gamma_rgb: [f32; 3], // offset 160
+    _pad5: f32,
+    /// Flat color shown when test_pattern == 3 (auto-blend geometry pass).
+    pattern_color: [f32; 3], // offset 176
+    _pad6: f32,
 }
 
 impl Uniforms {
     fn new(
         source_rect: [u32; 4],
         canvas_size: [u32; 2],
-        output_size: [u32; 2],
-        edge_blend: &EdgeBlend,
+        output: &ProjectorOutput,
         opacity: f32,
-        black_uplift: f32,
-        test_pattern: f32,
     ) -> Self {
         let sx = source_rect[0] as f32;
         let sy = source_rect[1] as f32;
@@ -80,10 +88,35 @@ impl Uniforms {
         let u_max = (sx + sw - 0.5) / cw;
         let v_max = (sy + sh - 0.5) / ch;
 
+        let (pattern_kind, pattern_color) = match &output.test_pattern {
+            cuepool_core::TestPattern::Off => (0.0, [0.0; 3]),
+            cuepool_core::TestPattern::Black => (1.0, [0.0; 3]),
+            cuepool_core::TestPattern::White => (2.0, [0.0; 3]),
+            cuepool_core::TestPattern::Color { r, g, b } => (
+                3.0,
+                [*r as f32 / 255.0, *g as f32 / 255.0, *b as f32 / 255.0],
+            ),
+        };
+        let [warp_r0, warp_r1, warp_r2] = crate::homography::warp_matrix_rows(&output.warp);
+        // In-projector processing bypass: blends/uplift are switched off here,
+        // CPU-side, so the calibrated values stay in the show file untouched
+        // and the shader needs no extra flags.
+        let no_blend = cuepool_core::EdgeBlend::default();
+        let edge_blend = if output.blend_enabled {
+            &output.edge_blend
+        } else {
+            &no_blend
+        };
+        let black_uplift = if output.uplift_enabled {
+            output.black_uplift
+        } else {
+            0.0
+        };
+
         Self {
             source_uv_min: [u_min, v_min],
             source_uv_max: [u_max, v_max],
-            output_size: [output_size[0] as f32, output_size[1] as f32],
+            output_size: [output.output_width as f32, output.output_height as f32],
             _pad0: [0.0; 2],
             edge_left: edge_uniform(&edge_blend.left),
             _pad1: 0.0,
@@ -94,8 +127,15 @@ impl Uniforms {
             edge_bottom: edge_uniform(&edge_blend.bottom),
             opacity,
             black_uplift,
-            test_pattern,
+            test_pattern: pattern_kind,
             _pad4: [0.0; 2],
+            warp_r0,
+            warp_r1,
+            warp_r2,
+            gamma_rgb: [output.gamma.r, output.gamma.g, output.gamma.b],
+            _pad5: 0.0,
+            pattern_color,
+            _pad6: 0.0,
         }
     }
 }
@@ -297,15 +337,8 @@ impl ProjectionRenderer {
                 output.source_height,
             ],
             canvas_size,
-            [output.output_width, output.output_height],
-            &output.edge_blend,
+            output,
             opacity,
-            output.black_uplift,
-            match output.test_pattern {
-                cuepool_core::TestPattern::Off => 0.0,
-                cuepool_core::TestPattern::Black => 1.0,
-                cuepool_core::TestPattern::White => 2.0,
-            },
         );
 
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
@@ -361,7 +394,7 @@ impl ProjectionRenderer {
 mod tests {
     use super::*;
     use crate::{CanvasTexture, VideoFrame};
-    use cuepool_core::CanvasFit;
+    use cuepool_core::{CanvasFit, EdgeBlend};
 
     #[test]
     fn test_projection_renderer_renders_frame() {
@@ -411,6 +444,10 @@ mod tests {
             edge_blend: EdgeBlend::default(),
             black_uplift: 0.0,
             test_pattern: cuepool_core::TestPattern::Off,
+            blend_enabled: true,
+            uplift_enabled: true,
+            warp: cuepool_core::WarpCorners::default(),
+            gamma: cuepool_core::OutputGamma::default(),
         };
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -474,10 +511,10 @@ mod tests {
         );
     }
 
-    /// Black-level uplift must appear in the solo interior but NOT inside an
-    /// active edge-blend ramp (that's the overlap zone, already at doubled black).
+    /// Black-level uplift is de-interlocked from the blend ramps: it must
+    /// appear both in the solo interior AND inside an active edge-blend ramp.
     #[test]
-    fn test_black_uplift_gated_outside_blend_ramp() {
+    fn test_black_uplift_applies_inside_blend_ramp() {
         let _gpu = crate::gpu_test_lock();
         let Some((device, queue)) = crate::test_device_queue(wgpu::Features::empty()) else {
             return;
@@ -575,11 +612,233 @@ mod tests {
         let data = slice.get_mapped_range().expect("mapped range");
         let y = h as usize / 2;
         let row = &data[y * (w * 4) as usize..(y + 1) * (w * 4) as usize];
-        // Leftmost pixel sits at the dark end of the blend ramp: no uplift.
-        assert_eq!(row[0], 0, "uplift leaked into the blend ramp: {}", row[0]);
-        // Rightmost pixel is solo interior: uplift visible (0.1 linear ≈ 89 sRGB).
+        // Leftmost pixel sits at the dark end of the blend ramp: uplift still
+        // applies there now that it is de-interlocked from the ramp gate
+        // (0.1 linear ≈ 89 sRGB).
+        assert!(
+            row[0] > 20,
+            "uplift missing inside the blend ramp: {}",
+            row[0]
+        );
+        // Rightmost pixel is solo interior: uplift visible as before.
         let right = row[((w - 1) * 4) as usize];
         assert!(right > 20, "uplift missing from solo interior: {right}");
+    }
+
+    /// Corner-pin warp: an image warped into the right half of the output
+    /// must leave the left half black and carry the discrete test-pattern
+    /// color where it lands.
+    #[test]
+    fn test_warp_and_pattern_color() {
+        let _gpu = crate::gpu_test_lock();
+        let Some((device, queue)) = crate::test_device_queue(wgpu::Features::empty()) else {
+            return;
+        };
+
+        let (w, h) = (64u32, 4u32);
+        let canvas = CanvasTexture::new(&device, w, h);
+        let frame = VideoFrame::new(w, h, vec![0; (w * h * 4) as usize], 0.0);
+        canvas.upload_frame(&queue, &frame, CanvasFit::Stretch);
+
+        let output_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("test-output-warp"),
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Bgra8UnormSrgb,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let output_view = output_tex.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let renderer = ProjectionRenderer::new(&device, wgpu::TextureFormat::Bgra8UnormSrgb, true);
+        let output = ProjectorOutput {
+            test_pattern: cuepool_core::TestPattern::Color { r: 255, g: 0, b: 0 },
+            // Image squashed into the right half of the output.
+            warp: cuepool_core::WarpCorners([[0.5, 0.0], [1.0, 0.0], [1.0, 1.0], [0.5, 1.0]]),
+            ..ProjectorOutput::default_single()
+        };
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("test-encoder-warp"),
+        });
+        let overlay = CanvasTexture::new(&device, w, h);
+        renderer.render(
+            &device,
+            &queue,
+            &mut encoder,
+            &canvas.view(),
+            &overlay.view(),
+            &output_view,
+            &output,
+            [w, h],
+            1.0,
+        );
+        queue.submit(std::iter::once(encoder.finish()));
+
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("test-readback-warp"),
+            size: (w * h * 4) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("test-copy-encoder-warp"),
+        });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &output_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(w * 4),
+                    rows_per_image: Some(h),
+                },
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit(std::iter::once(encoder.finish()));
+
+        let slice = readback.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+
+        let data = slice.get_mapped_range().expect("mapped range");
+        let y = h as usize / 2;
+        let row = &data[y * (w * 4) as usize..(y + 1) * (w * 4) as usize];
+        // BGRA. Left quarter is outside the warped image: black.
+        let left = &row[4 * 4..4 * 4 + 4];
+        assert_eq!(left, &[0, 0, 0, 255], "warp leaked into x=4: {left:?}");
+        // Right side carries the red pattern (sRGB write keeps 255 red).
+        let right = &row[48 * 4..48 * 4 + 4];
+        assert!(
+            right[2] > 200 && right[1] < 30 && right[0] < 30,
+            "pattern color missing at x=48: {right:?}"
+        );
+    }
+
+    /// In-projector bypass: with `blend_enabled`/`uplift_enabled` off, the
+    /// ramps and uplift must disappear while the calibrated values stay put.
+    #[test]
+    fn test_blend_and_uplift_bypass() {
+        let _gpu = crate::gpu_test_lock();
+        let Some((device, queue)) = crate::test_device_queue(wgpu::Features::empty()) else {
+            return;
+        };
+
+        let (w, h) = (64u32, 4u32);
+        let canvas = CanvasTexture::new(&device, w, h);
+        let frame = VideoFrame::new(w, h, vec![0; (w * h * 4) as usize], 0.0);
+        canvas.upload_frame(&queue, &frame, CanvasFit::Stretch);
+
+        let output_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("test-output-bypass"),
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Bgra8UnormSrgb,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let output_view = output_tex.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let renderer = ProjectionRenderer::new(&device, wgpu::TextureFormat::Bgra8UnormSrgb, true);
+        let output = ProjectorOutput {
+            edge_blend: EdgeBlend {
+                left: EdgeBlendEdge {
+                    enabled: true,
+                    width: 32,
+                    gamma: 2.0,
+                },
+                ..Default::default()
+            },
+            black_uplift: 0.1,
+            blend_enabled: false,
+            uplift_enabled: false,
+            ..ProjectorOutput::default_single()
+        };
+        // Values are kept, only bypassed.
+        assert!(output.edge_blend.left.enabled);
+        assert!(output.black_uplift > 0.0);
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("test-encoder-bypass"),
+        });
+        let overlay = CanvasTexture::new(&device, w, h);
+        renderer.render(
+            &device,
+            &queue,
+            &mut encoder,
+            &canvas.view(),
+            &overlay.view(),
+            &output_view,
+            &output,
+            [w, h],
+            1.0,
+        );
+        queue.submit(std::iter::once(encoder.finish()));
+
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("test-readback-bypass"),
+            size: (w * h * 4) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("test-copy-encoder-bypass"),
+        });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &output_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(w * 4),
+                    rows_per_image: Some(h),
+                },
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit(std::iter::once(encoder.finish()));
+
+        let slice = readback.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+
+        // All-black canvas + bypassed blend and uplift = black everywhere.
+        let data = slice.get_mapped_range().expect("mapped range");
+        assert!(
+            data.iter().all(|&b| b == 0),
+            "bypassed blend/uplift still affected the output"
+        );
     }
 
     /// Mirrors the real runtime path: 1920x1080 canvas, `Fit`, the default

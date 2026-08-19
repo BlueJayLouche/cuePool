@@ -305,8 +305,9 @@ pub enum Cue {
         mtc_start: Timespan,
     },
 
-    #[serde(rename = "OSCCue")]
-    Osc {
+    // `alias` keeps pre-rename showfiles loading; new saves write "NetworkCue".
+    #[serde(rename = "NetworkCue", alias = "OSCCue")]
+    Network {
         #[serde(flatten)]
         base: CueBase,
         #[serde(default)]
@@ -437,7 +438,7 @@ pub type TimeCodeCue = Cue;
 pub type StopCue = Cue;
 pub type VolumeCue = Cue;
 pub type VideoCue = Cue;
-pub type OscCue = Cue;
+pub type NetworkCue = Cue;
 pub type TextCue = Cue;
 pub type ImageCue = Cue;
 pub type GotoCue = Cue;
@@ -453,7 +454,7 @@ impl Cue {
             Cue::Stop { base, .. } => base,
             Cue::Volume { base, .. } => base,
             Cue::Video { base, .. } => base,
-            Cue::Osc { base, .. } => base,
+            Cue::Network { base, .. } => base,
             Cue::Text { base, .. } => base,
             Cue::Image { base, .. } => base,
             Cue::Goto { base, .. } => base,
@@ -473,7 +474,7 @@ impl Cue {
             Cue::Stop { base, .. } => base,
             Cue::Volume { base, .. } => base,
             Cue::Video { base, .. } => base,
-            Cue::Osc { base, .. } => base,
+            Cue::Network { base, .. } => base,
             Cue::Text { base, .. } => base,
             Cue::Image { base, .. } => base,
             Cue::Goto { base, .. } => base,
@@ -647,8 +648,8 @@ mod tests {
     }
 
     #[test]
-    fn test_osc_cue_serde() {
-        let cue = Cue::Osc {
+    fn test_network_cue_serde() {
+        let cue = Cue::Network {
             base: CueBase {
                 qid: Decimal::from(7),
                 name: "OSC Go".into(),
@@ -660,8 +661,15 @@ mod tests {
         let de: Cue = serde_json::from_str(&json).unwrap();
         assert_eq!(cue, de);
         let val = serde_json::to_value(&cue).unwrap();
-        assert_eq!(val["$type"], "OSCCue");
+        assert_eq!(val["$type"], "NetworkCue");
         assert_eq!(val["command"], "/qplayer/go,5");
+    }
+
+    #[test]
+    fn test_network_cue_loads_legacy_osc_tag() {
+        let legacy = r#"{"$type":"OSCCue","qid":7,"name":"OSC Go","command":"/qplayer/go,5"}"#;
+        let de: Cue = serde_json::from_str(legacy).unwrap();
+        assert!(matches!(de, Cue::Network { .. }));
     }
 
     #[test]

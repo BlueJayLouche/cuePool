@@ -69,6 +69,10 @@ impl ProjectionConfig {
                     },
                     black_uplift: 0.0,
                     test_pattern: TestPattern::Off,
+                    blend_enabled: true,
+                    uplift_enabled: true,
+                    warp: WarpCorners::default(),
+                    gamma: OutputGamma::default(),
                 },
                 ProjectorOutput {
                     name: "Projector 2".into(),
@@ -95,6 +99,10 @@ impl ProjectionConfig {
                     },
                     black_uplift: 0.0,
                     test_pattern: TestPattern::Off,
+                    blend_enabled: true,
+                    uplift_enabled: true,
+                    warp: WarpCorners::default(),
+                    gamma: OutputGamma::default(),
                 },
                 ProjectorOutput {
                     name: "Projector 3".into(),
@@ -116,6 +124,10 @@ impl ProjectionConfig {
                     },
                     black_uplift: 0.0,
                     test_pattern: TestPattern::Off,
+                    blend_enabled: true,
+                    uplift_enabled: true,
+                    warp: WarpCorners::default(),
+                    gamma: OutputGamma::default(),
                 },
             ],
         }
@@ -167,23 +179,99 @@ pub struct ProjectorOutput {
     pub monitor_id: Option<MonitorId>,
     #[serde(default)]
     pub edge_blend: EdgeBlend,
-    /// Black-level uplift (linear light) added where this output is NOT edge
-    /// blended, to match the doubled black floor of the overlap zone.
+    /// Black-level uplift (linear light) applied uniformly across the whole
+    /// output, de-interlocked from the edge-blend ramps.
     #[serde(default)]
     pub black_uplift: f32,
     /// Flat-field calibration pattern replacing the canvas content.
     #[serde(default)]
     pub test_pattern: TestPattern,
+    /// Master switch for the edge-blend ramps. Turn off when blending is
+    /// handled in-projector — the calibrated edge values are kept, not lost.
+    #[serde(default = "default_enabled")]
+    pub blend_enabled: bool,
+    /// Master switch for black-level uplift. Turn off when black-level
+    /// compensation is handled in-projector.
+    #[serde(default = "default_enabled")]
+    pub uplift_enabled: bool,
+    /// Corner-pin warp (normalized output UV corners, TL/TR/BR/BL). Identity
+    /// until the auto-blend calibration measures this output's projected quad.
+    #[serde(default)]
+    pub warp: WarpCorners,
+    /// Per-channel output gamma from the white-pass photometric calibration.
+    #[serde(default)]
+    pub gamma: OutputGamma,
 }
 
-/// Flat-field calibration pattern for a projector output: Black for black-uplift
-/// calibration, White for edge-blend width/gamma calibration.
+/// Normalized corner-pin warp for one output: TL, TR, BR, BL in output UV
+/// space. Identity means the output fills its window unwarped.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct WarpCorners(pub [[f32; 2]; 4]);
+
+impl WarpCorners {
+    pub const IDENTITY: Self = Self([[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]);
+
+    pub fn is_identity(&self) -> bool {
+        self.0
+            .iter()
+            .zip(Self::IDENTITY.0.iter())
+            .all(|(a, b)| (a[0] - b[0]).abs() < 1e-6 && (a[1] - b[1]).abs() < 1e-6)
+    }
+}
+
+impl Default for WarpCorners {
+    fn default() -> Self {
+        Self::IDENTITY
+    }
+}
+
+/// Per-channel output gamma, fitted from the white-pass camera measurement.
+///
+/// ponytail: parametric gamma, not a measured LUT — three floats ride the
+/// existing uniform instead of a LUT texture. If a real rig's response curves
+/// defeat the parametric fit, upgrade to a 256-entry per-channel 1D LUT.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct OutputGamma {
+    #[serde(default = "default_gamma_one")]
+    pub r: f32,
+    #[serde(default = "default_gamma_one")]
+    pub g: f32,
+    #[serde(default = "default_gamma_one")]
+    pub b: f32,
+}
+
+impl Default for OutputGamma {
+    fn default() -> Self {
+        Self {
+            r: 1.0,
+            g: 1.0,
+            b: 1.0,
+        }
+    }
+}
+
+fn default_enabled() -> bool {
+    true
+}
+
+fn default_gamma_one() -> f32 {
+    1.0
+}
+
+/// Calibration pattern for a projector output: Black for black-uplift
+/// calibration, White for edge-blend width/gamma calibration, and a discrete
+/// Color per output for the camera-measured auto-blend geometry pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum TestPattern {
     #[default]
     Off,
     Black,
     White,
+    Color {
+        r: u8,
+        g: u8,
+        b: u8,
+    },
 }
 
 impl ProjectorOutput {
@@ -201,6 +289,10 @@ impl ProjectorOutput {
             edge_blend: EdgeBlend::default(),
             black_uplift: 0.0,
             test_pattern: TestPattern::Off,
+            blend_enabled: true,
+            uplift_enabled: true,
+            warp: WarpCorners::default(),
+            gamma: OutputGamma::default(),
         }
     }
 }
@@ -389,5 +481,39 @@ mod tests {
         let json = serde_json::to_string_pretty(&cfg).unwrap();
         let de: ProjectionConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(cfg, de);
+    }
+
+    /// A v10 file predates `warp`/`gamma`: both must land on their
+    /// pass-through defaults so an uncalibrated show renders unchanged.
+    #[test]
+    fn test_v10_output_without_warp_or_gamma_loads_uncalibrated() {
+        let legacy = r#"{"name":"Output","source_x":0,"source_y":0}"#;
+        let out: ProjectorOutput = serde_json::from_str(legacy).unwrap();
+        assert!(out.warp.is_identity());
+        assert_eq!(out.gamma, OutputGamma::default());
+        assert!(out.blend_enabled);
+        assert!(out.uplift_enabled);
+    }
+
+    #[test]
+    fn test_test_pattern_color_roundtrip() {
+        let out = ProjectorOutput {
+            test_pattern: TestPattern::Color {
+                r: 255,
+                g: 0,
+                b: 128,
+            },
+            ..ProjectorOutput::default_single()
+        };
+        let json = serde_json::to_string(&out).unwrap();
+        let de: ProjectorOutput = serde_json::from_str(&json).unwrap();
+        assert_eq!(out, de);
+    }
+
+    #[test]
+    fn test_warp_identity_detection() {
+        assert!(WarpCorners::default().is_identity());
+        let warped = WarpCorners([[0.1, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]);
+        assert!(!warped.is_identity());
     }
 }

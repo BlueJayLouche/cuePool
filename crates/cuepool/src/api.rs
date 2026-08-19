@@ -828,7 +828,7 @@ fn cue_type(cue: &cuepool_core::Cue) -> &'static str {
         cuepool_core::Cue::Group { .. } => "group",
         cuepool_core::Cue::Dummy { .. } => "dummy",
         cuepool_core::Cue::TimeCode { .. } => "time_code",
-        cuepool_core::Cue::Osc { .. } => "osc",
+        cuepool_core::Cue::Network { .. } => "network",
         cuepool_core::Cue::Text { .. } => "text",
         cuepool_core::Cue::Image { .. } => "image",
         cuepool_core::Cue::Goto { .. } => "goto",

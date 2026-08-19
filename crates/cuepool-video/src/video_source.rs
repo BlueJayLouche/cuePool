@@ -898,7 +898,7 @@ fn validate_hap_packet(
     Ok(format)
 }
 
-fn open_input(
+pub(crate) fn open_input(
     path: &str,
     interrupt: Option<&Arc<AtomicBool>>,
 ) -> Result<format::context::Input, ffmpeg_next::Error> {

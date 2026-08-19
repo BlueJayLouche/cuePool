@@ -92,6 +92,38 @@ pub enum OscEvent {
     RecorderSelect {
         name: String,
     },
+    /// `/qplayer/projection/autoblend/stream <url>` — start watching the
+    /// calibration camera stream.
+    AutoblendStream {
+        url: String,
+    },
+    /// `/qplayer/projection/autoblend/markers [index]` — AprilTag geometry
+    /// pass (all outputs, or one output per pass).
+    AutoblendMarkers {
+        output: Option<usize>,
+    },
+    /// `/qplayer/projection/autoblend/colors [index]` — discrete-color
+    /// geometry/overlap pass.
+    AutoblendColors {
+        output: Option<usize>,
+    },
+    /// `/qplayer/projection/autoblend/apply` — compute warp + edge blends from
+    /// the measurements and write them into the live projection config.
+    AutoblendApply,
+    /// `/qplayer/projection/autoblend/abort` — clear patterns and discard
+    /// measurements.
+    AutoblendAbort,
+    /// `/qplayer/projection/autoblend/white [index]` — photometric pass:
+    /// white → gray → black levels, measuring per-output gamma + black floor.
+    AutoblendWhite {
+        output: Option<usize>,
+    },
+    /// `/qplayer/projection/autoblend/run <url> [index]` — the full sequence:
+    /// stream, markers, colors, white, apply.
+    AutoblendRun {
+        url: String,
+        output: Option<usize>,
+    },
     RawMessage(OscMessage),
 }
 
@@ -499,6 +531,51 @@ impl OscManager {
                     let _ = tx.send(OscEvent::RecorderSelect { name });
                 }
             });
+
+            // Projection auto-blend calibration (camera-driven).
+            let tx = event_tx.clone();
+            r.subscribe("/qplayer/projection/autoblend/stream", move |msg, _src| {
+                if let Some(url) = msg.args.first().and_then(arg_to_string) {
+                    let _ = tx.send(OscEvent::AutoblendStream { url });
+                }
+            });
+            let tx = event_tx.clone();
+            r.subscribe("/qplayer/projection/autoblend/markers", move |msg, _src| {
+                let _ = tx.send(OscEvent::AutoblendMarkers {
+                    output: optional_index(msg),
+                });
+            });
+            let tx = event_tx.clone();
+            r.subscribe("/qplayer/projection/autoblend/colors", move |msg, _src| {
+                let _ = tx.send(OscEvent::AutoblendColors {
+                    output: optional_index(msg),
+                });
+            });
+            let tx = event_tx.clone();
+            r.subscribe("/qplayer/projection/autoblend/apply", move |_msg, _src| {
+                let _ = tx.send(OscEvent::AutoblendApply);
+            });
+            let tx = event_tx.clone();
+            r.subscribe("/qplayer/projection/autoblend/abort", move |_msg, _src| {
+                let _ = tx.send(OscEvent::AutoblendAbort);
+            });
+            let tx = event_tx.clone();
+            r.subscribe("/qplayer/projection/autoblend/white", move |msg, _src| {
+                let _ = tx.send(OscEvent::AutoblendWhite {
+                    output: optional_index(msg),
+                });
+            });
+            let tx = event_tx.clone();
+            r.subscribe("/qplayer/projection/autoblend/run", move |msg, _src| {
+                if let Some(url) = msg.args.first().and_then(arg_to_string) {
+                    let output = msg
+                        .args
+                        .get(1)
+                        .and_then(arg_to_i32)
+                        .and_then(|i| usize::try_from(i).ok());
+                    let _ = tx.send(OscEvent::AutoblendRun { url, output });
+                }
+            });
         }
 
         let router_clone = Arc::clone(&router);
@@ -614,6 +691,14 @@ fn arg_to_i32(arg: &OscType) -> Option<i32> {
         OscType::Double(d) => Some(*d as i32),
         _ => None,
     }
+}
+
+/// Optional output-index arg: absent or negative means "all outputs".
+fn optional_index(msg: &OscMessage) -> Option<usize> {
+    msg.args
+        .first()
+        .and_then(arg_to_i32)
+        .and_then(|i| usize::try_from(i).ok())
 }
 
 #[cfg(test)]

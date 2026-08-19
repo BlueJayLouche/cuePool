@@ -29,6 +29,9 @@ pub fn upgrade_show_file(show_file: &mut ShowFile, raw: &Value) {
     if version < 10 {
         upgrade_v9_to_v10(show_file, raw);
     }
+    if version < 11 {
+        upgrade_v10_to_v11(show_file, raw);
+    }
 
     show_file.file_format_version = crate::showfile::FILE_FORMAT_VERSION;
 }
@@ -145,6 +148,13 @@ fn upgrade_v9_to_v10(show_file: &mut ShowFile, _raw: &Value) {
     let broadcast = std::net::Ipv4Addr::new(o[0], o[1], o[2], 255);
     settings.osc_tx_host = broadcast.to_string();
     log::info!("OSC destination migrated from NIC {nic} to {broadcast}");
+}
+
+/// V10 -> V11: projection outputs gained corner-pin `warp` and per-channel
+/// `gamma` calibration fields (auto-blend). New fields use serde defaults
+/// (identity warp, gamma 1.0), so this just logs the bump.
+fn upgrade_v10_to_v11(_show_file: &mut ShowFile, _raw: &Value) {
+    log::info!("Upgrading show file from V10 to V11...");
 }
 
 #[inline]

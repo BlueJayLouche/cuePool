@@ -48,7 +48,7 @@ pub(crate) fn cue_type_label(cue: &cuepool_core::Cue) -> &'static str {
         Cue::Volume { .. } => "VOL",
         Cue::Dummy { .. } => "DUM",
         Cue::TimeCode { .. } => "TC",
-        Cue::Osc { .. } => "OSC",
+        Cue::Network { .. } => "NET",
         Cue::Text { .. } => "TXT",
         Cue::Image { .. } => "IMG",
         Cue::Goto { .. } => "GTO",

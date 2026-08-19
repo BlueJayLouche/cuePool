@@ -15,7 +15,7 @@ pub mod timespan;
 
 pub use colour::SerializedColour;
 pub use cue::{
-    AudioRouting, Crosspoint, Cue, CueBase, DummyCue, GotoCue, GroupCue, ImageCue, OscCue,
+    AudioRouting, Crosspoint, Cue, CueBase, DummyCue, GotoCue, GroupCue, ImageCue, NetworkCue,
     SoundCue, StopCue, TextCue, TimeCodeCue, VideoCue, VolumeCue,
 };
 pub use cue::{
@@ -27,8 +27,8 @@ pub use lighting::{
     FixtureId, FixtureLook, FixtureProfile, LightingConfig, LightingProtocol, PatchedFixture,
 };
 pub use projection::{
-    CanvasFit, EdgeBlend, EdgeBlendEdge, MonitorId, ProjectionConfig, ProjectorOutput, TestPattern,
-    resolve_monitor_assignment,
+    CanvasFit, EdgeBlend, EdgeBlendEdge, MonitorId, OutputGamma, ProjectionConfig, ProjectorOutput,
+    TestPattern, WarpCorners, resolve_monitor_assignment,
 };
 pub use showfile::{
     AudioLimiterSettings, AudioOutputDriver, ImportSections, RemoteNode, ShowFile, ShowSettings,

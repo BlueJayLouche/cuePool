@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 pub mod migration;
 
 /// Current file format version. Bumped when serialization schema changes.
-pub const FILE_FORMAT_VERSION: i32 = 10;
+pub const FILE_FORMAT_VERSION: i32 = 11;
 
 /// Root of every CuePool project file.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -156,10 +156,19 @@ pub struct ShowSettings {
     pub udp_tx_host: String,
     #[serde(default = "default_udp_tx_port")]
     pub udp_tx_port: u16,
-    /// Named per-cue UDP targets: a `udp:name:payload` command is sent to the
-    /// matching entry's host instead of the default `udp_tx_host`.
+    /// Named per-cue targets shared by `udp:` and `tcp:` commands: a
+    /// `udp:name:payload` / `tcp:name:payload` command is sent to the matching
+    /// entry's host instead of the default TX host.
     #[serde(default)]
     pub udp_targets: Vec<UdpTarget>,
+
+    // Raw TCP command output (e.g. projectors, serial-over-TCP bridges)
+    /// Target host for `tcp:` cue commands without a named target. Named
+    /// targets are shared with `udp_targets`; payloads get a CRLF appended.
+    #[serde(default = "default_tcp_tx_host")]
+    pub tcp_tx_host: String,
+    #[serde(default = "default_tcp_tx_port")]
+    pub tcp_tx_port: u16,
 
     // Remote control
     #[serde(default)]
@@ -268,6 +277,8 @@ impl Default for ShowSettings {
             udp_tx_host: default_udp_tx_host(),
             udp_tx_port: default_udp_tx_port(),
             udp_targets: Vec::new(),
+            tcp_tx_host: default_tcp_tx_host(),
+            tcp_tx_port: default_tcp_tx_port(),
             enable_remote_control: false,
             is_remote_host: true,
             sync_show_file_on_save: true,
@@ -463,6 +474,12 @@ fn default_udp_tx_host() -> String {
     "255.255.255.255".into()
 }
 fn default_udp_tx_port() -> u16 {
+    12345
+}
+fn default_tcp_tx_host() -> String {
+    "127.0.0.1".into()
+}
+fn default_tcp_tx_port() -> u16 {
     12345
 }
 fn default_true() -> bool {

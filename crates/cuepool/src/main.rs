@@ -44,6 +44,7 @@ use winit::window::{Window, WindowId};
 use human_panic::Metadata;
 
 mod api;
+mod autoblend;
 use api::{ApiCommand, ApiCommandOutcome, ApiRuntime};
 mod lighting_engine;
 use lighting_engine::LightingEngine;
@@ -64,7 +65,10 @@ mod pixels;
 mod recorder;
 use recorder::Recorder;
 mod remote_commands;
-use remote_commands::{parse_osc_command, resolve_udp_command, send_udp_command, strip_udp_prefix};
+use remote_commands::{
+    parse_osc_command, resolve_remote_command, send_tcp_command, send_udp_command,
+    strip_tcp_prefix, strip_udp_prefix,
+};
 mod settings;
 use settings::{AppProfile, load_settings, save_settings_from_state};
 mod video_pipeline;
@@ -462,6 +466,8 @@ struct App {
     consume_failure_reported: bool,
     /// Last projection outputs pushed to the consume thread (change detect).
     published_outputs: Vec<cuepool_core::ProjectorOutput>,
+    /// OSC-driven auto-blend calibration state machine.
+    autoblend: autoblend::AutoBlend,
 
     // ── egui ──
     egui_ctx: egui::Context,
@@ -952,6 +958,7 @@ impl App {
             consume_join: Some(consume_join),
             consume_failure_reported: false,
             published_outputs: Vec::new(),
+            autoblend: autoblend::AutoBlend::new(),
             video_stop_flag: Arc::new(AtomicBool::new(false)),
             video_decode_join: None,
             pending_video_decode: None,
@@ -1416,20 +1423,35 @@ impl App {
     ) -> Result<(), String> {
         let qid = cue.base().qid;
         match cue {
-            cuepool_core::Cue::Osc { command, .. } => {
+            cuepool_core::Cue::Network { command, .. } => {
                 if let Some(remainder) = strip_udp_prefix(command) {
                     let (host, port, payload) = {
                         let state = self.cuepool.state().lock_unpoisoned();
                         let settings = &state.show_file.show_settings;
-                        let (host, payload) = resolve_udp_command(
+                        let (host, payload) = resolve_remote_command(
                             remainder,
                             &settings.udp_targets,
                             &settings.udp_tx_host,
+                            "UDP",
                         );
                         (host, settings.udp_tx_port, payload.to_string())
                     };
                     send_udp_command(&payload, &host, port)
                         .map_err(|error| format!("UDP send to {host}:{port} failed: {error}"))?;
+                } else if let Some(remainder) = strip_tcp_prefix(command) {
+                    let (host, port, payload) = {
+                        let state = self.cuepool.state().lock_unpoisoned();
+                        let settings = &state.show_file.show_settings;
+                        let (host, payload) = resolve_remote_command(
+                            remainder,
+                            &settings.udp_targets,
+                            &settings.tcp_tx_host,
+                            "TCP",
+                        );
+                        (host, settings.tcp_tx_port, payload.to_string())
+                    };
+                    send_tcp_command(&payload, &host, port)
+                        .map_err(|error| format!("TCP send to {host}:{port} failed: {error}"))?;
                 } else if let Some(osc) = &self.osc_manager {
                     let message = parse_osc_command(command)
                         .map_err(|error| format!("invalid OSC command: {error}"))?;
@@ -3480,6 +3502,55 @@ impl App {
                             state.recorder_file = file;
                         }
                     }
+                    OscEvent::AutoblendStream { url } => {
+                        self.autoblend.stream(&url);
+                    }
+                    OscEvent::AutoblendMarkers { output } => {
+                        if let Ok(state) = self.cuepool.state().lock() {
+                            self.autoblend.markers(
+                                output,
+                                &state.show_file.projection,
+                                &self.canvas_cmd_tx,
+                            );
+                        }
+                    }
+                    OscEvent::AutoblendColors { output } => {
+                        if let Ok(mut state) = self.cuepool.state().lock() {
+                            self.autoblend.colors(
+                                output,
+                                &mut state.show_file.projection,
+                                &self.canvas_cmd_tx,
+                            );
+                        }
+                    }
+                    OscEvent::AutoblendApply => {
+                        if let Ok(mut state) = self.cuepool.state().lock() {
+                            self.autoblend
+                                .apply(&mut state.show_file.projection, &self.canvas_cmd_tx);
+                        }
+                    }
+                    OscEvent::AutoblendAbort => {
+                        if let Ok(mut state) = self.cuepool.state().lock() {
+                            self.autoblend
+                                .abort(&mut state.show_file.projection, &self.canvas_cmd_tx);
+                        }
+                    }
+                    OscEvent::AutoblendWhite { output } => {
+                        if let Ok(mut state) = self.cuepool.state().lock() {
+                            self.autoblend
+                                .white(output, &mut state.show_file.projection);
+                        }
+                    }
+                    OscEvent::AutoblendRun { url, output } => {
+                        if let Ok(mut state) = self.cuepool.state().lock() {
+                            self.autoblend.run(
+                                &url,
+                                output,
+                                &mut state.show_file.projection,
+                                &self.canvas_cmd_tx,
+                            );
+                        }
+                    }
                     OscEvent::RemotePing { src } => {
                         // Reply to whoever asked, rather than broadcasting on the
                         // TX port: a broadcast pong carries no identity, so with
@@ -4714,6 +4785,15 @@ impl ApplicationHandler<AppEvent> for App {
                     IDENTIFY_COLOR_NAMES[out.configured_index % IDENTIFY_COLOR_NAMES.len()]
                 );
             }
+        }
+
+        // Advance a pending auto-blend capture whose settle timer elapsed
+        // (gated so idle ticks never touch the shared state lock).
+        if self.autoblend.has_pending()
+            && let Ok(mut state) = self.cuepool.state().lock()
+        {
+            self.autoblend
+                .tick(&mut state.show_file.projection, &self.canvas_cmd_tx);
         }
 
         // Push winit-side state to the consume thread: canvas fit, changed

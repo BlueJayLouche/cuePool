@@ -9,6 +9,7 @@
 //! The main application (in `cuepool`) wires these together inside its own
 //! winit event loop, syncing video presentation to the audio master clock.
 
+pub mod calibration;
 mod canvas_texture;
 #[cfg(windows)]
 mod d3d12_zero_copy;
@@ -17,6 +18,7 @@ mod frame;
 mod frame_lease;
 mod frame_pool;
 mod hap_converter;
+pub mod homography;
 mod pixel_sampler;
 mod projection_renderer;
 mod submit_queue;

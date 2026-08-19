@@ -85,7 +85,7 @@ pub fn demo_show() -> ShowFile {
             fade_time: 2.5,
             fade_type: FadeType::SCurve,
         },
-        Cue::Osc {
+        Cue::Network {
             base: cue_base(Decimal::from(3), "Arm Projection", None),
             command: "/projection/arm 1".into(),
         },

@@ -29,12 +29,22 @@ struct Uniforms {
     edge_bottom: vec3<f32>,
     // Global canvas opacity (Stop-cue picture fade).
     opacity: f32,
-    // Black-level uplift (linear light) added where no edge-blend ramp is
-    // active, to match the doubled black floor of the overlap zone.
+    // Black-level uplift (linear light), applied uniformly across the output —
+    // de-interlocked from the edge-blend ramps.
     black_uplift: f32,
     // Calibration flat field replacing the canvas content: 0=off, 1=black,
-    // 2=white. Edge blend and uplift still apply on top.
+    // 2=white, 3=pattern_color (discrete per-output color for the camera
+    // auto-blend geometry pass). Edge blend and uplift still apply on top.
     test_pattern: f32,
+    // Inverse corner-pin warp, as three padded rows of a 3x3 homography
+    // mapping fragment UV back to unwarped UV. Identity = no warp.
+    warp_r0: vec4<f32>,
+    warp_r1: vec4<f32>,
+    warp_r2: vec4<f32>,
+    // Per-channel output gamma from the white-pass photometric calibration.
+    gamma_rgb: vec3<f32>,
+    // Flat color shown when test_pattern == 3.
+    pattern_color: vec3<f32>,
 }
 
 @group(0) @binding(0)
@@ -59,10 +69,30 @@ fn edge_alpha(enabled: f32, dist_px: f32, width_px: f32, gamma: f32) -> f32 {
     return pow(s, gamma);
 }
 
+// Inverse corner-pin warp: fragment UV -> unwarped image UV.
+fn warp_apply(p: vec2<f32>) -> vec2<f32> {
+    let h = vec3<f32>(p, 1.0);
+    let w = dot(uniforms.warp_r2.xyz, h);
+    if abs(w) < 1e-8 {
+        return vec2<f32>(-1.0, -1.0);
+    }
+    return vec2<f32>(
+        dot(uniforms.warp_r0.xyz, h) / w,
+        dot(uniforms.warp_r1.xyz, h) / w,
+    );
+}
+
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    // Fragments whose unwarped UV leaves the image quad sit outside the
+    // warped image: black, whatever the content.
+    let warped_uv = warp_apply(in.texcoord);
+    if warped_uv.x < 0.0 || warped_uv.x > 1.0 || warped_uv.y < 0.0 || warped_uv.y > 1.0 {
+        return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+    }
+
     // Sample the canvas with pixel-center alignment baked into source_uv_min/max.
-    let uv = mix(uniforms.source_uv_min, uniforms.source_uv_max, in.texcoord);
+    let uv = mix(uniforms.source_uv_min, uniforms.source_uv_max, warped_uv);
     var color = textureSample(canvas_texture, canvas_sampler, uv);
 
     // Composite the text overlay over the canvas (edge blend below dims both).
@@ -70,17 +100,21 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     color = vec4<f32>(mix(color.rgb, overlay.rgb, overlay.a), color.a);
 
     // Calibration flat field (black for uplift calibration, white for blend
-    // width/gamma calibration), replacing canvas + overlay content.
-    if uniforms.test_pattern > 0.5 {
+    // width/gamma calibration, discrete color for the camera geometry pass),
+    // replacing canvas + overlay content.
+    if uniforms.test_pattern > 2.5 {
+        color = vec4<f32>(uniforms.pattern_color, color.a);
+    } else if uniforms.test_pattern > 0.5 {
         let flat = select(vec3<f32>(0.0), vec3<f32>(1.0), uniforms.test_pattern > 1.5);
         color = vec4<f32>(flat, color.a);
     }
 
-    // Distance from each output edge in pixels.
-    let left_dist = in.texcoord.x * uniforms.output_size.x;
-    let right_dist = (1.0 - in.texcoord.x) * uniforms.output_size.x;
-    let top_dist = in.texcoord.y * uniforms.output_size.y;
-    let bottom_dist = (1.0 - in.texcoord.y) * uniforms.output_size.y;
+    // Distance from each image edge in pixels, in unwarped space so the ramps
+    // track the warped image edges.
+    let left_dist = warped_uv.x * uniforms.output_size.x;
+    let right_dist = (1.0 - warped_uv.x) * uniforms.output_size.x;
+    let top_dist = warped_uv.y * uniforms.output_size.y;
+    let bottom_dist = (1.0 - warped_uv.y) * uniforms.output_size.y;
 
     let left = edge_alpha(uniforms.edge_left.x, left_dist, uniforms.edge_left.y, uniforms.edge_left.z);
     let right = edge_alpha(uniforms.edge_right.x, right_dist, uniforms.edge_right.y, uniforms.edge_right.z);
@@ -94,14 +128,14 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     color.g *= blend;
     color.b *= blend;
 
-    // Black-level uplift: raise the black floor where this output is not edge
-    // blended (solo area) to match the doubled black floor of the overlap zone,
-    // where both projectors' lamp leakage adds up. Hard step at the ramp
-    // boundary: leakage is not attenuated by the ramp, so neither is the uplift.
+    // Black-level uplift (linear light), de-interlocked from the blend ramps:
+    // applied uniformly across the output, overlap zones included, so the
+    // black floor can be lifted independently of the edge-blend geometry.
     // Not scaled by opacity — lamp leakage doesn't fade with the picture.
-    if edge >= 1.0 {
-        color = vec4<f32>(color.rgb + vec3<f32>(uniforms.black_uplift), color.a);
-    }
+    color = vec4<f32>(color.rgb + vec3<f32>(uniforms.black_uplift), color.a);
+
+    // Per-channel output gamma from the white-pass calibration.
+    color = vec4<f32>(pow(max(color.rgb, vec3<f32>(0.0)), uniforms.gamma_rgb), color.a);
 
     return color;
 }

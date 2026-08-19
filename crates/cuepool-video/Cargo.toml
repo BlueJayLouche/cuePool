@@ -20,6 +20,10 @@ pollster = { workspace = true }
 ffmpeg-next = { workspace = true }
 hap-parser = { workspace = true }
 
+# AprilTag calibration detection (C-FFI; needs a C toolchain)
+apriltag = { version = "0.4" }
+apriltag-sys = { version = "0.3" }
+
 # Utils
 log = { workspace = true }
 thiserror = { workspace = true }

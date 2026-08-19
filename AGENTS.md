@@ -13,6 +13,10 @@ reach CuePool until they are published — bump the version in `Cargo.toml` to p
 - Apply emitted `EngineAction`s in order before the next tick. Report asynchronous completion through `EngineEvent`, including the video instance and epoch so stale EOF events cannot finish a replacement stream.
 - Add or change the shared engine behavior instead of writing a test-only cue interpreter.
 
+## Projection auto-blend
+
+Camera-driven output calibration lives in `crates/cuepool/src/autoblend.rs` (state machine, owned by `App`, OSC-driven) with support modules in `crates/cuepool-video/src/calibration/` (stream capture, AprilTag/color detection) and `crates/cuepool-video/src/homography.rs` (warp math). OSC surface: `/qplayer/projection/autoblend/{stream,markers,colors,white,apply,abort,run}`. Calibration writes into the live `ProjectionConfig` (`warp`, `edge_blend`, `gamma`, `black_uplift`); the per-tick output diff publishes it to the render threads — no window rebuild. `blend_enabled`/`uplift_enabled` bypass blends/black-lift when the projector handles them, keeping the calibrated values.
+
 ## Headless show tests
 
 Use `cuepool_harness::HeadlessShowRunner` for full-show behavior that does not require a window, GPU, audio device, or external I/O:

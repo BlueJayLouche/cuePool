@@ -366,7 +366,7 @@ fn cue_kind(cue: &Cue) -> &'static str {
         Cue::Stop { .. } => "stop",
         Cue::Volume { .. } => "volume",
         Cue::Video { .. } => "video",
-        Cue::Osc { .. } => "network",
+        Cue::Network { .. } => "network",
         Cue::Text { .. } => "text",
         Cue::Image { .. } => "image",
         Cue::Goto { .. } => "goto",

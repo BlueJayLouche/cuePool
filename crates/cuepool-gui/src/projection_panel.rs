@@ -204,6 +204,26 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
 
             ui.label(RichText::new("Calibration").strong().size(11.0));
             ui.horizontal(|ui| {
+                if ui
+                    .checkbox(&mut output.blend_enabled, "Edge Blend")
+                    .on_hover_text(
+                        "Turn off when edge blending is handled in-projector. The calibrated blend values are kept, just bypassed.",
+                    )
+                    .changed()
+                {
+                    changed = true;
+                }
+                if ui
+                    .checkbox(&mut output.uplift_enabled, "Black Lift")
+                    .on_hover_text(
+                        "Turn off when black-level compensation is handled in-projector. The calibrated uplift value is kept, just bypassed.",
+                    )
+                    .changed()
+                {
+                    changed = true;
+                }
+            });
+            ui.horizontal(|ui| {
                 ui.label("Black Uplift:");
                 if ui
                     .add(
@@ -212,7 +232,7 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
                             .range(0.0..=0.2),
                     )
                     .on_hover_text(
-                        "Raises the black floor of the non-overlapped area to match the overlap zone's doubled black level. Calibrate by eye with the Black test pattern.",
+                        "Raises the black floor of the whole output, independent of the edge-blend ramps. Calibrate by eye with the Black test pattern.",
                     )
                     .changed()
                 {
@@ -236,6 +256,22 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
                         changed = true;
                     }
                 }
+            });
+            // Auto-blend calibration state, written over OSC — display only.
+            ui.horizontal(|ui| {
+                ui.label("Auto-Blend:");
+                let warp_state = if output.warp.is_identity() {
+                    "unwarped"
+                } else {
+                    "warped"
+                };
+                ui.label(format!(
+                    "{warp_state}, gamma ({:.2}, {:.2}, {:.2})",
+                    output.gamma.r, output.gamma.g, output.gamma.b
+                ))
+                .on_hover_text(
+                    "Written by the OSC auto-blend calibration (/qplayer/projection/autoblend/...).",
+                );
             });
         });
     }
