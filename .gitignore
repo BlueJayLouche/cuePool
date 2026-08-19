@@ -29,3 +29,6 @@ dist/
 
 # FFmpeg
 ffmpeg/
+
+# mdBook output
+guide/book/
