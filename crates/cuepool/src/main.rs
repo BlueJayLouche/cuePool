@@ -49,6 +49,8 @@ mod lighting_engine;
 use lighting_engine::LightingEngine;
 mod ltc_source;
 use ltc_source::{LtcReceiver, to_mtc_frame_rate};
+#[cfg(target_os = "macos")]
+mod macos_quit;
 mod mtc_follow;
 use mtc_follow::MtcFollowState;
 mod output_window;
@@ -2352,6 +2354,16 @@ impl App {
         self.cuepool.state().lock_unpoisoned().diagnostics.video = None;
     }
 
+    /// Whether a quit right now has to go through the confirm modal first.
+    ///
+    /// `has_active_cues` rather than `snapshot()`, which allocates and takes the
+    /// shared-state lock the `dirty` read has only just released — this runs on
+    /// every event-loop tick to keep the macOS Quit hook's answer fresh.
+    fn quit_needs_confirm(&self) -> bool {
+        let dirty = self.cuepool.state().lock_unpoisoned().dirty;
+        quit_needs_confirmation(dirty, self.show_engine.has_active_cues())
+    }
+
     /// Persist settings and hard-exit the process. A graceful `event_loop.exit()`
     /// returns through `run_app` and runs Rust drops (wgpu device/surfaces, threads)
     /// which can wedge the main thread on macOS (beachball); the OS reclaims
@@ -4146,10 +4158,9 @@ impl ApplicationHandler<AppEvent> for App {
                     //
                     // lock_unpoisoned, as everywhere else in this binary: the
                     // fallible form swallowed the close request outright under a
-                    // poisoned lock, and read `dirty` as false, which sent a dirty
-                    // project down the hard_exit branch with no prompt (#173).
-                    let dirty = self.cuepool.state().lock_unpoisoned().dirty;
-                    if !self.show_engine.snapshot().active_cues.is_empty() || dirty {
+                    // poisoned lock, which sent a dirty project down the hard_exit
+                    // branch with no prompt (#173).
+                    if self.quit_needs_confirm() {
                         self.cuepool.state().lock_unpoisoned().pending_close_confirm = true;
                     } else {
                         self.hard_exit("control window closed");
@@ -4360,6 +4371,22 @@ impl ApplicationHandler<AppEvent> for App {
         // fallible read left a confirmed quit unactioned under a poisoned lock.
         if self.cuepool.state().lock_unpoisoned().quit {
             self.hard_exit("operator confirmed quit");
+        }
+
+        // The macOS Quit hook answers AppKit from a delegate callback, where the
+        // engine is out of reach and locking is unsafe — leave it a fresh answer
+        // to read, and do its state write here. Raise the control window too: a
+        // modal behind a minimised window reads as Cmd-Q doing nothing at all.
+        #[cfg(target_os = "macos")]
+        {
+            macos_quit::publish_needs_confirm(self.quit_needs_confirm());
+            if macos_quit::take_confirm_request() {
+                self.cuepool.state().lock_unpoisoned().pending_close_confirm = true;
+                if let Some(window) = self.control_window.as_ref() {
+                    window.set_minimized(false);
+                    window.focus_window();
+                }
+            }
         }
 
         let show_status = self
@@ -4924,6 +4951,15 @@ impl ApplicationHandler<AppEvent> for App {
     }
 }
 
+/// Whether quitting right now would lose work. Every way out of the app asks
+/// this one question: the window's close button, and — since winit's default
+/// macOS menu sends `terminate:` rather than a close request — the macOS Quit
+/// hook too. Keeping it in one place is what stops those paths drifting apart
+/// again (#218: Cmd-Q discarded a dirty show without a prompt).
+fn quit_needs_confirmation(dirty: bool, active_cues: bool) -> bool {
+    dirty || active_cues
+}
+
 fn shutdown_rejection(dirty: bool, active: bool) -> Option<&'static str> {
     if active {
         Some("cues are active; stop playback before shutting down")
@@ -5163,6 +5199,11 @@ fn run(log_file: String, profile: AppProfile) -> anyhow::Result<()> {
     let event_loop = EventLoop::with_user_event().build()?;
     event_loop.set_control_flow(ControlFlow::Poll);
     let proxy = event_loop.create_proxy();
+
+    // After the event loop exists, never before: winit registers the delegate
+    // class this hooks in `EventLoop::new`.
+    #[cfg(target_os = "macos")]
+    macos_quit::install();
 
     let make_instance = |backends| {
         wgpu::Instance::new(wgpu::InstanceDescriptor {
@@ -5445,6 +5486,17 @@ mod tests {
             message.args,
             vec![rosc::OscType::String("stage-left".into())]
         );
+    }
+
+    /// Both quit paths — the window's close button and the macOS Quit hook —
+    /// share this predicate so neither can start discarding a show the other
+    /// would have asked about (#218).
+    #[test]
+    fn quitting_asks_whenever_there_is_work_to_lose() {
+        assert!(!quit_needs_confirmation(false, false));
+        assert!(quit_needs_confirmation(true, false), "unsaved edits");
+        assert!(quit_needs_confirmation(false, true), "cues still running");
+        assert!(quit_needs_confirmation(true, true));
     }
 
     #[test]

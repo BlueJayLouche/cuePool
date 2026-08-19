@@ -55,6 +55,31 @@ fn discard_quits_without_saving() {
     assert!(s.dirty, "discard must not have saved");
 }
 
+/// Nothing to save, but cues still running: the dialog is about losing the
+/// show, not just the file, so it has to come up here too. The macOS Quit hook
+/// reaches this state far more often than the window's close button ever did —
+/// Cmd-Q mid-show is one keystroke.
+#[test]
+fn a_running_show_is_confirmed_even_with_nothing_to_save() {
+    let (mut harness, state) = harness_for(preview::demo_app());
+    {
+        let mut s = state.lock().unwrap();
+        s.last_seen_release_notes = Some(cuepool_gui::RELEASE_NOTES_VERSION.into());
+        s.dirty = false;
+        s.pending_close_confirm = true;
+    }
+    harness.input_mut().time = Some(60.0);
+    settle(&mut harness);
+    assert!(modal_visible(&harness), "a running show must still ask");
+
+    harness.get_by_label("Discard & Quit").click();
+    settle(&mut harness);
+
+    let s = state.lock().unwrap();
+    assert!(s.quit, "Discard & Quit should set the quit flag");
+    assert!(!s.pending_close_confirm);
+}
+
 #[test]
 fn cancel_clears_the_close_request() {
     let (mut harness, state) = pending_close();

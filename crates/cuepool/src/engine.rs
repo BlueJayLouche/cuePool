@@ -334,6 +334,13 @@ impl ShowEngine {
         }
     }
 
+    /// Whether any cue is still running. `snapshot()` answers the same question
+    /// but allocates and takes the shared-state lock on the way, and the quit
+    /// paths ask this on every event-loop tick.
+    pub fn has_active_cues(&self) -> bool {
+        !self.active_cues.is_empty()
+    }
+
     pub fn is_paused(&self) -> bool {
         self.paused
     }

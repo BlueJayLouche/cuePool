@@ -50,6 +50,15 @@ human-panic = "2"
 ctrlc = { version = "3", features = ["termination"] }
 single-instance = "0.3"
 
+[lints.rust]
+# objc 0.2's sel! expands to a cargo-clippy feature check (see src/macos_quit.rs).
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Grafts applicationShouldTerminate: onto winit's app delegate so the menu-bar
+# and Dock quits reach the quit-confirm modal (see src/macos_quit.rs).
+objc = "0.2"
+
 [dev-dependencies]
 env_logger = "0.11"
 tower = "0.5"
