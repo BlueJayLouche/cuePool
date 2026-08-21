@@ -8,4 +8,4 @@
 - [Video & Projection](video.md)
 - [Lighting & Pixel Mapping](lighting.md)
 - [Show Control](show-control.md)
-- [MTC Follow](mtc-follow.md)
+- [Timecode Follow](timecode-follow.md)

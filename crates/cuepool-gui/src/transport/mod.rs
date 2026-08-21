@@ -254,7 +254,7 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
                         .small()
                         .weak(),
                 )
-                .on_hover_text("MTC target − video position (follow cue active)");
+                .on_hover_text("Timecode target − video position (follow cue active)");
             }
         }
 
