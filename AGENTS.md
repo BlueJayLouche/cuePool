@@ -38,6 +38,14 @@ A minor bump is not finished until the modal body is rewritten for that release 
 
 Do not derive the constant from `CARGO_PKG_VERSION`. That re-fires the modal on every patch bump and labels the previous release's copy with the new version, which is how the notes silently sat at 0.4 from 0.4.0 through 0.10.2.
 
+## Platform gating
+
+CuePool ships on macOS, Windows, and Linux, but any given author compiles only one. Rust does not typecheck `cfg`'d-out code, so platform divergence is invisible until another OS builds it — and "compiles everywhere, wrong on one platform" (e.g. a Windows-only audio driver presented on macOS) is invisible even then.
+
+- Platform-specific user-facing options (drivers, hosts, APIs) must be gated to the platforms where they are meaningful. Make the platform decision once, in the crate that owns the type (e.g. `AUDIO_OUTPUT_DRIVER_OPTIONS` / `AudioOutputDriver::presented` in `cuepool-core`), and have every UI surface consume it — never hard-code a platform's option list in the GUI.
+- Keep platform code behind module-level `cfg` gates (a whole `mod`, e.g. `d3d11_zero_copy.rs`) rather than scattered inline flags.
+- If a change touches a `cfg(target_os)` path the author cannot compile locally, the PR must state which OS is untested.
+
 ## Verification
 
 Run the focused checks first:
