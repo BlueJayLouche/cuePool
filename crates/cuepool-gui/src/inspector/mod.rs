@@ -569,16 +569,17 @@ fn show_inner(ui: &mut egui::Ui, state: &SharedStateHandle) {
             });
             ui.horizontal(|ui| {
                 changed |= ui
-                    .checkbox(follow_mtc, "Follow MTC")
+                    .checkbox(follow_mtc, "Follow Timecode")
                     .on_hover_text(
-                        "Play this video under MIDI Timecode (e.g. Pro Tools over RTP-MIDI): \
-                         silent playback, holds on frame 0 until MTC plays, seeks on locate",
+                        "Play this video under external timecode (MTC or LTC, per the project's \
+                         Chase source — e.g. Pro Tools over RTP-MIDI): silent playback, holds \
+                         on frame 0 until timecode plays, seeks on locate",
                     )
                     .changed();
             });
             ui.horizontal(|ui| {
                 ui.add_enabled_ui(*follow_mtc, |ui| {
-                    ui.label("MTC start:");
+                    ui.label("Timecode start:");
                     let mut secs = mtc_start.as_secs_f64();
                     if timecode_edit(ui, "mtc_start", &mut secs, tc_fps) {
                         *mtc_start = cuepool_core::Timespan::from_secs_f64(secs);
