@@ -984,16 +984,11 @@ fn ltc_driver_combo(
 ) -> bool {
     let mut changed = false;
     egui::ComboBox::from_id_salt(id_salt)
-        .selected_text(current.to_string())
+        .selected_text(current.presented().to_string())
         .show_ui(ui, |ui| {
-            for driver in [
-                cuepool_core::AudioOutputDriver::WASAPI,
-                cuepool_core::AudioOutputDriver::Wave,
-                cuepool_core::AudioOutputDriver::DirectSound,
-                cuepool_core::AudioOutputDriver::ASIO,
-            ] {
+            for &driver in cuepool_core::AUDIO_OUTPUT_DRIVER_OPTIONS {
                 if ui
-                    .selectable_label(*current == driver, driver.to_string())
+                    .selectable_label(current.presented() == driver, driver.to_string())
                     .clicked()
                 {
                     *current = driver;
@@ -1624,17 +1619,17 @@ impl CuePoolApp {
                             ui.horizontal(|ui| {
                                 ui.label("Output Driver:");
                                 egui::ComboBox::from_id_salt("audio_driver")
-                                    .selected_text(settings.audio_output_driver.to_string())
+                                    .selected_text(
+                                        settings.audio_output_driver.presented().to_string(),
+                                    )
                                     .show_ui(ui, |ui| {
-                                        for driver in [
-                                            cuepool_core::AudioOutputDriver::WASAPI,
-                                            cuepool_core::AudioOutputDriver::Wave,
-                                            cuepool_core::AudioOutputDriver::DirectSound,
-                                            cuepool_core::AudioOutputDriver::ASIO,
-                                        ] {
+                                        for &driver in cuepool_core::AUDIO_OUTPUT_DRIVER_OPTIONS {
                                             if ui
                                                 .selectable_label(
-                                                    driver == settings.audio_output_driver,
+                                                    driver
+                                                        == settings
+                                                            .audio_output_driver
+                                                            .presented(),
                                                     driver.to_string(),
                                                 )
                                                 .clicked()

@@ -14,9 +14,10 @@ pub(crate) enum HostChoice {
 pub(crate) fn host_choice(driver: AudioOutputDriver) -> HostChoice {
     match driver {
         AudioOutputDriver::ASIO => HostChoice::Asio,
-        AudioOutputDriver::WASAPI | AudioOutputDriver::Wave | AudioOutputDriver::DirectSound => {
-            HostChoice::Default
-        }
+        AudioOutputDriver::System
+        | AudioOutputDriver::WASAPI
+        | AudioOutputDriver::Wave
+        | AudioOutputDriver::DirectSound => HostChoice::Default,
     }
 }
 
@@ -80,6 +81,7 @@ mod tests {
 
     #[test]
     fn driver_selection_decision_table() {
+        assert_eq!(host_choice(AudioOutputDriver::System), HostChoice::Default);
         assert_eq!(host_choice(AudioOutputDriver::WASAPI), HostChoice::Default);
         assert_eq!(host_choice(AudioOutputDriver::Wave), HostChoice::Default);
         assert_eq!(
