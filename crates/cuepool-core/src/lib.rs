@@ -31,8 +31,9 @@ pub use projection::{
     TestPattern, WarpCorners, resolve_monitor_assignment,
 };
 pub use showfile::{
-    AudioLimiterSettings, AudioOutputDriver, ImportSections, RemoteNode, ShowFile, ShowSettings,
-    TimecodeFrameRate, TimecodeSourceKind, UdpTarget, apply_import,
+    AUDIO_OUTPUT_DRIVER_OPTIONS, AudioLimiterSettings, AudioOutputDriver, ImportSections,
+    RemoteNode, ShowFile, ShowSettings, TimecodeFrameRate, TimecodeSourceKind, UdpTarget,
+    apply_import,
 };
 pub use sync::LockExt;
 pub use timespan::Timespan;

@@ -343,9 +343,15 @@ pub struct UdpTarget {
 
 /// Audio driver (cpal host) selection. Named for its first consumer — the
 /// programme output — but shared by the LTC input and output settings.
+///
+/// `System` is the platform default host (CoreAudio on macOS, ALSA on Linux,
+/// WASAPI on Windows). The Windows hosts are legacy show-file values off
+/// Windows: they already resolve to the platform default there, so they keep
+/// deserializing but present as `System` (see [`Self::presented`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum AudioOutputDriver {
     #[default]
+    System,
     WASAPI,
     Wave,
     DirectSound,
@@ -355,10 +361,41 @@ pub enum AudioOutputDriver {
 impl AudioOutputDriver {
     pub const fn name(self) -> &'static str {
         match self {
+            Self::System => "System",
             Self::WASAPI => "WASAPI",
             Self::Wave => "Wave",
             Self::DirectSound => "DirectSound",
             Self::ASIO => "ASIO",
+        }
+    }
+}
+
+/// The drivers meaningful on the running platform, in picker order.
+#[cfg(target_os = "windows")]
+pub const AUDIO_OUTPUT_DRIVER_OPTIONS: &[AudioOutputDriver] = &[
+    AudioOutputDriver::WASAPI,
+    AudioOutputDriver::Wave,
+    AudioOutputDriver::DirectSound,
+    AudioOutputDriver::ASIO,
+];
+
+/// The drivers meaningful on the running platform, in picker order.
+#[cfg(not(target_os = "windows"))]
+pub const AUDIO_OUTPUT_DRIVER_OPTIONS: &[AudioOutputDriver] = &[AudioOutputDriver::System];
+
+impl AudioOutputDriver {
+    /// The driver this stored value presents as on the running platform.
+    /// Windows hosts stored in a show file fold onto `System` elsewhere —
+    /// they already resolve to the platform default host there. `ASIO` stays
+    /// as-is: it is a guaranteed runtime failure off Windows, and presenting
+    /// it as `System` would hide that.
+    pub const fn presented(self) -> Self {
+        if cfg!(target_os = "windows") {
+            return self;
+        }
+        match self {
+            Self::ASIO => self,
+            _ => Self::System,
         }
     }
 }
@@ -564,12 +601,12 @@ mod tests {
     }
 
     #[test]
-    fn old_show_without_audio_output_fields_defaults_to_wasapi() {
+    fn old_show_without_audio_output_fields_defaults_to_system() {
         let show: ShowFile =
             serde_json::from_str(r#"{"show_settings":{"title":"Old Show"}}"#).unwrap();
         assert_eq!(
             show.show_settings.audio_output_driver,
-            AudioOutputDriver::WASAPI
+            AudioOutputDriver::System
         );
         assert!(show.show_settings.audio_output_device.is_empty());
     }
@@ -581,9 +618,9 @@ mod tests {
         let show: ShowFile =
             serde_json::from_str(r#"{"show_settings":{"title":"Old Show"}}"#).unwrap();
         let settings = &show.show_settings;
-        assert_eq!(settings.ltc_input_driver, AudioOutputDriver::WASAPI);
+        assert_eq!(settings.ltc_input_driver, AudioOutputDriver::System);
         assert_eq!(settings.ltc_input_channel, 1);
-        assert_eq!(settings.ltc_output_driver, AudioOutputDriver::WASAPI);
+        assert_eq!(settings.ltc_output_driver, AudioOutputDriver::System);
         assert_eq!(settings.ltc_output_channel, 1);
     }
 

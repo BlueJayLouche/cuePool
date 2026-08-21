@@ -12,16 +12,17 @@ limiter. Output is via cpal.
 
 | Setting | Meaning |
 |---|---|
-| Output driver | Windows audio host. WASAPI is the default; ASIO uses CPAL's separate ASIO host when the build enables it. |
+| Output driver | Audio host. `System` (the platform default) is the only choice on macOS and Linux. Windows additionally offers WASAPI, Wave, DirectSound, and ASIO — ASIO uses CPAL's separate ASIO host when the build enables it. |
 | Output device | A device enumerated from the selected driver host. The exact name is saved in the project. |
 | Latency | Requested output latency in ms (default 10). |
 | Channel offset | Shift all output channels — useful on interfaces where outputs 1-2 are not the mains. |
 | Exclusive mode | Windows-only output preference. |
 | Limiter | Master-bus brick-wall limiter: input gain, threshold, attack, release. |
 
-`Wave` and `DirectSound` are retained as legacy show-file values and use CPAL's
-platform-default host, as older CuePool builds did. `ASIO` is the only alternate
-CPAL host selected by this setting.
+`WASAPI`, `Wave`, and `DirectSound` are retained as legacy show-file values
+and use CPAL's platform-default host, as older CuePool builds did — a show
+saved with one of them on Windows presents as `System` when opened on macOS
+or Linux. `ASIO` is the only alternate CPAL host selected by this setting.
 
 ## Building with ASIO on Windows
 
