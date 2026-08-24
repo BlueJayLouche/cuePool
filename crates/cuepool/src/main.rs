@@ -19,7 +19,7 @@ use cuepool_core::{
 };
 use cuepool_gui::app::CueState;
 use cuepool_gui::logging::PERSIST_TARGET;
-use cuepool_gui::{AppCommand, CuePoolApp, OutputDiagnostics, VideoTimings};
+use cuepool_gui::{AppCommand, CuePoolApp, OutputDiagnostics, ShowMode, VideoTimings};
 use cuepool_protocols::ltc::LtcGenerator;
 use cuepool_protocols::midi::mtc::MtcReceiver;
 use cuepool_protocols::midi::{MidiEvent, MidiManager};
@@ -342,6 +342,28 @@ fn queue_latest_video_decode(
     request: VideoDecodeRequest,
 ) {
     *pending = Some(request);
+}
+
+/// A fired timecode trigger stays latched only while the show clock sits at
+/// or past its time. Rewinding back before a trigger (frame-step back, a
+/// negative clock adjustment) re-arms it so it fires again on the next pass;
+/// a trigger whose cue was deleted or edited away drops out of the latch.
+fn unlatch_rewound_timecode_triggers(
+    fired: &mut std::collections::HashSet<rust_decimal::Decimal>,
+    cues: &[cuepool_core::Cue],
+    elapsed_secs: f64,
+) {
+    fired.retain(|qid| {
+        cues.iter().any(|cue| {
+            cue.base().qid == *qid
+                && cue
+                    .base()
+                    .triggers
+                    .timecode
+                    .as_ref()
+                    .is_some_and(|trigger| elapsed_secs >= trigger.time.as_secs_f64())
+        })
+    });
 }
 
 fn clamp_video_seek_secs(target: f64, length_secs: Option<f64>) -> f64 {
@@ -3334,7 +3356,13 @@ impl App {
             });
             state.pending_timecode_capture
         };
-        let Some(elapsed) = elapsed else { return };
+        let Some(elapsed) = elapsed else {
+            // Stopped clock: the show starts over on the next Go, so every
+            // trigger re-arms — otherwise a trigger fires once per app launch
+            // instead of once per run-through.
+            self.timecode_fired.clear();
+            return;
+        };
 
         // Capture current show time into a cue's timecode trigger if
         // requested — works while paused (that's the frame-step workflow).
@@ -3356,6 +3384,15 @@ impl App {
             state.pending_timecode_capture = None;
         }
 
+        let cues: Vec<_> = {
+            let Ok(state) = self.cuepool.state().lock() else {
+                return;
+            };
+            state.show_file.cues.clone()
+        };
+
+        unlatch_rewound_timecode_triggers(&mut self.timecode_fired, &cues, elapsed);
+
         // Frozen clock: never fire while paused (a just-captured or stepped-past
         // trigger would fire instantly). Anything passed by stepping fires on
         // resume.
@@ -3363,20 +3400,10 @@ impl App {
             return;
         }
 
-        let cues: Vec<_> = {
-            let Ok(state) = self.cuepool.state().lock() else {
-                return;
-            };
-            state
-                .show_file
-                .cues
-                .iter()
-                .filter(|c| c.enabled())
-                .cloned()
-                .collect()
-        };
-
         for cue in cues {
+            if !cue.enabled() {
+                continue;
+            }
             let Some(trigger) = cue.base().triggers.timecode.as_ref() else {
                 continue;
             };
@@ -5081,21 +5108,33 @@ fn resolve_cli_project_path(path: &Path, cwd: &Path) -> Result<PathBuf, String> 
     Ok(resolved)
 }
 
-const CLI_USAGE: &str = "Usage: cuepool [--zero-copy | --no-zero-copy] [--project <path> | <path>]";
+const CLI_USAGE: &str =
+    "Usage: cuepool [--show-mode] [--zero-copy | --no-zero-copy] [--project <path> | <path>]";
 
 #[derive(Debug, PartialEq, Eq)]
 struct CliOptions {
     project: Option<PathBuf>,
     zero_copy: Option<bool>,
+    /// Start locked in Show mode instead of the default Edit mode, so an
+    /// unattended machine comes up with the editing surfaces already closed.
+    show_mode: bool,
 }
 
 fn parse_cli(args: impl IntoIterator<Item = OsString>) -> Result<CliOptions, String> {
     let mut options = CliOptions {
         project: None,
         zero_copy: None,
+        show_mode: false,
     };
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
+        // Repeating it is not an error the way a second project path or a
+        // conflicting zero-copy flag is: the intent stays unambiguous.
+        if arg == "--show-mode" {
+            options.show_mode = true;
+            continue;
+        }
+
         if arg == "--zero-copy" || arg == "--no-zero-copy" {
             if options.zero_copy.replace(arg == "--zero-copy").is_some() {
                 return Err(format!(
@@ -5150,6 +5189,19 @@ fn load_startup_project(cuepool: &CuePoolApp, path: &Path) -> Result<(), String>
         .map_err(|error| format!("Cannot parse startup project '{}': {error}", path.display()))?;
     state.push_recent_file(path);
     Ok(())
+}
+
+/// Settle the operator's starting stance, after any startup project load.
+///
+/// Order matters more than the one line suggests: `apply_show_file` leaves the
+/// mode alone today, so a load cannot unlock a show — running last is what
+/// keeps that true if it ever stops leaving it alone.
+fn apply_startup_show_mode(cuepool: &CuePoolApp, show_mode: bool) {
+    if !show_mode {
+        return;
+    }
+    cuepool.state().lock_unpoisoned().show_mode = ShowMode::Show;
+    log::info!(target: PERSIST_TARGET, "CuePool startup mode=show");
 }
 
 fn startup_error(title: &str, message: String) -> anyhow::Error {
@@ -5276,6 +5328,7 @@ fn run(log_file: String, profile: AppProfile) -> anyhow::Result<()> {
     } else {
         log::info!(target: PERSIST_TARGET, "CuePool startup project load result=not_requested");
     }
+    apply_startup_show_mode(&cuepool, cli.show_mode);
     cuepool.state().lock_unpoisoned().diagnostics.log_file = log_file;
 
     // 1 ms timer resolution so WaitUntil/sleep don't quantize to 15.6 ms.
@@ -5496,6 +5549,48 @@ mod tests {
         assert_eq!(clamp_video_seek_secs(f64::INFINITY, None), 0.0);
     }
 
+    fn timecode_cue(qid: i64, at_secs: f64) -> cuepool_core::Cue {
+        let mut base = cuepool_core::CueBase {
+            qid: rust_decimal::Decimal::from(qid),
+            ..Default::default()
+        };
+        base.triggers.timecode = Some(cuepool_core::TimecodeTrigger {
+            time: Timespan::from_secs_f64(at_secs),
+        });
+        cuepool_core::Cue::Dummy { base }
+    }
+
+    #[test]
+    fn timecode_triggers_rearm_on_rewind_but_stay_latched_past_their_time() {
+        let qid = rust_decimal::Decimal::from(7);
+        let cues = vec![timecode_cue(7, 7.0)];
+        let mut fired = std::collections::HashSet::from([qid]);
+
+        // At or past the trigger the latch holds — no refire every tick.
+        unlatch_rewound_timecode_triggers(&mut fired, &cues, 7.0);
+        assert!(fired.contains(&qid));
+        unlatch_rewound_timecode_triggers(&mut fired, &cues, 42.0);
+        assert!(fired.contains(&qid));
+
+        // Rewound before the trigger it re-arms for the next pass.
+        unlatch_rewound_timecode_triggers(&mut fired, &cues, 3.0);
+        assert!(fired.is_empty());
+    }
+
+    #[test]
+    fn deleted_or_untriggered_cues_drop_out_of_the_timecode_latch() {
+        let qid = rust_decimal::Decimal::from(7);
+        let mut fired = std::collections::HashSet::from([qid]);
+        let plain = cuepool_core::Cue::Dummy {
+            base: cuepool_core::CueBase {
+                qid,
+                ..Default::default()
+            },
+        };
+        unlatch_rewound_timecode_triggers(&mut fired, &[plain], 42.0);
+        assert!(fired.is_empty());
+    }
+
     #[test]
     fn control_surface_retry_backoff_is_capped() {
         let delays: Vec<_> = (1..=9)
@@ -5615,6 +5710,7 @@ mod tests {
             Ok(CliOptions {
                 project: Some(path.clone()),
                 zero_copy: None,
+                show_mode: false,
             })
         );
         assert_eq!(
@@ -5622,6 +5718,7 @@ mod tests {
             Ok(CliOptions {
                 project: Some(path),
                 zero_copy: None,
+                show_mode: false,
             })
         );
         assert_eq!(
@@ -5629,6 +5726,57 @@ mod tests {
             Ok(CliOptions {
                 project: None,
                 zero_copy: None,
+                show_mode: false,
+            })
+        );
+    }
+
+    #[test]
+    fn cli_show_mode_launches_locked_and_composes_with_the_other_options() {
+        assert!(
+            !parse_cli([]).unwrap().show_mode,
+            "Edit mode is the default"
+        );
+        assert!(
+            parse_cli([OsString::from("--show-mode")])
+                .unwrap()
+                .show_mode
+        );
+
+        // Repeating the flag says the same thing twice, so it is not rejected.
+        assert!(
+            parse_cli([OsString::from("--show-mode"), OsString::from("--show-mode")])
+                .unwrap()
+                .show_mode
+        );
+
+        // The unattended-gallery invocation: open a project, locked, on the
+        // readback video path.
+        assert_eq!(
+            parse_cli([
+                OsString::from("--show-mode"),
+                OsString::from("--no-zero-copy"),
+                OsString::from("--project"),
+                OsString::from("Opening Night.qproj"),
+            ]),
+            Ok(CliOptions {
+                project: Some(PathBuf::from("Opening Night.qproj")),
+                zero_copy: Some(false),
+                show_mode: true,
+            })
+        );
+
+        // A positional path still parses as the project, not as a stray value
+        // belonging to --show-mode.
+        assert_eq!(
+            parse_cli([
+                OsString::from("--show-mode"),
+                OsString::from("Opening Night.qproj"),
+            ]),
+            Ok(CliOptions {
+                project: Some(PathBuf::from("Opening Night.qproj")),
+                zero_copy: None,
+                show_mode: true,
             })
         );
     }
@@ -5737,6 +5885,34 @@ mod tests {
         let state = cuepool.state().lock_unpoisoned();
         assert_eq!(state.project_path.as_deref(), Some(path.as_path()));
         assert_eq!(state.recent_files.first(), Some(&path));
+        drop(state);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn startup_show_mode_survives_the_startup_project_load() {
+        let dir = cli_project_test_dir();
+        let path = dir.join("gallery.qproj");
+        let json = serde_json::to_string(&cuepool_core::ShowFile::default()).unwrap();
+        std::fs::write(&path, json).unwrap();
+
+        let cuepool = CuePoolApp::new();
+        assert_eq!(
+            cuepool.state().lock_unpoisoned().show_mode,
+            ShowMode::Edit,
+            "an unflagged launch stays in Edit mode"
+        );
+        apply_startup_show_mode(&cuepool, false);
+        assert_eq!(cuepool.state().lock_unpoisoned().show_mode, ShowMode::Edit);
+
+        // The unattended order: open the show, then lock it.
+        load_startup_project(&cuepool, &path).unwrap();
+        apply_startup_show_mode(&cuepool, true);
+
+        let state = cuepool.state().lock_unpoisoned();
+        assert_eq!(state.show_mode, ShowMode::Show);
+        assert_eq!(state.project_path.as_deref(), Some(path.as_path()));
+        assert!(!state.dirty, "launching locked is not an edit");
         drop(state);
         std::fs::remove_dir_all(dir).unwrap();
     }
