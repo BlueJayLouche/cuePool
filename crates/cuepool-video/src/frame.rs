@@ -39,6 +39,16 @@ pub enum FramePixels {
         padded_width: u32,
         padded_height: u32,
     },
+    /// A decompressed NotchLC payload, decoded by a compute shader on the GPU.
+    /// Like `Hap`, the expensive part stays compressed until it reaches the
+    /// converter; unlike `Hap`, decoding is a dispatch rather than a texture
+    /// upload. `bit_offsets` is the per-block prefix sum the shader cannot
+    /// compute for itself.
+    NotchLc {
+        payload: notchlc_rs::Payload,
+        header: notchlc_rs::Header,
+        bit_offsets: Vec<u32>,
+    },
     YuvPlanar {
         subsample: ChromaSubsample,
         bit_depth: BitDepth,
@@ -98,6 +108,29 @@ impl VideoFrame {
                 data,
                 padded_width,
                 padded_height,
+            },
+        }
+    }
+
+    /// NotchLC frame: payload decompressed, block decode still to come.
+    #[allow(dead_code)]
+    pub(crate) fn notchlc(
+        width: u32,
+        height: u32,
+        pts: f64,
+        payload: notchlc_rs::Payload,
+        header: notchlc_rs::Header,
+        bit_offsets: Vec<u32>,
+    ) -> Self {
+        debug_assert_eq!((header.width, header.height), (width, height));
+        Self {
+            width,
+            height,
+            pts,
+            pixels: FramePixels::NotchLc {
+                payload,
+                header,
+                bit_offsets,
             },
         }
     }

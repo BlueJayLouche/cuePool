@@ -4,6 +4,7 @@ use crate::frame::{BitDepth, ChromaSubsample, VideoFrame, YuvPlane};
 use ffmpeg_next::Packet;
 use ffmpeg_next::{codec, color, ffi, format, frame, media::Type, software::scaling, threading};
 use hap_parser::{HapFrame, TextureFormat as HapFormat};
+use notchlc_rs::{Header as NotchLcHeader, Payload as NotchLcPayload, bit_offsets, decompress_packet, parse_header};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -99,6 +100,10 @@ pub struct VideoFrameTimings {
 #[derive(Clone, Debug)]
 pub struct HapAcceleration {
     max_texture_dimension_2d: Option<u32>,
+    /// The device's texture limit regardless of BC support. NotchLC decodes
+    /// with a compute shader into a plain RGBA8 texture, so it is available on
+    /// devices that cannot do native HAP at all.
+    device_max_texture_dimension_2d: Option<u32>,
     fallback_reason: Option<String>,
 }
 
@@ -120,13 +125,25 @@ impl HapAcceleration {
     pub fn available(max_texture_dimension_2d: u32) -> Self {
         Self {
             max_texture_dimension_2d: Some(max_texture_dimension_2d),
+            device_max_texture_dimension_2d: Some(max_texture_dimension_2d),
             fallback_reason: None,
+        }
+    }
+
+    /// Native HAP is out, but a GPU device is present — so codecs that do not
+    /// need BC, such as NotchLC, can still take a GPU-native path.
+    pub fn without_bc(reason: impl Into<String>, device_max_texture_dimension_2d: u32) -> Self {
+        Self {
+            max_texture_dimension_2d: None,
+            device_max_texture_dimension_2d: Some(device_max_texture_dimension_2d),
+            fallback_reason: Some(reason.into()),
         }
     }
 
     pub fn unavailable(reason: impl Into<String>) -> Self {
         Self {
             max_texture_dimension_2d: None,
+            device_max_texture_dimension_2d: None,
             fallback_reason: Some(reason.into()),
         }
     }
@@ -204,6 +221,7 @@ unsafe extern "C" fn hw_get_format(
 enum VideoBackend {
     Ffmpeg(FfmpegVideoSource),
     Hap(HapVideoSource),
+    NotchLc(NotchLcVideoSource),
 }
 
 /// Chooses GPU-native HAP packet decoding when available, otherwise delegates
@@ -225,7 +243,8 @@ enum HapProbe {
     Fallback(String),
 }
 
-enum HapRead {
+/// Outcome of one packet read on a GPU-native path (HAP or NotchLC).
+enum NativeRead {
     Frame(VideoFrame),
     Eof,
     Fallback {
@@ -504,11 +523,38 @@ impl VideoSource {
                 })
             }
             HapProbe::NotHap(input) => {
+                // The input is still at the head of the stream here, so the
+                // NotchLC probe can adopt it without reopening the file.
+                let input = match NotchLcVideoSource::adopt(
+                    input,
+                    hap_acceleration.device_max_texture_dimension_2d,
+                    std::env::var("QPLAYER_NO_HWACCEL").as_deref() == Ok("1"),
+                )? {
+                    NotchLcProbe::Native(source) => {
+                        return Ok(Self {
+                            path: path.to_owned(),
+                            frame_pool,
+                            hap_fallback_session,
+                            interrupt: stop_flag,
+                            fallback_decode_time: Duration::ZERO,
+                            recovering_fallback_reason: None,
+                            terminal_error: None,
+                            backend: VideoBackend::NotchLc(*source),
+                        });
+                    }
+                    NotchLcProbe::Other(input) => Some(input),
+                    // A NotchLC stream we could not prepare: the packet pump
+                    // has moved on, so let FFmpeg reopen from scratch.
+                    NotchLcProbe::Fallback(reason) => {
+                        log::warn!("Video decode: {reason}; using FFmpeg software fallback");
+                        None
+                    }
+                };
                 let source = FfmpegVideoSource::open_with_options(
                     path,
                     Arc::clone(&frame_pool),
                     OpenOptions::hardware(availability),
-                    Some(input),
+                    input,
                     stop_flag.clone(),
                 )?;
                 Ok(Self {
@@ -560,11 +606,12 @@ impl VideoSource {
                     return frame;
                 }
                 VideoBackend::Hap(source) => source.read_frame(stop_flag),
+                VideoBackend::NotchLc(source) => source.read_frame(stop_flag),
             };
             match read {
-                HapRead::Frame(frame) => return Some(frame),
-                HapRead::Eof => return None,
-                HapRead::Fallback {
+                NativeRead::Frame(frame) => return Some(frame),
+                NativeRead::Eof => return None,
+                NativeRead::Fallback {
                     reason,
                     pts,
                     decode_time,
@@ -620,6 +667,7 @@ impl VideoSource {
         match &mut self.backend {
             VideoBackend::Ffmpeg(source) => source.seek_before(secs),
             VideoBackend::Hap(source) => source.seek_before(secs),
+            VideoBackend::NotchLc(source) => source.seek_before(secs),
         }
     }
 
@@ -627,6 +675,7 @@ impl VideoSource {
         match &self.backend {
             VideoBackend::Ffmpeg(source) => source.duration_secs(),
             VideoBackend::Hap(source) => source.duration_secs(),
+            VideoBackend::NotchLc(source) => source.duration_secs(),
         }
     }
 
@@ -634,6 +683,7 @@ impl VideoSource {
         match &self.backend {
             VideoBackend::Ffmpeg(source) => source.decode_path(),
             VideoBackend::Hap(_) => "hap gpu-native",
+            VideoBackend::NotchLc(_) => "notchlc gpu-native",
         }
     }
 
@@ -641,6 +691,7 @@ impl VideoSource {
         match &self.backend {
             VideoBackend::Ffmpeg(source) => source.width(),
             VideoBackend::Hap(source) => source.width,
+            VideoBackend::NotchLc(source) => source.width,
         }
     }
 
@@ -648,6 +699,7 @@ impl VideoSource {
         match &self.backend {
             VideoBackend::Ffmpeg(source) => source.height(),
             VideoBackend::Hap(source) => source.height,
+            VideoBackend::NotchLc(source) => source.height,
         }
     }
 
@@ -662,8 +714,9 @@ impl VideoSource {
         let mut timings = match &self.backend {
             VideoBackend::Ffmpeg(source) => source.last_timings(),
             VideoBackend::Hap(source) => source.last_timings,
+            VideoBackend::NotchLc(source) => source.last_timings,
         };
-        if matches!(&self.backend, VideoBackend::Hap(_)) {
+        if matches!(&self.backend, VideoBackend::Hap(_) | VideoBackend::NotchLc(_)) {
             timings.decode += self.fallback_decode_time;
         }
         timings
@@ -676,6 +729,7 @@ impl VideoSource {
         match &self.backend {
             VideoBackend::Ffmpeg(source) => source.fallback_reason(),
             VideoBackend::Hap(_) => None,
+            VideoBackend::NotchLc(_) => None,
         }
     }
 
@@ -688,6 +742,7 @@ impl VideoSource {
         match &mut self.backend {
             VideoBackend::Ffmpeg(source) => source.fallback_zero_copy(reason),
             VideoBackend::Hap(_) => false,
+            VideoBackend::NotchLc(_) => false,
         }
     }
 
@@ -1050,11 +1105,11 @@ impl HapVideoSource {
         VideoFrame::hap(self.width, self.height, pts, parsed.format, parsed.data)
     }
 
-    fn read_frame(&mut self, stop_flag: Option<&std::sync::atomic::AtomicBool>) -> HapRead {
+    fn read_frame(&mut self, stop_flag: Option<&std::sync::atomic::AtomicBool>) -> NativeRead {
         self.last_timings = VideoFrameTimings::default();
         loop {
             if stop_flag.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)) {
-                return HapRead::Eof;
+                return NativeRead::Eof;
             }
             if let Some((packet, elapsed)) = self.pending.take() {
                 let started = Instant::now();
@@ -1066,7 +1121,7 @@ impl HapVideoSource {
                 ) {
                     Ok(parsed) => {
                         self.last_timings.decode = elapsed + started.elapsed();
-                        return HapRead::Frame(self.frame_from_packet(packet, parsed));
+                        return NativeRead::Frame(self.frame_from_packet(packet, parsed));
                     }
                     Err(error) => {
                         self.last_timings.decode = elapsed + started.elapsed();
@@ -1076,7 +1131,7 @@ impl HapVideoSource {
                             .map(|value| value as f64 * self.time_base)
                             .unwrap_or(self.next_pts)
                             .max(0.0);
-                        return HapRead::Fallback {
+                        return NativeRead::Fallback {
                             reason: format!("GPU-native HAP first packet invalid: {error}"),
                             pts,
                             decode_time: self.last_timings.decode,
@@ -1088,7 +1143,7 @@ impl HapVideoSource {
             let mut next_packet = None;
             for (stream, packet) in self.ictx.packets() {
                 if stop_flag.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)) {
-                    return HapRead::Eof;
+                    return NativeRead::Eof;
                 }
                 if stream.index() == self.stream_index {
                     next_packet = Some(packet);
@@ -1096,7 +1151,7 @@ impl HapVideoSource {
                 }
             }
             let Some(packet) = next_packet else {
-                return HapRead::Eof;
+                return NativeRead::Eof;
             };
             match Self::parse_packet(
                 &packet,
@@ -1114,7 +1169,7 @@ impl HapVideoSource {
                             .map(|value| value as f64 * self.time_base)
                             .unwrap_or(self.next_pts)
                             .max(0.0);
-                        return HapRead::Fallback {
+                        return NativeRead::Fallback {
                             reason: format!(
                                 "GPU-native HAP variant changed mid-stream: expected {:?}, got {:?}",
                                 self.format, parsed.format
@@ -1123,7 +1178,7 @@ impl HapVideoSource {
                             decode_time: self.last_timings.decode,
                         };
                     }
-                    return HapRead::Frame(self.frame_from_packet(packet, parsed));
+                    return NativeRead::Frame(self.frame_from_packet(packet, parsed));
                 }
                 Err(HapPacketError::Unsupported(reason)) => {
                     self.last_timings.decode += started.elapsed();
@@ -1133,7 +1188,7 @@ impl HapVideoSource {
                         .map(|value| value as f64 * self.time_base)
                         .unwrap_or(self.next_pts)
                         .max(0.0);
-                    return HapRead::Fallback {
+                    return NativeRead::Fallback {
                         reason: format!("GPU-native HAP variant changed mid-stream: {reason}"),
                         pts,
                         decode_time: self.last_timings.decode,
@@ -1152,7 +1207,7 @@ impl HapVideoSource {
                             .map(|value| value as f64 * self.time_base)
                             .unwrap_or(self.next_pts)
                             .max(0.0);
-                        return HapRead::Fallback {
+                        return NativeRead::Fallback {
                             reason: format!(
                                 "GPU-native HAP encountered {} consecutive corrupt packets",
                                 self.corrupt_streak
@@ -1181,6 +1236,242 @@ impl HapVideoSource {
         let duration = self.ictx.duration();
         (duration > 0).then(|| duration as f64 / f64::from(ffi::AV_TIME_BASE))
     }
+}
+
+/// GPU-native NotchLC. Packets reach the converter still compressed, the same
+/// bargain HAP gets — except the work FFmpeg would do on the CPU (LZ4/LZF, then
+/// the per-block bit offsets the shader cannot derive for itself) happens here
+/// on the decode thread, leaving the render thread an upload and a dispatch.
+struct NotchLcVideoSource {
+    ictx: format::context::Input,
+    // Must outlive `ictx`: FFmpeg's interrupt callback points into this Arc.
+    _interrupt: Option<Arc<AtomicBool>>,
+    stream_index: usize,
+    time_base: f64,
+    width: u32,
+    height: u32,
+    frame_duration: f64,
+    next_pts: f64,
+    pending: Option<(NotchLcPrepared, f64, Duration)>,
+    last_timings: VideoFrameTimings,
+    corrupt_warned: bool,
+    corrupt_streak: u32,
+}
+
+/// A packet decompressed and measured, ready for the GPU.
+struct NotchLcPrepared {
+    payload: NotchLcPayload,
+    header: NotchLcHeader,
+    bit_offsets: Vec<u32>,
+}
+
+enum NotchLcProbe {
+    Native(Box<NotchLcVideoSource>),
+    /// Not a NotchLC stream; the input is handed back untouched.
+    Other(format::context::Input),
+    Fallback(String),
+}
+
+impl NotchLcVideoSource {
+    /// Take over an already-opened input if it carries a NotchLC stream.
+    ///
+    /// Nothing is read from `ictx` unless the codec matches, so a stream this
+    /// declines is returned exactly as it arrived.
+    fn adopt(
+        mut ictx: format::context::Input,
+        device_max_texture_dimension_2d: Option<u32>,
+        no_hw_accel: bool,
+    ) -> anyhow::Result<NotchLcProbe> {
+        let (stream_index, time_base, width, height, frame_duration, is_notchlc) = {
+            let input = ictx
+                .streams()
+                .best(Type::Video)
+                .ok_or_else(|| anyhow::anyhow!("no video stream found"))?;
+            let parameters = input.parameters();
+            let is_notchlc = parameters.id() == codec::Id::NOTCHLC;
+            let (width, height) =
+                unsafe { ((*parameters.as_ptr()).width, (*parameters.as_ptr()).height) };
+            let rate = f64::from(input.avg_frame_rate());
+            (
+                input.index(),
+                f64::from(input.time_base()),
+                u32::try_from(width).unwrap_or(0),
+                u32::try_from(height).unwrap_or(0),
+                if rate > 0.0 { 1.0 / rate } else { 0.0 },
+                is_notchlc,
+            )
+        };
+        if !is_notchlc {
+            return Ok(NotchLcProbe::Other(ictx));
+        }
+        if no_hw_accel {
+            return Ok(NotchLcProbe::Fallback(
+                "GPU-native NotchLC disabled by QPLAYER_NO_HWACCEL=1".into(),
+            ));
+        }
+        let Some(max_texture_dimension_2d) = device_max_texture_dimension_2d else {
+            return Ok(NotchLcProbe::Fallback(
+                "GPU-native NotchLC unavailable: caller reported no GPU device".into(),
+            ));
+        };
+        if width == 0 || height == 0 {
+            return Ok(NotchLcProbe::Fallback(
+                "GPU-native NotchLC invalid: zero stream dimensions".into(),
+            ));
+        }
+        if width > max_texture_dimension_2d || height > max_texture_dimension_2d {
+            return Ok(NotchLcProbe::Fallback(format!(
+                "GPU-native NotchLC dimensions {width}x{height} exceed the device texture limit {max_texture_dimension_2d}"
+            )));
+        }
+
+        let started = Instant::now();
+        let mut first_packet = None;
+        for (stream, packet) in ictx.packets() {
+            if stream.index() == stream_index {
+                first_packet = Some(packet);
+                break;
+            }
+        }
+        let Some(packet) = first_packet else {
+            return Ok(NotchLcProbe::Fallback(
+                "GPU-native NotchLC first packet unavailable".into(),
+            ));
+        };
+        let prepared = match Self::prepare(&packet, width, height) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                return Ok(NotchLcProbe::Fallback(format!(
+                    "GPU-native NotchLC first packet invalid: {error}"
+                )));
+            }
+        };
+        let pts = packet_pts(&packet, time_base).unwrap_or(0.0);
+        log::info!("Video decode: NotchLC GPU-native path selected ({width}x{height})");
+        Ok(NotchLcProbe::Native(Box::new(Self {
+            ictx,
+            _interrupt: None,
+            stream_index,
+            time_base,
+            width,
+            height,
+            frame_duration,
+            next_pts: 0.0,
+            pending: Some((prepared, pts, started.elapsed())),
+            last_timings: VideoFrameTimings::default(),
+            corrupt_warned: false,
+            corrupt_streak: 0,
+        })))
+    }
+
+    fn prepare(packet: &Packet, width: u32, height: u32) -> Result<NotchLcPrepared, String> {
+        let data = packet.data().ok_or_else(|| "empty packet".to_string())?;
+        let payload = decompress_packet(data).map_err(|error| error.to_string())?;
+        let header = parse_header(&payload).map_err(|error| error.to_string())?;
+        if (header.width, header.height) != (width, height) {
+            return Err(format!(
+                "frame is {}x{} but the stream declares {width}x{height}",
+                header.width, header.height
+            ));
+        }
+        let bit_offsets = bit_offsets(&payload, &header).map_err(|error| error.to_string())?;
+        Ok(NotchLcPrepared {
+            payload,
+            header,
+            bit_offsets,
+        })
+    }
+
+    fn frame_from(&mut self, prepared: NotchLcPrepared, pts: Option<f64>, step: f64) -> VideoFrame {
+        let pts = pts.unwrap_or(self.next_pts);
+        let step = if step > 0.0 { step } else { self.frame_duration };
+        self.next_pts = pts + step.max(0.0);
+        VideoFrame::notchlc(
+            self.width,
+            self.height,
+            pts,
+            prepared.payload,
+            prepared.header,
+            prepared.bit_offsets,
+        )
+    }
+
+    fn read_frame(&mut self, stop_flag: Option<&std::sync::atomic::AtomicBool>) -> NativeRead {
+        self.last_timings = VideoFrameTimings::default();
+        loop {
+            if stop_flag.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)) {
+                return NativeRead::Eof;
+            }
+            if let Some((prepared, pts, elapsed)) = self.pending.take() {
+                self.last_timings.decode = elapsed;
+                return NativeRead::Frame(self.frame_from(prepared, Some(pts), 0.0));
+            }
+
+            let started = Instant::now();
+            let mut next_packet = None;
+            for (stream, packet) in self.ictx.packets() {
+                if stop_flag.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)) {
+                    return NativeRead::Eof;
+                }
+                if stream.index() == self.stream_index {
+                    next_packet = Some(packet);
+                    break;
+                }
+            }
+            let Some(packet) = next_packet else {
+                return NativeRead::Eof;
+            };
+            let pts = packet_pts(&packet, self.time_base);
+            let step = packet.duration() as f64 * self.time_base;
+            match Self::prepare(&packet, self.width, self.height) {
+                Ok(prepared) => {
+                    self.last_timings.decode += started.elapsed();
+                    self.corrupt_streak = 0;
+                    return NativeRead::Frame(self.frame_from(prepared, pts, step));
+                }
+                Err(error) => {
+                    self.last_timings.decode += started.elapsed();
+                    self.corrupt_streak += 1;
+                    if !std::mem::replace(&mut self.corrupt_warned, true) {
+                        log::warn!("Video decode: skipping corrupt NotchLC packet: {error}");
+                    }
+                    if self.corrupt_streak >= MAX_CONSECUTIVE_CORRUPT_HAP_PACKETS {
+                        return NativeRead::Fallback {
+                            reason: format!(
+                                "GPU-native NotchLC encountered {} consecutive corrupt packets",
+                                self.corrupt_streak
+                            ),
+                            pts: pts.unwrap_or(self.next_pts).max(0.0),
+                            decode_time: self.last_timings.decode,
+                        };
+                    }
+                }
+            }
+        }
+    }
+
+    fn seek_before(&mut self, secs: f64) -> anyhow::Result<()> {
+        let secs = secs.max(0.0);
+        let ts = (secs * f64::from(ffi::AV_TIME_BASE)) as i64;
+        self.ictx.seek(ts, ..ts)?;
+        self.pending = None;
+        self.next_pts = secs;
+        self.corrupt_warned = false;
+        self.corrupt_streak = 0;
+        Ok(())
+    }
+
+    fn duration_secs(&self) -> Option<f64> {
+        let duration = self.ictx.duration();
+        (duration > 0).then(|| duration as f64 / f64::from(ffi::AV_TIME_BASE))
+    }
+}
+
+fn packet_pts(packet: &Packet, time_base: f64) -> Option<f64> {
+    packet
+        .pts()
+        .or(packet.dts())
+        .map(|value| value as f64 * time_base)
 }
 
 /// The existing FFmpeg pixel decoder, kept as the universal fallback.
@@ -2003,6 +2294,116 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_MEDIA_ID: AtomicU64 = AtomicU64::new(0);
+
+    /// A NotchLC .mov written by the reference encoder, for the GPU-native
+    /// path to open.
+    struct TempNotchLc {
+        dir: PathBuf,
+        path: PathBuf,
+    }
+
+    impl TempNotchLc {
+        fn new(width: u32, height: u32, frames: u32) -> Self {
+            let id = NEXT_MEDIA_ID.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir()
+                .join(format!("cuepool-notchlc-test-{}-{id}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("fixture.mov");
+
+            let encoder = notchlc_rs::FrameEncoder::new(width, height);
+            let mut writer = notchlc_rs::MovWriter::new(width, height, 50);
+            let count = (width * height) as usize;
+            for index in 0..frames {
+                let shade = |v: u8| ((v as u16) << 4) | ((v as u16) >> 4);
+                writer.add_sample(encoder.encode_packet(
+                    &vec![shade(96); count],
+                    &vec![shade(160); count],
+                    &vec![shade(32 + index as u8); count],
+                ));
+            }
+            writer
+                .write_to(&mut std::fs::File::create(&path).unwrap())
+                .unwrap();
+            Self { dir, path }
+        }
+    }
+
+    impl Drop for TempNotchLc {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[test]
+    fn notchlc_files_take_the_gpu_native_path() {
+        let media = TempNotchLc::new(64, 64, 3);
+        let mut source = VideoSource::open_with_pool_and_hap(
+            media.path.to_str().unwrap(),
+            Arc::new(FramePool::new(0)),
+            Some(8_192),
+        )
+        .unwrap();
+
+        assert_eq!(source.decode_path(), "notchlc gpu-native");
+        assert_eq!((source.width(), source.height()), (64, 64));
+
+        for _ in 0..3 {
+            let frame = source.read_frame().expect("frame");
+            let FramePixels::NotchLc {
+                header,
+                bit_offsets,
+                ..
+            } = &frame.pixels
+            else {
+                panic!("expected a NotchLC frame, got {:?}", frame.pixels);
+            };
+            assert_eq!((header.width, header.height), (64, 64));
+            // One entry per 4x4 luma block, which is what the shader indexes.
+            let (cols4, rows4) = header.blocks4();
+            assert_eq!(bit_offsets.len(), cols4 * rows4);
+        }
+        assert!(source.read_frame().is_none());
+        assert!(!source.failed());
+    }
+
+    /// Regression: the probe once turned "caller reported no texture limit"
+    /// into a limit of zero, which rejected every real frame size while a tiny
+    /// fixture with an explicit limit still passed.
+    #[test]
+    fn notchlc_takes_the_gpu_path_at_real_frame_sizes() {
+        let media = TempNotchLc::new(1248, 702, 2);
+        let source = VideoSource::open_with_pool_and_hap(
+            media.path.to_str().unwrap(),
+            Arc::new(FramePool::new(0)),
+            Some(8_192),
+        )
+        .unwrap();
+        assert_eq!(source.decode_path(), "notchlc gpu-native");
+    }
+
+    /// Without a GPU device there is nothing to decode on, so the software
+    /// path takes it — but for that reason, not a bogus size rejection.
+    #[test]
+    fn notchlc_falls_back_when_no_device_is_reported() {
+        let media = TempNotchLc::new(64, 64, 1);
+        let source =
+            VideoSource::open_with_pool(media.path.to_str().unwrap(), Arc::new(FramePool::new(0)))
+                .unwrap();
+        assert_ne!(source.decode_path(), "notchlc gpu-native");
+    }
+
+    /// A stream FFmpeg can read but the NotchLC path must not claim.
+    #[test]
+    fn non_notchlc_files_are_left_to_ffmpeg() {
+        let media = TempHap::new(QtHapFormat::Hap1, 8, 8, 1);
+        let source = VideoSource::open_with_pool_and_hap(
+            media.path.to_str().unwrap(),
+            Arc::new(FramePool::new(0)),
+            Some(8_192),
+        )
+        .unwrap();
+        assert_ne!(source.decode_path(), "notchlc gpu-native");
+    }
 
     struct TempHap {
         dir: PathBuf,

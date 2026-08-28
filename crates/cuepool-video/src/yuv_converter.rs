@@ -358,7 +358,7 @@ impl YuvConverter {
                 );
             }
             // Caller shouldn't reach these variants, but keep the converter a safe no-op.
-            FramePixels::Rgba(_) | FramePixels::Hap { .. } => {}
+            FramePixels::Rgba(_) | FramePixels::Hap { .. } | FramePixels::NotchLc { .. } => {}
         }
     }
 

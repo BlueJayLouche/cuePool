@@ -27,6 +27,9 @@ rubato = "0.16"
 symphonia = { version = "0.6", features = ["all"] }
 ffmpeg-next = "9.0"
 hap-parser = "0.2.0"
+# NotchLC GPU decode. "clip" is off: ffmpeg already demuxes, so the packets
+# come from VideoSource rather than notchlc-rs opening the file itself.
+notchlc-rs = { git = "https://github.com/BlueJayLouche/rustjay-hap-convert", branch = "notchlc-decoder", default-features = false, features = ["gpu"] }
 
 # GPU / UI
 # frame-pacing-diag is a fork-only feature (see [patch.crates-io]): fence-lock

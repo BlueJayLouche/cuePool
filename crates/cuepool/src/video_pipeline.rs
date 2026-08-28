@@ -327,6 +327,7 @@ pub(crate) fn video_consume_thread(
     let mut overlay: Option<cuepool_video::CanvasTexture> = None;
     let mut yuv_converter: Option<cuepool_video::YuvConverter> = None;
     let mut hap_converter: Option<cuepool_video::HapConverter> = None;
+    let mut notchlc_converter: Option<cuepool_video::NotchLcConverter> = None;
     // Decode channel taken out of the control struct; None when stopped/EOF.
     let mut rx: Option<std::sync::mpsc::Receiver<VideoMessage>> = None;
     // Epoch captured with `rx`; all frame work is discarded if control moves on.
@@ -698,6 +699,45 @@ pub(crate) fn video_consume_thread(
                             }
                             Err(error) => {
                                 log::warn!("Video HAP upload skipped: {error}");
+                                frame_presented = false;
+                            }
+                        }
+                    }
+                }
+                cuepool_video::FramePixels::NotchLc { .. } => {
+                    if notchlc_converter.is_none() {
+                        notchlc_converter = Some(cuepool_video::NotchLcConverter::new(
+                            &device,
+                            wgpu::TextureFormat::Rgba8Unorm,
+                        ));
+                    }
+                    if let (Some(c), Some(conv)) = (canvas.as_ref(), notchlc_converter.as_mut()) {
+                        let _configure_guard =
+                            configure_gate.read().unwrap_or_else(|e| e.into_inner());
+                        let upload_started = Instant::now();
+                        match conv.upload(&device, queue.queue(), &frame, [c.width, c.height], fit)
+                        {
+                            Ok(()) => {
+                                timings
+                                    .upload
+                                    .set_ms(upload_timing.record(upload_started.elapsed()));
+                                let conversion_started = Instant::now();
+                                let mut encoder = device.create_command_encoder(
+                                    &wgpu::CommandEncoderDescriptor {
+                                        label: Some("canvas-notchlc-convert"),
+                                    },
+                                );
+                                // Decode dispatch and fit pass share the encoder,
+                                // so this stays one submit, as the HAP path is.
+                                conv.encode(&device, &mut encoder, &c.render_view());
+                                queue.submit(std::iter::once(encoder.finish()));
+                                timings.conversion_submit.set_ms(
+                                    conversion_submit_timing.record(conversion_started.elapsed()),
+                                );
+                                uploaded = true;
+                            }
+                            Err(error) => {
+                                log::warn!("Video NotchLC upload skipped: {error}");
                                 frame_presented = false;
                             }
                         }

@@ -36,6 +36,9 @@ fn main() {
             let path_kind = match &f.pixels {
                 FramePixels::Rgba(_) => "swscale -> RGBA (CPU fallback)".to_string(),
                 FramePixels::Hap { format, .. } => format!("GPU-native HAP {format:?}"),
+                FramePixels::NotchLc { header, .. } => {
+                    format!("GPU-native NotchLC {}x{}", header.width, header.height)
+                }
                 FramePixels::YuvPlanar {
                     subsample,
                     bit_depth,

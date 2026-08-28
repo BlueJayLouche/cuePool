@@ -18,6 +18,7 @@ mod frame;
 mod frame_lease;
 mod frame_pool;
 mod hap_converter;
+mod notchlc_converter;
 pub mod homography;
 mod pixel_sampler;
 mod projection_renderer;
@@ -43,6 +44,7 @@ pub fn ffmpeg_version() -> u32 {
 }
 pub use frame::{BitDepth, ChromaSubsample, FramePixels, VideoFrame, YuvPlane};
 pub use hap_converter::HapConverter;
+pub use notchlc_converter::NotchLcConverter;
 pub use pixel_sampler::PixelSampler;
 pub use projection_renderer::ProjectionRenderer;
 pub use video_source::{

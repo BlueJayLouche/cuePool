@@ -54,6 +54,8 @@ impl FramePool {
             // worth can pin tens of MB. Reuse them only if profiling proves the
             // compressed-frame allocator is the next bottleneck.
             FramePixels::Hap { .. } => {}
+            // Same reasoning as HAP: compressed payloads are big and short-lived.
+            FramePixels::NotchLc { .. } => {}
             FramePixels::YuvPlanar { y, u, v, .. } => {
                 self.recycle(y.data);
                 self.recycle(u.data);

@@ -5450,10 +5450,15 @@ fn run(log_file: String, profile: AppProfile) -> anyhow::Result<()> {
         if !hap_features.is_empty() && enabled_optional_features.contains(hap_features) {
             HapAcceleration::available(device.limits().max_texture_dimension_2d)
         } else if !hap_features.is_empty() {
-            HapAcceleration::unavailable(negotiation_reason("GPU-native HAP"))
+            HapAcceleration::without_bc(
+                negotiation_reason("GPU-native HAP"),
+                device.limits().max_texture_dimension_2d,
+            )
         } else {
-            HapAcceleration::unavailable(
+            // No BC, but there is still a device — NotchLC does not need BC.
+            HapAcceleration::without_bc(
                 "GPU-native HAP unavailable: GPU device lacks BC texture compression",
+                device.limits().max_texture_dimension_2d,
             )
         };
     let device_lost_proxy = proxy.clone();

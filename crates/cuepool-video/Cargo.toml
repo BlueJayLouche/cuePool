@@ -19,6 +19,7 @@ pollster = { workspace = true }
 # Video decoding
 ffmpeg-next = { workspace = true }
 hap-parser = { workspace = true }
+notchlc-rs = { workspace = true }
 
 # AprilTag calibration detection (C-FFI; needs a C toolchain)
 apriltag = { version = "0.4" }

@@ -1458,6 +1458,7 @@ dependencies = [
  "hap-qt",
  "image",
  "log",
+ "notchlc-rs",
  "pollster 0.3.0",
  "thiserror 2.0.20",
  "wgpu",
@@ -3255,6 +3256,15 @@ checksum = "d273983c5a657a70a3e8f2a01329822f3b8c8172b73826411a55751e404a0a4a"
 dependencies = [
  "memchr",
  "minimal-lexical",
+]
+
+[[package]]
+name = "notchlc-rs"
+version = "0.1.0"
+source = "git+https://github.com/BlueJayLouche/rustjay-hap-convert?branch=notchlc-decoder#a3430d4a59d5bff91d941906d6b6423f4492a5b9"
+dependencies = [
+ "bytemuck",
+ "wgpu",
 ]
 
 [[package]]
