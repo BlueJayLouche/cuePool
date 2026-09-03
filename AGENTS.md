@@ -1,6 +1,6 @@
 # CuePool development
 
-CuePool is a standalone Cargo workspace. It was extracted from `examples/cuepool` in
+CuePool is a standalone Cargo workspace. It was extracted from the CuePool example in
 [rustjay-engine](https://github.com/BlueJayLouche/rustjay-engine); the only remaining tie is
 `rustjay-lighting`, consumed from crates.io. Local edits to that crate in the engine tree do not
 reach CuePool until they are published — bump the version in `Cargo.toml` to pick them up.
@@ -40,7 +40,7 @@ Do not derive the constant from `CARGO_PKG_VERSION`. That re-fires the modal on 
 
 ## Platform gating
 
-CuePool ships on macOS, Windows, and Linux, but any given author compiles only one. Rust does not typecheck `cfg`'d-out code, so platform divergence is invisible until another OS builds it — and "compiles everywhere, wrong on one platform" (e.g. a Windows-only audio driver presented on macOS) is invisible even then.
+CuePool releases on macOS and Windows and is compiled and tested on Linux in CI, but any given author compiles only one. Rust does not typecheck `cfg`'d-out code, so platform divergence is invisible until another OS builds it — and "compiles everywhere, wrong on one platform" (e.g. a Windows-only audio driver presented on macOS) is invisible even then.
 
 - Platform-specific user-facing options (drivers, hosts, APIs) must be gated to the platforms where they are meaningful. Make the platform decision once, in the crate that owns the type (e.g. `AUDIO_OUTPUT_DRIVER_OPTIONS` / `AudioOutputDriver::presented` in `cuepool-core`), and have every UI surface consume it — never hard-code a platform's option list in the GUI.
 - Keep platform code behind module-level `cfg` gates (a whole `mod`, e.g. `d3d11_zero_copy.rs`) rather than scattered inline flags.

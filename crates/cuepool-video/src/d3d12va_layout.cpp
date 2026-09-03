@@ -9,7 +9,7 @@
 // master SDK fails here BY DESIGN — adopting the new ABI also means adopting
 // the array-texture resource model in d3d12_zero_copy.rs, not just resizing
 // the mirrors. Build against the 8.0-ABI SDK (FFMPEG_DIR on the rigs, or the
-// pinned SDK in release-apps.yml); a runtime version check in configure_pool
+// pinned SDK in release.yml); a runtime version check in configure_pool
 // declines the direct path if the DLLs ever diverge from the build.
 #include <cstddef>
 #include <libavutil/hwcontext_d3d12va.h>

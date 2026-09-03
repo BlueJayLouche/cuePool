@@ -1,5 +1,7 @@
 # CuePool convert-on-sample design
 
+> Written in the rustjay-engine tree before CuePool moved to its own repository on 2026-09-03. Issue numbers refer to BlueJayLouche/rustjay-engine. Paths have been rewritten to this repo's layout; line numbers were not re-verified.
+
 Issue: [#139](https://github.com/BlueJayLouche/rustjay-engine/issues/139)
 
 ## Decision
@@ -35,8 +37,8 @@ the measured 15 ms to one lock or driver call.
 
 CuePool pins `wgpu`, `wgpu-core`, `wgpu-hal`, and `wgpu-types` 29.0.4 to fork
 revision `a0b9d5718c2ab2edfce2f156792b0f4359f25460`. The revision is fixed by
-`examples/cuepool/Cargo.toml::patch.crates-io` and confirmed by
-`examples/cuepool/Cargo.lock`. All wgpu claims below refer to that revision, not
+`Cargo.toml::patch.crates-io` and confirmed by
+`Cargo.lock`. All wgpu claims below refer to that revision, not
 current upstream.
 
 Current CuePool behaviour is cited as `file::symbol`, deliberately without line
@@ -56,8 +58,8 @@ from output 0's present tick, selects the newest due frame, uploads CPU planes,
 records a YUV-to-RGB pass into the RGBA canvas, submits it, and publishes shared
 canvas/overlay views. Each output thread independently loops acquire, encode,
 submit, present. Sources:
-`examples/cuepool/crates/cuepool/src/main.rs::{VIDEO_QUEUE_CAP,App::new}` and
-`examples/cuepool/crates/cuepool/src/video_pipeline::{video_decode_thread,video_consume_thread,output_render_thread,OutputFrameState}`.
+`crates/cuepool/src/main.rs::{VIDEO_QUEUE_CAP,App::new}` and
+`crates/cuepool/src/video_pipeline::{video_decode_thread,video_consume_thread,output_render_thread,OutputFrameState}`.
 
 ```text
 decode thread -> bounded frames -> consume thread
@@ -78,8 +80,8 @@ The output threads already achieve the required presentation rate. The delivery
 ceiling occurs before publication: newest-due selection discards the source
 frames that became late while the consume thread was inside the standalone
 conversion submit. Sources:
-`examples/cuepool/crates/cuepool/src/video_pipeline::{video_consume_thread,TimingWindow}`
-and `examples/cuepool/crates/cuepool-gui/src/app::{Diagnostics::sections,VideoTimings}`.
+`crates/cuepool/src/video_pipeline::{video_consume_thread,TimingWindow}`
+and `crates/cuepool-gui/src/app::{Diagnostics::sections,VideoTimings}`.
 
 ## Track A: understand and remove the stall at the smallest rung
 
@@ -144,8 +146,8 @@ CuePool's own steady-state locks do not explain a read-versus-write queue stall.
 `configure_gate` is held for reading by both consume and render work and excludes
 only surface reconfiguration; `OutputFrameState` is held only for a short
 snapshot/publication, outside GPU calls. Sources:
-`examples/cuepool/crates/cuepool/src/video_pipeline::{video_consume_thread,output_render_thread}`
-and `examples/cuepool/crates/cuepool/src/output_window::App::create_output_windows`.
+`crates/cuepool/src/video_pipeline::{video_consume_thread,output_render_thread}`
+and `crates/cuepool/src/output_window::App::create_output_windows`.
 
 The module comments introduced by `daa67a8` describe the reason for one FIFO
 render thread per output: each thread should block on its own display rather
@@ -193,8 +195,8 @@ For the field build, bucket samples by the existing thread name
 a permanent public wgpu API for one investigation. Lock-free atomics are enough
 because there is one device and the Status snapshot is approximate diagnostics,
 not control state. Sources for the thread names and current rolling window:
-`examples/cuepool/crates/cuepool/src::{main::App::new,output_window::App::create_output_windows}`
-and `examples/cuepool/crates/cuepool/src/video_pipeline::TimingWindow`.
+`crates/cuepool/src::{main::App::new,output_window::App::create_output_windows}`
+and `crates/cuepool/src/video_pipeline::TimingWindow`.
 
 The three rows answer the immediate decision:
 
@@ -225,7 +227,7 @@ after the conversion and show the new one; no output samples a half-converted
 canvas. Sources for pending-write preparation and ordered command buffers:
 pinned `wgpu-core/src/device/queue.rs::Queue::submit`; source for the current
 split upload/encode API:
-`examples/cuepool/crates/cuepool-video/src/yuv_converter::YuvConverter::{upload,encode}`.
+`crates/cuepool-video/src/yuv_converter::YuvConverter::{upload,encode}`.
 
 Use a capacity-one handoff with epoch tagging and an acknowledgement after
 `Queue::submit` returns. Do not let the consume thread overwrite the converter's
@@ -234,15 +236,15 @@ If the handoff is occupied, keep newest-due semantics and account for the
 discard. Any healthy output may claim the work so an occluded output 0 does not
 freeze visible outputs. The existing output-0 present tick can remain the decode
 pacer. Sources for epoch and pacing behaviour:
-`examples/cuepool/crates/cuepool/src/video_pipeline::{VideoControl,frame_pacing_decision,video_consume_thread,output_render_thread}`.
+`crates/cuepool/src/video_pipeline::{VideoControl,frame_pacing_decision,video_consume_thread,output_render_thread}`.
 
 For D3D11 NV12, batch the existing acquire, convert, and release command buffers
 before the claimant's output buffer, attach the keyed-mutex operation exactly as
 today, and register completion against that combined submit. The decoder lease
 still retires only after submitted work completes. Sources:
-`examples/cuepool/crates/cuepool/src/video_pipeline::video_consume_thread`,
-`examples/cuepool/crates/cuepool-video/src/d3d11_zero_copy::D3d11Frame`, and
-`examples/cuepool/crates/cuepool-video/src/frame_lease::SubmissionRetirement`.
+`crates/cuepool/src/video_pipeline::video_consume_thread`,
+`crates/cuepool-video/src/d3d11_zero_copy::D3d11Frame`, and
+`crates/cuepool-video/src/frame_lease::SubmissionRetirement`.
 
 This alternative removes one queue call per delivered frame, preserves one YUV
 conversion per frame, leaves every canvas consumer untouched, and requires no
@@ -259,8 +261,8 @@ all output threads out of acquire until conversion submits would open a write
 window, but it re-couples three independently paced outputs and risks undoing the
 fix from `daa67a8`. A delay aimed only at output 0 does not exclude outputs 1 and
 2. Sources:
-`examples/cuepool/crates/cuepool/src/video_pipeline::output_render_thread` and
-`examples/cuepool/crates/cuepool/src/output_window::OutputWindow`.
+`crates/cuepool/src/video_pipeline::output_render_thread` and
+`crates/cuepool/src/output_window::OutputWindow`.
 
 Do not ship this as the first fix. Batching gets the same queue-ordering benefit
 without a new cross-output acquisition barrier.
@@ -274,7 +276,7 @@ buckets plus upload/drop/present rates. A collapse in fence-lock wait outside
 FIFO would confirm present/acquire interaction, but Mailbox or Immediate is not
 the production answer: prior field work found free-running output pacing worse,
 and tearing is unacceptable on the wall. Source:
-`examples/cuepool/crates/cuepool/src/output_window::App::create_output_windows`.
+`crates/cuepool/src/output_window::App::create_output_windows`.
 
 If operationally safe, repeat FIFO on one other qualified NVIDIA driver. That
 comparison can establish driver sensitivity, but source cannot predict it. A
@@ -315,8 +317,8 @@ and no extra sampler submit. `PixelSampler` retains the submit it already needs
 for downsample/readback, and the independent PixelMap cue pipeline retains its
 existing YUV-to-pixmap submit; neither is a newly introduced projection-video
 submission. Sources for those existing calls:
-`examples/cuepool/crates/cuepool-video/src/pixel_sampler::PixelSampler::sample`
-and `examples/cuepool/crates/cuepool/src/main::App::upload_pixmap_frames`.
+`crates/cuepool-video/src/pixel_sampler::PixelSampler::sample`
+and `crates/cuepool/src/main::App::upload_pixmap_frames`.
 
 ### Published content and glitch-free mode changes
 
@@ -339,7 +341,7 @@ Unlike today's shared mutable canvas, every accepted plane frame bumps the
 generation. Output threads snapshot one complete generation and never combine a
 new topology or fit uniform with old texture views. Source for the current loose
 fields and change detection:
-`examples/cuepool/crates/cuepool/src/video_pipeline::OutputFrameState`.
+`crates/cuepool/src/video_pipeline::OutputFrameState`.
 
 At a video-to-image boundary, bump `VideoControl::stream_epoch` first, stop
 admitting old decode work, finish the image upload, then publish `Canvas` in one
@@ -348,8 +350,8 @@ fully written and publish `Planes` only then. Text remains an orthogonal overlay
 so starting or stopping text never changes the base mode. An overlay-only cue
 publishes `Black` as its base rather than exposing the last video generation.
 These rules preserve the intent of today's ordering in
-`examples/cuepool/crates/cuepool/src/main::{App::play_cue,App::play_video,App::clear_text_overlay,App::stop_video_playback}`
-and `examples/cuepool/crates/cuepool/src/video_pipeline::CanvasCommand`.
+`crates/cuepool/src/main::{App::play_cue,App::play_video,App::clear_text_overlay,App::stop_video_playback}`
+and `crates/cuepool/src/video_pipeline::CanvasCommand`.
 
 ### Plane bundle ownership, slots, and epochs
 
@@ -361,8 +363,8 @@ destroy or overwrite textures still visible to a renderer. Allocate separate
 slot shapes for planar R8, planar R16, and NV12 R8/RG8 as needed; never
 reinterpret a slot across an incompatible topology. Sources for the channel
 bound and current texture topology:
-`examples/cuepool/crates/cuepool/src/main::VIDEO_QUEUE_CAP` and
-`examples/cuepool/crates/cuepool-video/src/yuv_converter::{PlanarBinding,Nv12Binding}`.
+`crates/cuepool/src/main::VIDEO_QUEUE_CAP` and
+`crates/cuepool-video/src/yuv_converter::{PlanarBinding,Nv12Binding}`.
 
 At the start of each refresh, before surface acquisition, an output compares the
 published generation, clones the new bundle lease, and drops its prior lease.
@@ -398,7 +400,7 @@ writes and again before publication. An epoch change drops unpublished CPU
 frames immediately, publishes the replacement `Black` or `Canvas` mode, and
 lets bundle leases make old slots reusable. Sources for current double epoch
 checks:
-`examples/cuepool/crates/cuepool/src/video_pipeline::{VideoControl,video_consume_thread}`.
+`crates/cuepool/src/video_pipeline::{VideoControl,video_consume_thread}`.
 
 ### Shader organisation and colour parity
 
@@ -419,15 +421,15 @@ implements limited versus full range and BT.601 versus BT.709. Move that fit and
 matrix contract into one shared WGSL/Rust source used by the existing converter,
 the projection shaders, and the pixel sampler; do not maintain three handwritten
 matrix copies. Sources:
-`examples/cuepool/crates/cuepool-video/src/{frame::FramePixels,yuv_converter::YuvConverter}`.
+`crates/cuepool-video/src/{frame::FramePixels,yuv_converter::YuvConverter}`.
 
 The decoder currently admits YUV420P/YUVJ420P, YUV422P/YUVJ422P,
 YUV444P/YUVJ444P, NV12, and YUV420P10LE to the GPU path. `FramePixels` and
 `YuvConverter` are structurally capable of planar 420/422/444 at either 8 or 10
 bits, but `video_source::gpu_format_class` currently produces 10-bit only for
 420P10LE. Other formats remain RGBA swscale fallback. Sources:
-`examples/cuepool/crates/cuepool-video/src/video_source::{GpuYuvFormat,gpu_format_class,convert_frame}`
-and `examples/cuepool/crates/cuepool-video/src/frame::{ChromaSubsample,BitDepth,FramePixels}`.
+`crates/cuepool-video/src/video_source::{GpuYuvFormat,gpu_format_class,convert_frame}`
+and `crates/cuepool-video/src/frame::{ChromaSubsample,BitDepth,FramePixels}`.
 
 Preserve the logical canvas coordinate system. The fragment first maps output
 coordinates through `ProjectorOutput`'s pixel-centred source rectangle to canvas
@@ -435,8 +437,8 @@ UV, applies Fit/Fill/Stretch to obtain source-plane UV or black letterbox, then
 performs YUV conversion. Overlay sampling still uses the canvas UV. Finally the
 shader applies each edge's smoothstep/gamma ramp and global stop-cue opacity.
 Sources for current geometry/effects:
-`examples/cuepool/crates/cuepool-video/src/{projection_renderer::Uniforms,shaders/projection.wgsl}`
-and `examples/cuepool/crates/cuepool-video/src/yuv_converter::fit_rects`.
+`crates/cuepool-video/src/{projection_renderer::Uniforms,shaders/projection.wgsl}`
+and `crates/cuepool-video/src/yuv_converter::fit_rects`.
 
 There is one easy colour trap. Today YUV conversion writes display-encoded RGB
 bytes into a linear `Rgba8Unorm` canvas, and projection samples through an
@@ -447,8 +449,8 @@ encode it. The lighting sampler is different: it currently reads the canvas's
 linear view specifically to recover the stored display-referred bytes, so its
 plane shader must write matrix output directly without that sRGB decode.
 Sources:
-`examples/cuepool/crates/cuepool-video/src/{canvas_texture::CanvasTexture,projection_renderer::ProjectionRenderer,pixel_sampler::PixelSampler}`
-and `examples/cuepool/crates/cuepool/src/main::App::about_to_wait`.
+`crates/cuepool-video/src/{canvas_texture::CanvasTexture,projection_renderer::ProjectionRenderer,pixel_sampler::PixelSampler}`
+and `crates/cuepool/src/main::App::about_to_wait`.
 
 ### Consumer inventory
 
@@ -476,7 +478,7 @@ middle submissions that keep Vulkan ownership, a last-output release, timeout
 recovery when an output is occluded/lost, and decoder retirement after the last
 GPU completion. It would pace decode by the slowest output and turn an optional
 optimization into the highest-risk part of the renderer. Sources:
-`examples/cuepool/crates/cuepool-video/src/d3d11_zero_copy::{PoolInterop::record_barrier,D3d11Frame::attach_keyed_mutex,D3d11Handoff::wait}`.
+`crates/cuepool-video/src/d3d11_zero_copy::{PoolInterop::record_barrier,D3d11Frame::attach_keyed_mutex,D3d11Handoff::wait}`.
 
 Keeping one D3D11 conversion is acceptable because batching removes the 15 ms
 dedicated submit while retaining zero-copy's avoided GPU-to-CPU transfer. The
@@ -493,7 +495,7 @@ completes, and enable direct conversion only on the next decoder frame if it
 matches. A failed canary therefore cannot reach a projector. This costs one
 startup frame and preserves the current conservative fallback without a
 canary-only submit. Source for the current synchronous first-frame gate:
-`examples/cuepool/crates/cuepool-video/src/yuv_converter::YuvConverter::run_d3d11_canary`.
+`crates/cuepool-video/src/yuv_converter::YuvConverter::run_d3d11_canary`.
 
 ### Memory cost
 
@@ -515,8 +517,8 @@ image/text/video boundaries. For a 5120x1200 source, one 8-bit 420/NV12 set is
 is 17.58 MiB, so the delta is 35.16 MiB. These are logical texel sizes and
 exclude allocator alignment, staging buffers, swapchains, and the externally
 owned D3D11 decoder pool. Sources for current allocations:
-`examples/cuepool/crates/cuepool-video/src/{canvas_texture::CanvasTexture,yuv_converter::YuvConverter}`
-and `examples/cuepool/crates/cuepool/src/video_pipeline::video_consume_thread`.
+`crates/cuepool-video/src/{canvas_texture::CanvasTexture,yuv_converter::YuvConverter}`
+and `crates/cuepool/src/video_pipeline::video_consume_thread`.
 
 Do not grow the slot pool dynamically. If three slots are insufficient, the
 status counter and rig capture should reveal it; the safe response is a dropped
@@ -537,8 +539,8 @@ The important invariant remains `Uploads/s + Dropped/s` approximately equal to
 the due source cadence when starvation is zero. Presented/s measures output
 pacing and is not expected to equal Uploads/s times output count. Current
 publication sources are
-`examples/cuepool/crates/cuepool/src/main::App::about_to_wait` and
-`examples/cuepool/crates/cuepool-gui/src/app::Diagnostics::sections`.
+`crates/cuepool/src/main::App::about_to_wait` and
+`crates/cuepool-gui/src/app::Diagnostics::sections`.
 
 ## Verification and staged implementation
 

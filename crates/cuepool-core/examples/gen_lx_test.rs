@@ -1,4 +1,8 @@
 //! One-shot generator for testFiles/lightingTest.qproj (see QPLAYER lighting L1).
+//!
+//! The media fixtures are not committed. Set `CUEPOOL_LX_FIXTURES` to the
+//! directory containing `lx_stripes.png` and `lx_stripes.mp4`; otherwise the
+//! example looks in the workspace's `testFiles` directory.
 
 use cuepool_core::lighting::{
     FixtureLook, LightingProtocol, PatchedFixture, PixelMapSegment, SegmentSource,
@@ -6,6 +10,12 @@ use cuepool_core::lighting::{
 use cuepool_core::{Cue, CueBase, FadeType, LoopMode, ShowFile};
 use rust_decimal::Decimal;
 use std::collections::BTreeMap;
+
+fn fixture(name: &str) -> String {
+    let dir = std::env::var("CUEPOOL_LX_FIXTURES")
+        .unwrap_or_else(|_| format!("{}/../../testFiles", env!("CARGO_MANIFEST_DIR")));
+    format!("{dir}/{name}")
+}
 
 fn main() {
     let mut show = ShowFile::default();
@@ -108,7 +118,7 @@ fn main() {
                 name: "Stripes still".into(),
                 ..Default::default()
             },
-            path: "/Users/ac/developer/rust/rustjay-engine/testFiles/lx_stripes.png".into(),
+            path: fixture("lx_stripes.png"),
         },
         // Q4: looping stripes video into the pixel-map texture.
         Cue::PixelMap {
@@ -118,7 +128,7 @@ fn main() {
                 loop_mode: LoopMode::LoopedInfinite,
                 ..Default::default()
             },
-            path: "/Users/ac/developer/rust/rustjay-engine/testFiles/lx_stripes.mp4".into(),
+            path: fixture("lx_stripes.mp4"),
         },
     ];
 

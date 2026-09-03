@@ -1,12 +1,14 @@
 # CuePool panic audit
 
+> Written in the rustjay-engine tree before CuePool moved to its own repository on 2026-09-03. Issue numbers refer to BlueJayLouche/rustjay-engine. Paths have been rewritten to this repo's layout; line numbers were not re-verified.
+
 Audit date: 2026-08-12
 
 Audited revision: `7aa9c4253809b70da4021c0dff3c9f32bd518f22`
 
 ## Scope and counting
 
-CuePool's nested workspace sets `panic = "abort"` for release builds. Any panic in
+CuePool's workspace sets `panic = "abort"` for release builds. Any panic in
 the application therefore kills the whole CuePool process; a panic in a standalone
 example kills that example process. Thread ownership below describes where the
 panic originates, not a smaller blast radius.
@@ -327,6 +329,6 @@ Two changes landed between the audited revision and this document merging:
   instead of aborting. Worklist item 1 is done. `engine.rs` line numbers in this
   document predate that change — the resampler-construction sites from worklist
   item 4 now sit at `engine.rs:443` and `engine.rs:494`.
-- PR #99 synced the nested `Cargo.lock` with the cpal 0.18 manifests.
+- PR #99 synced `Cargo.lock` with the cpal 0.18 manifests.
 
 Worklist items 2–6 are unaffected and remain open.

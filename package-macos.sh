@@ -5,29 +5,29 @@
 # where Finder and the Dock read Contents/Resources/AppIcon.icns instead.
 # Re-run after a rebuild. Windows counterpart: package-windows.ps1.
 #
-# The Info.plist template and icon slot are the ones release-apps.yml ships, so a
+# The Info.plist template and icon slot are the ones release.yml ships, so a
 # local bundle matches the released one. Without dylibbundler the .app still loads
 # FFmpeg from Homebrew, which is fine here but will not run on another Mac.
 set -euo pipefail
 
-root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)   # repo root
-bin="$root/examples/cuepool/target/release/cuepool"
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)   # repo root
+bin="$root/target/release/cuepool"
 app="$root/dist/CuePool.app"
 exe="$app/Contents/MacOS/cuepool"
 
 if [ ! -x "$bin" ]; then
-    echo "Build first: cargo build --release --manifest-path examples/cuepool/Cargo.toml -p cuepool" >&2
+    echo "Build first: cargo build --release --locked -p cuepool" >&2
     echo "Missing: $bin" >&2
     exit 1
 fi
 
-version=$(cargo pkgid --manifest-path "$root/examples/cuepool/Cargo.toml" -p cuepool)
+version=$(cargo pkgid --manifest-path "$root/Cargo.toml" -p cuepool)
 version=${version##*#}
 
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp "$bin" "$exe"
-cp "$root/examples/cuepool/packaging/AppIcon.icns" "$app/Contents/Resources/"
+cp "$root/packaging/AppIcon.icns" "$app/Contents/Resources/"
 sed -e 's/__NAME__/CuePool/g' \
     -e 's/__BIN__/cuepool/g' \
     -e "s/__VERSION__/$version/g" \

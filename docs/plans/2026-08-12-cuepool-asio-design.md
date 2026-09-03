@@ -1,5 +1,7 @@
 # CuePool ASIO output design
 
+> Written in the rustjay-engine tree before CuePool moved to its own repository on 2026-09-03. Issue numbers refer to BlueJayLouche/rustjay-engine. Paths have been rewritten to this repo's layout; line numbers were not re-verified.
+
 ## Goal
 
 Make CuePool's existing `audio_output_driver` and `audio_output_device` settings control the CPAL host and device used for playback. WASAPI remains the default. A project requesting ASIO must never emit audio through WASAPI.
