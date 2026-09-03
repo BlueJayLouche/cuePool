@@ -26,7 +26,6 @@ apriltag-sys = { version = "0.3" }
 
 # Utils
 log = { workspace = true }
-thiserror = { workspace = true }
 anyhow = { workspace = true }
 bytemuck = { version = "1.21", features = ["derive"] }
 image = { workspace = true }
