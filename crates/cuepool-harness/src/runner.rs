@@ -353,7 +353,7 @@ impl HeadlessShowRunner {
 fn load_project(path: &Path) -> Result<ShowFile> {
     let data = fs::read_to_string(path)
         .with_context(|| format!("failed to read CuePool project '{}'", path.display()))?;
-    serde_json::from_str(&data)
+    cuepool_core::parse_show_file(&data)
         .with_context(|| format!("failed to parse CuePool project '{}'", path.display()))
 }
 

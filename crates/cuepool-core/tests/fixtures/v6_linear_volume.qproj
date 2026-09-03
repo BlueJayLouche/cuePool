@@ -1,0 +1,6 @@
+{
+  "file_format_version": 6,
+  "cues": [
+    { "$type": "SoundCue", "qid": "1", "name": "Bed", "path": "bed.wav", "volume": 0.5 }
+  ]
+}

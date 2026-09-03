@@ -1,0 +1,7 @@
+{
+  "file_format_version": 3,
+  "cues": [
+    { "$type": "DummyCue", "qid": "1", "name": "follows", "halt": false },
+    { "$type": "DummyCue", "qid": "2", "name": "waits",   "halt": true }
+  ]
+}
