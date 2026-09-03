@@ -368,6 +368,31 @@ fn unlatch_rewound_timecode_triggers(
     });
 }
 
+/// A take name from `/recorder/select` must be a bare file name. OSC is
+/// unauthenticated, and the recorder creates, renames and overwrites files at
+/// whatever path it is given; a path component here would let any host on
+/// the show LAN write anywhere the CuePool user can. The GUI's file pickers
+/// are the way to record to an arbitrary location.
+fn osc_take_file_name(name: &str) -> Option<String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() || trimmed.contains('\0') {
+        return None;
+    }
+    let mut components = std::path::Path::new(trimmed).components();
+    match (components.next(), components.next()) {
+        (Some(std::path::Component::Normal(_)), None) => {}
+        _ => return None,
+    }
+    if trimmed.contains(['/', '\\']) {
+        return None;
+    }
+    let mut file = trimmed.to_string();
+    if !file.ends_with(".dmxrec") {
+        file.push_str(".dmxrec");
+    }
+    Some(file)
+}
+
 fn clamp_video_seek_secs(target: f64, length_secs: Option<f64>) -> f64 {
     match length_secs.filter(|length| length.is_finite() && *length > 0.0) {
         Some(length) => target.min(length.next_down()),
@@ -3564,16 +3589,17 @@ impl App {
                                 .push(AppCommand::RecorderRevert { file });
                         }
                     }
-                    OscEvent::RecorderSelect { name } => {
-                        let mut file = name;
-                        if !file.ends_with(".dmxrec") {
-                            file.push_str(".dmxrec");
+                    OscEvent::RecorderSelect { name } => match osc_take_file_name(&name) {
+                        Some(file) => {
+                            if let Ok(mut state) = self.cuepool.state().lock() {
+                                log::info!("Recorder: selected take '{file}' via OSC");
+                                state.recorder_file = file;
+                            }
                         }
-                        if let Ok(mut state) = self.cuepool.state().lock() {
-                            log::info!("Recorder: selected take '{file}' via OSC");
-                            state.recorder_file = file;
-                        }
-                    }
+                        None => log::warn!(
+                            "Recorder: ignoring take name {name:?} from OSC; it must be a bare file name"
+                        ),
+                    },
                     OscEvent::AutoblendStream { url } => {
                         self.autoblend.stream(&url);
                     }
@@ -5644,6 +5670,33 @@ mod tests {
         };
         unlatch_rewound_timecode_triggers(&mut fired, &[plain], 42.0);
         assert!(fired.is_empty());
+    }
+
+    #[test]
+    fn osc_take_names_are_bare_file_names() {
+        assert_eq!(osc_take_file_name("act1").as_deref(), Some("act1.dmxrec"));
+        assert_eq!(
+            osc_take_file_name("act1.dmxrec").as_deref(),
+            Some("act1.dmxrec")
+        );
+        assert_eq!(
+            osc_take_file_name("  act1 ").as_deref(),
+            Some("act1.dmxrec")
+        );
+        for bad in [
+            "",
+            "   ",
+            "..",
+            "../x",
+            "/tmp/x",
+            "a/b",
+            "a\\b",
+            "C:\\x",
+            "\\\\srv\\share\\x",
+            "a\0b",
+        ] {
+            assert!(osc_take_file_name(bad).is_none(), "{bad:?}");
+        }
     }
 
     #[test]
