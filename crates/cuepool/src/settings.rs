@@ -140,22 +140,11 @@ fn save_settings_at(path: &std::path::Path, settings: &AppSettings) {
         }
     };
 
-    // Same directory as the target, so the rename stays on one filesystem. The
-    // pid keeps concurrent automation profiles from sharing a temp file.
-    let temp = path.with_extension(format!("json.{}.tmp", std::process::id()));
-    if let Err(error) = std::fs::write(&temp, &data) {
+    if let Err(error) = cuepool_gui::atomic_write::write_atomically(path, data.as_bytes()) {
         log::warn!(
             "Could not write {} ({error}); settings not saved",
-            temp.display()
-        );
-        return;
-    }
-    if let Err(error) = std::fs::rename(&temp, path) {
-        log::warn!(
-            "Could not replace {} ({error}); settings not saved",
             path.display()
         );
-        let _ = std::fs::remove_file(&temp);
     }
 }
 
