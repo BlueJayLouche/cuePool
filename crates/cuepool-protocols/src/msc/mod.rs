@@ -382,13 +382,16 @@ impl MamscDriver {
         let running = Arc::clone(&self.running);
         self.rx_thread = Some(std::thread::spawn(move || {
             let mut buf = [0u8; 65536];
+            let mut malformed = crate::WarnThrottle::new(std::time::Duration::from_secs(10));
             while running.load(std::sync::atomic::Ordering::Relaxed) {
                 match socket.recv_from(&mut buf) {
                     Ok((len, src)) => {
                         if let Some(pkt) = MamscPacket::try_read(&buf[..len]) {
                             on_msg(pkt, src);
-                        } else {
-                            log::warn!("Malformed MA-MSC packet from {src}");
+                        } else if let Some(suppressed) = malformed.tick(std::time::Instant::now()) {
+                            log::warn!(
+                                "Malformed MA-MSC packet from {src} ({suppressed} similar suppressed)"
+                            );
                         }
                     }
                     // An idle port: the read timeout expired with nothing to

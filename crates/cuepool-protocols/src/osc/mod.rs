@@ -180,6 +180,7 @@ impl OscDriver {
         let running = Arc::clone(&self.running);
         self.rx_thread = Some(std::thread::spawn(move || {
             let mut buf = [0u8; 65536];
+            let mut decode_errors = crate::WarnThrottle::new(std::time::Duration::from_secs(10));
             while running.load(std::sync::atomic::Ordering::Relaxed) {
                 match socket.recv_from(&mut buf) {
                     Ok((len, src)) => match rosc::decoder::decode_udp(&buf[..len]) {
@@ -189,7 +190,12 @@ impl OscDriver {
                             }
                         }
                         Err(e) => {
-                            log::warn!("OSC decode error from {src}: {e}");
+                            if let Some(suppressed) = decode_errors.tick(std::time::Instant::now())
+                            {
+                                log::warn!(
+                                    "OSC decode error from {src}: {e} ({suppressed} similar suppressed)"
+                                );
+                            }
                         }
                     },
                     // An idle port: the read timeout expired with nothing to
