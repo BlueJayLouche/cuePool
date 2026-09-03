@@ -6,5 +6,6 @@ ignore = [
     # path). Ignored so first-contact CI is green; drop this once rust_decimal
     # ships a lockfile that no longer pins vulnerable rkyv, or audit stops
     # flagging unbuilt optional deps.
+    # Re-check: when rust_decimal is next bumped in Cargo.lock, or 2027-03-01, whichever first.
     "RUSTSEC-2026-0235",
 ]
