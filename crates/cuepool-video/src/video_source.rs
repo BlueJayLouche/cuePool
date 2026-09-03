@@ -914,6 +914,18 @@ pub(crate) fn open_input(
     }
 }
 
+/// `open_input` with AVFormat options. Used by calibration capture to pass
+/// `protocol_whitelist`; file playback keeps `open_input` so its protocol
+/// set is unchanged.
+pub(crate) fn open_input_with_options(
+    path: &str,
+    interrupt: &Arc<AtomicBool>,
+    options: ffmpeg_next::Dictionary,
+) -> Result<format::context::Input, ffmpeg_next::Error> {
+    let stop = Arc::clone(interrupt);
+    format::input_with_interrupt_and_dictionary(path, move || stop.load(Ordering::Relaxed), options)
+}
+
 impl HapVideoSource {
     fn probe(
         path: &str,
