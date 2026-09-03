@@ -3493,7 +3493,7 @@ impl CuePoolApp {
             };
             serde_json::to_string_pretty(&state.show_file)?
         };
-        std::fs::write(path, json)?;
+        crate::atomic_write::write_atomically(path, json.as_bytes())?;
         if let Ok(mut state) = self.state.lock() {
             state.project_path = Some(path.to_path_buf());
             state.dirty = false;
@@ -3631,7 +3631,7 @@ impl CuePoolApp {
             }
 
             let json = serde_json::to_string_pretty(&state.show_file)?;
-            std::fs::write(&proj_path, json)?;
+            crate::atomic_write::write_atomically(&proj_path, json.as_bytes())?;
             state.project_path = Some(proj_path.clone());
             state.dirty = false;
             state.push_recent_file(&proj_path);

@@ -1,5 +1,6 @@
 use cuepool_core::LockExt;
 use cuepool_gui::SharedStateHandle;
+use cuepool_gui::atomic_write::write_atomically;
 use cuepool_gui::logging::PERSIST_TARGET;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -53,7 +54,7 @@ pub(crate) fn spawn_autosave_thread(state: SharedStateHandle, running: Arc<Atomi
                     }
                 }
             };
-            if let Err(e) = std::fs::write(&backup_path, json) {
+            if let Err(e) = write_atomically(&backup_path, json.as_bytes()) {
                 log::warn!("Autosave: failed to write {:?}: {}", backup_path, e);
             } else {
                 log::info!("Autosaved to {:?}", backup_path);
@@ -93,14 +94,14 @@ pub(crate) fn emergency_save(state: &SharedStateHandle, reason: &str) {
 
     // Prefer crash_recovery.qproj, but if a project_path exists, also save there
     let crash_path = dir.join("crash_recovery.qproj");
-    if let Err(e) = std::fs::write(&crash_path, &json) {
+    if let Err(e) = write_atomically(&crash_path, json.as_bytes()) {
         log::error!("Emergency save: failed to write {:?}: {}", crash_path, e);
     } else {
         log::info!(target: PERSIST_TARGET, "Recovery save written to {:?}", crash_path);
     }
 
     if let Some(project_path) = path {
-        if let Err(e) = std::fs::write(&project_path, &json) {
+        if let Err(e) = write_atomically(&project_path, json.as_bytes()) {
             log::error!(
                 "Emergency save: failed to overwrite {:?}: {}",
                 project_path,
