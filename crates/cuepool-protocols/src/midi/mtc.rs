@@ -278,6 +278,83 @@ pub struct MtcReceiver {
     last_refresh: std::time::Instant,
 }
 
+/// Drop connections whose port is no longer present. The two vectors are
+/// index-parallel, so they are pruned in lockstep. Returns the names dropped.
+fn prune_missing<C>(
+    names: &mut Vec<String>,
+    connections: &mut Vec<C>,
+    present: &[String],
+) -> Vec<String> {
+    debug_assert_eq!(names.len(), connections.len());
+    let mut dropped = Vec::new();
+    let mut i = 0;
+    while i < names.len() {
+        if present.contains(&names[i]) {
+            i += 1;
+        } else {
+            dropped.push(names.remove(i));
+            connections.remove(i);
+        }
+    }
+    dropped
+}
+
+/// One MIDI message from one port, applied to the shared published state.
+/// Called from the midir callback thread; keep it allocation-free on the
+/// quarter-frame path.
+fn handle_midi_message(
+    msg: &[u8],
+    device: &str,
+    decoder: &mut MtcDecoder,
+    published: &MtcPublished,
+) {
+    if msg.is_empty() {
+        return;
+    }
+    match msg[0] {
+        0xF1 if msg.len() >= 2 => {
+            // Record arrival time before any decode work.
+            published.last_qf_ms.store(now_ms(), Ordering::Release);
+
+            if let Some(tc) = decoder.feed_quarter_frame(msg[1]) {
+                log::debug!("[MTC] {} from {}", tc, device);
+                // Update source device name — try_lock avoids any
+                // block if the reader happens to hold it.
+                if let Ok(mut src) = published.source_device.try_lock()
+                    && src.as_str() != device
+                {
+                    src.clear();
+                    src.push_str(device);
+                }
+                published
+                    .smpte
+                    .store(pack_smpte(&tc, true, true), Ordering::Release);
+            } else {
+                // Running but no complete SMPTE yet — set flags only.
+                published
+                    .smpte
+                    .fetch_or((1u64 << 24) | (1u64 << 25), Ordering::Relaxed);
+            }
+        }
+        0xF0 if msg.len() >= 10 && msg[3] == 0x01 && msg[4] == 0x01 => {
+            if let Some(tc) = MtcDecoder::parse_full_frame(msg) {
+                log::info!("[MTC] Full-frame locate: {} from {}", tc, device);
+                if let Ok(mut src) = published.source_device.try_lock()
+                    && src.as_str() != device
+                {
+                    src.clear();
+                    src.push_str(device);
+                }
+                // Full-frame is a locate — running but not playing.
+                published
+                    .smpte
+                    .store(pack_smpte(&tc, true, false), Ordering::Release);
+            }
+        }
+        _ => {}
+    }
+}
+
 impl MtcReceiver {
     /// Create a receiver and immediately connect to all currently visible ports.
     pub fn new() -> Self {
@@ -302,18 +379,24 @@ impl MtcReceiver {
         self.last_refresh = std::time::Instant::now();
 
         // Probe: list all port names with a throw-away MidiInput.
-        let new_names = {
+        let present = {
             let Ok(mut probe) = MidiInput::new("CuePool MTC Probe") else {
-                return;
+                return; // no probe, no pruning: don't churn on a transient failure
             };
             probe.ignore(Ignore::None);
             probe
                 .ports()
                 .iter()
                 .filter_map(|p| probe.port_name(p).ok())
-                .filter(|n| !self.connected_names.contains(n))
                 .collect::<Vec<_>>()
         };
+        for gone in prune_missing(&mut self.connected_names, &mut self.connections, &present) {
+            log::info!("[MTC] Port gone: {gone}");
+        }
+        let new_names: Vec<String> = present
+            .into_iter()
+            .filter(|n| !self.connected_names.contains(n))
+            .collect();
 
         for name in new_names {
             // Each connection needs its own MidiInput.
@@ -340,53 +423,7 @@ impl MtcReceiver {
             let result = input.connect(
                 &port,
                 "cuepool-mtc",
-                move |_, msg, _| {
-                    if msg.is_empty() {
-                        return;
-                    }
-                    match msg[0] {
-                        0xF1 if msg.len() >= 2 => {
-                            // Record arrival time before any decode work.
-                            published.last_qf_ms.store(now_ms(), Ordering::Release);
-
-                            if let Some(tc) = decoder.feed_quarter_frame(msg[1]) {
-                                log::debug!("[MTC] {} from {}", tc, device);
-                                // Update source device name — try_lock avoids any
-                                // block if the reader happens to hold it.
-                                if let Ok(mut src) = published.source_device.try_lock()
-                                    && src.as_str() != device
-                                {
-                                    src.clear();
-                                    src.push_str(&device);
-                                }
-                                published
-                                    .smpte
-                                    .store(pack_smpte(&tc, true, true), Ordering::Release);
-                            } else {
-                                // Running but no complete SMPTE yet — set flags only.
-                                published
-                                    .smpte
-                                    .fetch_or((1u64 << 24) | (1u64 << 25), Ordering::Relaxed);
-                            }
-                        }
-                        0xF0 if msg.len() >= 10 && msg[3] == 0x01 && msg[4] != 0x01 => {
-                            if let Some(tc) = MtcDecoder::parse_full_frame(msg) {
-                                log::info!("[MTC] Full-frame locate: {} from {}", tc, device);
-                                if let Ok(mut src) = published.source_device.try_lock()
-                                    && src.as_str() != device
-                                {
-                                    src.clear();
-                                    src.push_str(&device);
-                                }
-                                // Full-frame is a locate — running but not playing.
-                                published
-                                    .smpte
-                                    .store(pack_smpte(&tc, true, false), Ordering::Release);
-                            }
-                        }
-                        _ => {}
-                    }
-                },
+                move |_, msg, _| handle_midi_message(msg, &device, &mut decoder, &published),
                 (),
             );
 
@@ -550,5 +587,46 @@ mod tests {
         assert!(MtcDecoder::parse_full_frame(&[0xF0, 0x7F]).is_none());
         let wrong_subid = [0xF0, 0x7F, 0x7F, 0x02, 0x01, 0x21, 0x0C, 0x22, 0x04, 0xF7];
         assert!(MtcDecoder::parse_full_frame(&wrong_subid).is_none());
+    }
+
+    #[test]
+    fn a_full_frame_locate_reaches_the_published_state() {
+        let published = MtcPublished::new();
+        let mut decoder = MtcDecoder::new();
+        // F0 7F 7F 01 01 hr mn sc fr F7 — 01:12:34:04 at 25 fps
+        let msg = [0xF0, 0x7F, 0x7F, 0x01, 0x01, 0x21, 0x0C, 0x22, 0x04, 0xF7];
+
+        handle_midi_message(&msg, "Unit MTC", &mut decoder, &published);
+
+        let packed = published.smpte.load(Ordering::Acquire);
+        assert_ne!(packed, 0, "the locate must be published");
+        assert_eq!(published.source_device.lock().unwrap().as_str(), "Unit MTC");
+
+        let (tc, running, playing) = unpack_smpte(packed);
+        assert_eq!(tc.hours, 1);
+        assert_eq!(tc.minutes, 12);
+        assert_eq!(tc.seconds, 34);
+        assert_eq!(tc.frames, 4);
+        assert!(running, "a full-frame locate is running");
+        assert!(!playing, "a full-frame locate is not playing");
+    }
+
+    #[test]
+    fn prune_missing_drops_a_vanished_port_and_keeps_the_rest_aligned() {
+        let mut names = vec!["A".to_string(), "B".to_string(), "C".to_string()];
+        let mut conns = vec![1u8, 2, 3];
+        let present = vec!["A".to_string(), "C".to_string()];
+        let dropped = prune_missing(&mut names, &mut conns, &present);
+        assert_eq!(dropped, vec!["B".to_string()]);
+        assert_eq!(names, vec!["A".to_string(), "C".to_string()]);
+        assert_eq!(conns, vec![1, 3]);
+    }
+
+    #[test]
+    fn prune_missing_is_a_no_op_when_every_port_is_present() {
+        let mut names = vec!["A".to_string()];
+        let mut conns = vec![1u8];
+        assert!(prune_missing(&mut names, &mut conns, &["A".to_string()]).is_empty());
+        assert_eq!(names.len(), 1);
     }
 }
