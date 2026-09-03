@@ -336,6 +336,10 @@ fn read_executor_page(buf: &[u8]) -> (Option<u8>, Option<u8>) {
 // Driver
 // ---------------------------------------------------------------------------
 
+/// Upper bound on one blocking `recv_from`, so the RX thread re-checks the
+/// stop flag and `Drop` can join it. Mirrors `OscDriver`.
+const RX_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// Low-level UDP MSC driver.
 #[allow(dead_code)]
 pub struct MamscDriver {
@@ -354,6 +358,10 @@ impl MamscDriver {
         // As in OscDriver::bind: without this a broadcast destination fails
         // EACCES instead of sending.
         socket.set_broadcast(true)?;
+        // Blocking reads, but bounded: the RX loop only notices the stop flag
+        // between reads, so without a timeout `Drop` would join a thread parked
+        // in recv_from forever.
+        socket.set_read_timeout(Some(RX_POLL_INTERVAL))?;
         let tx_addr: std::net::SocketAddr = SocketAddrV4::new(tx_host, tx_port).into();
 
         Ok(Self {
@@ -383,9 +391,13 @@ impl MamscDriver {
                             log::warn!("Malformed MA-MSC packet from {src}");
                         }
                     }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(std::time::Duration::from_millis(1));
-                    }
+                    // An idle port: the read timeout expired with nothing to
+                    // show. Unix reports it as WouldBlock, Windows as TimedOut.
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) => {}
                     Err(e) => {
                         log::warn!("MSC recv error: {e}");
                     }
