@@ -12,6 +12,7 @@
 //!   that submits behind vsync-blocked swapchains).
 
 use cuepool::{EngineAction, EngineCommand, EngineEvent, ShowEngine};
+use cuepool_audio::engine::clamp_master_volume_db;
 use cuepool_audio::{AudioEngine, QueueOutput};
 use cuepool_core::{
     AudioOutputDriver, CanvasFit, LockExt, MidiTrigger, MidiTriggerKind, SerializedColour,
@@ -501,6 +502,9 @@ struct App {
     // ── app state ──
     cuepool: CuePoolApp,
     profile: AppProfile,
+    /// When a settings change (the master fader) should be flushed to disk.
+    /// Debounced so a fader drag costs one write, not one per frame.
+    settings_save_due: Option<Instant>,
     show_engine: ShowEngine,
     engine_epoch: Instant,
     window_ids: Option<WindowIds>,
@@ -963,6 +967,7 @@ impl App {
             egui_renderer: None,
             cuepool,
             profile,
+            settings_save_due: None,
             show_engine,
             engine_epoch: Instant::now(),
             window_ids: None,
@@ -2060,16 +2065,35 @@ impl App {
         target.trim() == local_name.trim() || target.trim() == "*"
     }
 
+    /// Master output gain from the transport fader or OSC. Applied to the mixer
+    /// at once, mirrored into shared state for the fader readout, and flushed
+    /// to per-machine settings once the value has settled for a second.
+    fn set_master_volume(&mut self, db: f32) {
+        let db = clamp_master_volume_db(db);
+        if let Some(audio) = self.show_engine.audio_engine() {
+            audio.set_master_volume_db(db);
+        }
+        let changed = {
+            let mut state = self.cuepool.state().lock_unpoisoned();
+            std::mem::replace(&mut state.master_volume_db, db) != db
+        };
+        if changed {
+            self.settings_save_due
+                .get_or_insert(Instant::now() + Duration::from_secs(1));
+        }
+    }
+
     /// Apply the project's exact driver/device request. Any failure drops the
     /// previous stream before reporting the error, so ASIO can never fall back
     /// to WASAPI or continue through a stale device.
     fn apply_audio_settings(&mut self) {
-        let (driver, configured_device, audio_ok) = {
+        let (driver, configured_device, audio_ok, master_volume_db) = {
             let state = self.cuepool.state().lock_unpoisoned();
             (
                 state.show_file.show_settings.audio_output_driver,
                 state.show_file.show_settings.audio_output_device.clone(),
                 state.audio_error.is_none(),
+                state.master_volume_db,
             )
         };
 
@@ -2087,12 +2111,6 @@ impl App {
         self.stop_video_playback();
         self.set_video_paused(false);
         self.stop_external_outputs();
-        // The master gain is runtime state on the mixer; a device change must
-        // not silently return a room fader to unity.
-        let master_volume_db = self
-            .show_engine
-            .audio_engine()
-            .map(AudioEngine::master_volume_db);
         self.show_engine.replace_audio_engine(None);
 
         let setup = AudioEngine::configure(driver, &configured_device);
@@ -2104,9 +2122,9 @@ impl App {
         match setup.engine {
             Ok(engine) => {
                 let device_name = engine.device_name().to_string();
-                if let Some(db) = master_volume_db {
-                    engine.set_master_volume_db(db);
-                }
+                // A fresh engine starts at unity; the room fader must survive
+                // a device change and the first start.
+                engine.set_master_volume_db(master_volume_db);
                 self.show_engine.replace_audio_engine(Some(engine));
                 let mut state = self.cuepool.state().lock_unpoisoned();
                 state.audio_devices = devices;
@@ -3017,6 +3035,7 @@ impl App {
                         );
                     }
                 }
+                AppCommand::SetMasterVolume(db) => self.set_master_volume(db),
                 AppCommand::SetAudioDriver(driver) => {
                     {
                         let mut state = self.cuepool.state().lock_unpoisoned();
@@ -3478,12 +3497,8 @@ impl App {
                         }
                     }
                     OscEvent::Volume { db } => {
-                        if let Some(audio) = self.show_engine.audio_engine() {
-                            audio.set_master_volume_db(db);
-                            log::info!(
-                                "Set master volume to {:.1} dB (OSC)",
-                                audio.master_volume_db()
-                            );
+                        if let Ok(mut state) = self.cuepool.state().lock() {
+                            state.command_queue.push(AppCommand::SetMasterVolume(db));
                         }
                     }
                     OscEvent::DmxChannel {
@@ -3740,6 +3755,16 @@ impl App {
                     _ => {}
                 }
             }
+        }
+
+        if self
+            .settings_save_due
+            .is_some_and(|due| Instant::now() >= due)
+        {
+            self.settings_save_due = None;
+            save_settings_from_state(&self.profile, self.cuepool.state());
+            let db = self.cuepool.state().lock_unpoisoned().master_volume_db;
+            log::info!("Master volume {db:+.1} dB");
         }
 
         // Discovery broadcast every 1 second
@@ -5330,6 +5355,7 @@ fn run(log_file: String, profile: AppProfile) -> anyhow::Result<()> {
         let mut state = cuepool.state().lock_unpoisoned();
         state.recent_files = settings.recent_files;
         state.last_seen_release_notes = settings.last_seen_release_notes;
+        state.master_volume_db = clamp_master_volume_db(settings.master_volume_db);
     }
     if let Some(path) = &project_path {
         load_startup_project(&cuepool, path).map_err(|message| {

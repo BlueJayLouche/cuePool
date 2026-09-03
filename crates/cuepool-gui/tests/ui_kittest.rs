@@ -263,6 +263,19 @@ fn mode_button_toggles_show_mode() {
 }
 
 #[test]
+fn master_fader_readout_follows_state() {
+    let (mut harness, state) = demo_harness();
+
+    assert!(harness.query_by_label("Master +0.0 dB").is_some());
+
+    // OSC or a restored setting lands in shared state; the readout must follow
+    // without a local copy going stale.
+    state.lock().unwrap().master_volume_db = -6.0;
+    harness.run();
+    assert!(harness.query_by_label("Master -6.0 dB").is_some());
+}
+
+#[test]
 fn go_button_queues_transport_command() {
     let (mut harness, state) = demo_harness();
 

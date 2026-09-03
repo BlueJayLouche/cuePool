@@ -25,7 +25,7 @@ cargo run --release
 | Left | **Active Cues** — every playing cue with state, volume meter, and a progress bar (`elapsed / total  −remaining`; yellow = paused) |
 | Center | **Cue list** — the show, in playback order |
 | Right | **Inspector** — full editor for the selected cue |
-| Bottom | Status bar |
+| Bottom | Status bar — playback state, cue count, **master fader**, audio and video status |
 
 Extra panels live in the **Window** menu: Log, Waveform, Video Output,
 Projection Mapping, and Lighting.

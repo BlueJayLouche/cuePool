@@ -6,6 +6,9 @@ use cuepool_gui::SharedStateHandle;
 pub(crate) struct AppSettings {
     pub(crate) recent_files: Vec<std::path::PathBuf>,
     pub(crate) last_seen_release_notes: Option<String>,
+    /// Master output gain in dB. Per machine: a room trim belongs to the box
+    /// driving the room, not to a show file that may arrive from another one.
+    pub(crate) master_volume_db: f32,
 }
 
 pub(crate) const AUTOMATION_PROFILE_ENV: &str = "CUEPOOL_AUTOMATION_PROFILE";
@@ -178,6 +181,7 @@ fn settings_from_state(state: &SharedStateHandle) -> AppSettings {
     AppSettings {
         recent_files: state.recent_files.clone(),
         last_seen_release_notes: state.last_seen_release_notes.clone(),
+        master_volume_db: state.master_volume_db,
     }
 }
 
@@ -201,6 +205,7 @@ mod tests {
             let mut guard = state.lock().unwrap();
             guard.recent_files = vec![std::path::PathBuf::from("/shows/gala.qproj")];
             guard.last_seen_release_notes = Some("9.9.9".into());
+            guard.master_volume_db = -6.0;
         }
 
         // Poison it the way a real panic does: unwind while holding the guard.
@@ -220,6 +225,7 @@ mod tests {
             "a poisoned lock must not blank recent_files"
         );
         assert_eq!(settings.last_seen_release_notes.as_deref(), Some("9.9.9"));
+        assert_eq!(settings.master_volume_db, -6.0);
     }
 
     /// A scratch directory that removes itself, so these tests never touch the
@@ -249,6 +255,7 @@ mod tests {
         AppSettings {
             recent_files: vec![std::path::PathBuf::from("/shows/gala.qproj")],
             last_seen_release_notes: Some("9.9.9".into()),
+            master_volume_db: -6.0,
         }
     }
 

@@ -139,6 +139,16 @@ pub const MASTER_VOLUME_DB_MIN: f32 = -96.0;
 /// quiet show cannot drive the limiter into constant reduction.
 pub const MASTER_VOLUME_DB_MAX: f32 = 12.0;
 
+/// Bring a requested master gain into range. NaN (a malformed OSC float, a
+/// hand-edited settings file) becomes unity rather than poisoning the mixer.
+pub fn clamp_master_volume_db(db: f32) -> f32 {
+    if db.is_nan() {
+        0.0
+    } else {
+        db.clamp(MASTER_VOLUME_DB_MIN, MASTER_VOLUME_DB_MAX)
+    }
+}
+
 /// Central audio engine.
 pub struct AudioEngine {
     mixer: Arc<Mixer>,
@@ -517,12 +527,10 @@ impl AudioEngine {
 
     /// Set the master gain in dB, clamped to [`MASTER_VOLUME_DB_MIN`]..=
     /// [`MASTER_VOLUME_DB_MAX`]. The floor is silence. Applied ahead of the
-    /// limiter; not saved in the show file.
+    /// limiter. Persistence is the binary's job (per-machine settings).
     pub fn set_master_volume_db(&self, db: f32) {
-        let db = if db.is_nan() { 0.0 } else { db };
-        self.mixer.set_master_volume(db_to_linear(
-            db.clamp(MASTER_VOLUME_DB_MIN, MASTER_VOLUME_DB_MAX),
-        ));
+        self.mixer
+            .set_master_volume(db_to_linear(clamp_master_volume_db(db)));
     }
 
     /// Current master gain in dB (`-inf` at the floor).

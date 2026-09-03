@@ -503,6 +503,9 @@ pub struct SharedState {
     pub recent_files: Vec<PathBuf>,
     /// Release-notes series acknowledged by the operator, persisted by the binary.
     pub last_seen_release_notes: Option<String>,
+    /// Master output gain in dB, as applied. A room trim, so it is persisted
+    /// per machine by the binary and never written to the show file.
+    pub master_volume_db: f32,
     /// Whether the project settings window is open.
     pub show_settings_window: bool,
     /// Current audio output device name.
@@ -680,6 +683,7 @@ impl Default for SharedState {
             active_cues: Vec::new(),
             meter_data: GuiMeterData::default(),
             recent_files: Vec::new(),
+            master_volume_db: 0.0,
             last_seen_release_notes: None,
             show_settings_window: false,
             audio_device_name: String::new(),
@@ -840,6 +844,8 @@ pub enum AppCommand {
         parent: Option<Decimal>,
     },
     SetLimiterThreshold(f32),
+    /// Master output gain in dB (transport fader; OSC `/qplayer/volume`).
+    SetMasterVolume(f32),
     SetAudioDriver(cuepool_core::AudioOutputDriver),
     SetAudioDevice(String),
     ApplyAudioSettings,
@@ -2803,6 +2809,12 @@ impl CuePoolApp {
                     "Audio: Off"
                 };
                 ui.label(egui::RichText::new(audio_text).small().color(audio_color));
+
+                ui.separator();
+
+                // Master fader lives here rather than in the transport bar, which
+                // is already full at 1280 px once timecode readouts are showing.
+                crate::master_fader::show(ui, &self.state);
 
                 ui.separator();
 

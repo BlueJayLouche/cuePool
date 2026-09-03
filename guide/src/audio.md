@@ -6,10 +6,13 @@ to the device rate, and mixes every playing cue through a per-cue DSP chain
 (fade → EQ → pan → routing) into a master bus with a master gain, metering,
 and an optional limiter. Output is via cpal.
 
-The master gain defaults to 0 dB and is set over OSC
-([`/qplayer/volume`](show-control.md#osc)) — the hook for a room-wide fader on
-a venue control system. It sits ahead of the limiter and is not saved in the
-show file; each change is reported in *Window → Log*.
+The master gain is the room trim: the **Master** fader in the status bar
+(double-click for 0 dB), or [`/qplayer/volume`](show-control.md#osc) from a
+venue control system — either way the fader readout follows. It sits ahead of
+the limiter, ranges −96 dB (silence) to +12 dB, and is saved per machine in
+CuePool's settings rather than in the show file, so a show pushed from another
+computer does not bring that computer's trim with it. Each settled change is
+reported in *Window → Log*.
 
 ## Project audio settings
 
@@ -84,6 +87,7 @@ low-pass filters, edited in the Inspector.
 
 ## Metering & waveform
 
-The transport bar shows the master meter; each entry in **Active Cues** has
+The transport bar shows the master meter and the status bar the master fader;
+each entry in **Active Cues** has
 its own meter. *Window → Waveform* opens a waveform view of the selected
 sound cue — handy when setting start/duration trims.
