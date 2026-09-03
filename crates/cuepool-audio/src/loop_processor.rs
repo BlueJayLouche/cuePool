@@ -132,6 +132,13 @@ impl SampleProvider for LoopProcessor {
         let mut total_read = 0;
         let target_frames = buffer.len() / channels.max(1);
 
+        // Set when a loop boundary sent the source back to `start_frame`;
+        // cleared by the next successful read. A second boundary hit with no
+        // read in between means the window is empty (start at or past end)
+        // or the seek did not move the source, and looping again would spin
+        // this decode thread forever.
+        let mut looped_without_progress = false;
+
         while total_read < target_frames {
             // Ensure source is at the right position (trim start)
             let current_src_frame = self.samples_to_frames(self.source.position());
@@ -146,6 +153,15 @@ impl SampleProvider for LoopProcessor {
             let samples_to_read = frames_to_read * channels;
 
             if samples_to_read == 0 {
+                if inner.start_frame >= inner.end_frame || looped_without_progress {
+                    log::warn!(
+                        "loop window {}..{} frames yields no samples; finishing the cue",
+                        inner.start_frame,
+                        inner.end_frame
+                    );
+                    inner.exhausted = true;
+                    break;
+                }
                 // Hit loop boundary — decide what to do
                 match inner.loop_mode {
                     LoopMode::OneShot | LoopMode::HoldLast => {
@@ -162,6 +178,7 @@ impl SampleProvider for LoopProcessor {
                             counter.fetch_add(1, Ordering::Relaxed);
                         }
                         self.source.seek(self.frames_to_samples(inner.start_frame));
+                        looped_without_progress = true;
                         continue;
                     }
                     LoopMode::LoopedInfinite => {
@@ -170,6 +187,7 @@ impl SampleProvider for LoopProcessor {
                             counter.fetch_add(1, Ordering::Relaxed);
                         }
                         self.source.seek(self.frames_to_samples(inner.start_frame));
+                        looped_without_progress = true;
                         continue;
                     }
                 }
@@ -184,6 +202,7 @@ impl SampleProvider for LoopProcessor {
                 inner.exhausted = true;
                 break;
             }
+            looped_without_progress = false;
 
             let read_frames = read / channels;
             total_read += read_frames;
@@ -402,5 +421,74 @@ mod tests {
         let mut buf2 = vec![0.0f32; 4];
         loop_proc.read(&mut buf2);
         assert_eq!(loop_proc.total_frames(), 2);
+    }
+
+    /// A source whose `seek` is ignored — models a decoder whose seek failed
+    /// and left `position` where it was.
+    struct StuckSource(TestSource);
+
+    impl SampleProvider for StuckSource {
+        fn read(&self, buffer: &mut [f32]) -> usize {
+            self.0.read(buffer)
+        }
+        fn seek(&self, _sample: usize) {}
+        fn position(&self) -> usize {
+            self.0.position()
+        }
+        fn length(&self) -> Option<usize> {
+            self.0.length()
+        }
+        fn sample_rate(&self) -> u32 {
+            self.0.sample_rate()
+        }
+        fn channels(&self) -> u16 {
+            self.0.channels()
+        }
+    }
+    unsafe impl Send for StuckSource {}
+    unsafe impl Sync for StuckSource {}
+
+    #[test]
+    fn an_inverted_loop_window_finishes_instead_of_spinning() {
+        let loop_proc = LoopProcessor::new(finite_source());
+        loop_proc.set_loop(8, 5, LoopMode::LoopedInfinite, 0); // start past end
+        let mut buf = vec![0.0f32; 20];
+        assert_eq!(loop_proc.read(&mut buf), 0);
+        assert_eq!(loop_proc.read(&mut buf), 0, "stays finished");
+    }
+
+    #[test]
+    fn a_start_past_the_media_end_finishes_instead_of_spinning() {
+        let loop_proc = LoopProcessor::new(finite_source());
+        loop_proc.set_loop(50, 0, LoopMode::LoopedInfinite, 0); // end = source length (10)
+        let mut buf = vec![0.0f32; 20];
+        assert_eq!(loop_proc.read(&mut buf), 0);
+    }
+
+    #[test]
+    fn a_seek_that_does_not_move_the_source_finishes_after_one_pass() {
+        let inner = TestSource::new((0..20).map(|i| i as f32).collect(), 48000, 2);
+        let loop_proc = LoopProcessor::new(Box::new(StuckSource(inner)));
+        loop_proc.set_loop(2, 5, LoopMode::LoopedInfinite, 0); // frames 2..5
+        let mut buf = vec![0.0f32; 40];
+        let first = loop_proc.read(&mut buf);
+        assert!(
+            first > 0 && first <= 10,
+            "first read makes progress: {first}"
+        );
+        assert_eq!(
+            loop_proc.read(&mut buf),
+            0,
+            "cannot loop: source did not seek back"
+        );
+    }
+
+    #[test]
+    fn a_normal_infinite_loop_still_loops() {
+        let loop_proc = LoopProcessor::new(finite_source());
+        loop_proc.set_loop(2, 5, LoopMode::LoopedInfinite, 0);
+        let mut buf = vec![0.0f32; 40]; // 20 frames requested, window is 3 frames
+        assert_eq!(loop_proc.read(&mut buf), 40);
+        assert!(loop_proc.played_loops() >= 6);
     }
 }
