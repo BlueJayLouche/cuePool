@@ -1023,6 +1023,9 @@ impl ShowEngine {
             } else if fade_out_secs > 0.0 {
                 let frames = (fade_out_secs * rate as f32) as u32;
                 active.input.start_fade(0.0, frames.max(1), fade_type);
+                // Owned by this stop now; the cue's own tail fade must not
+                // restart it from the pre-fade level.
+                active.fade_out_started = true;
             } else {
                 active.input.set_active(false);
                 active.input.set_volume(0.0);
@@ -1074,6 +1077,7 @@ impl ShowEngine {
             cue.follow_after_last = false;
             if cue.input.is_active() {
                 cue.input.start_fade(0.0, frames.max(1), fade_type);
+                cue.fade_out_started = true;
             } else {
                 // A preloaded input is never rendered; a fade would strand it.
                 cue.input.set_volume(0.0);
@@ -2586,5 +2590,40 @@ mod tests {
                 .all(|cue| cue.state == CueState::Done)
         );
         assert!(engine.active_cues.iter().all(|cue| !cue.input.is_active()));
+    }
+
+    #[test]
+    fn a_faded_stop_owns_the_fade_on_every_instance() {
+        let app = cuepool_gui::CuePoolApp::new();
+        let mut engine = ShowEngine::new(app.state().clone(), None);
+        engine
+            .active_cues
+            .push(sound_instance(Decimal::ONE, 1, 2.0));
+        engine
+            .active_cues
+            .push(sound_instance(Decimal::ONE, 2, 2.0));
+
+        engine.stop_single(Decimal::ONE, StopMode::Immediate, 3.0, Default::default());
+
+        for cue in &engine.active_cues {
+            assert!(cue.input.is_fading(), "stop must start the fade");
+            assert!(cue.fade_out_started, "tail fade must not restart it");
+        }
+    }
+
+    #[test]
+    fn stop_all_faded_marks_every_fade_owned() {
+        let app = cuepool_gui::CuePoolApp::new();
+        let mut engine = ShowEngine::new(app.state().clone(), None);
+        engine
+            .active_cues
+            .push(sound_instance(Decimal::ONE, 1, 2.0));
+        engine
+            .active_cues
+            .push(sound_instance(Decimal::TWO, 2, 2.0));
+
+        engine.stop_all_faded(3.0, Default::default());
+
+        assert!(engine.active_cues.iter().all(|cue| cue.fade_out_started));
     }
 }
