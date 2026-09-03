@@ -12,8 +12,9 @@ brew install ffmpeg
 cargo run --release
 ```
 
-On Windows, `package-windows.ps1` builds and bundles the app with its FFmpeg
-DLLs. You can also open a project straight from the command line:
+On Windows, `package-windows.ps1` bundles a release build with its FFmpeg DLLs
+(build first with `cargo build --release --locked -p cuepool --all-features`,
+with `FFMPEG_DIR` set). You can also open a project straight from the command line:
 
 ```sh
 cargo run --release -- --project MyShow.qproj

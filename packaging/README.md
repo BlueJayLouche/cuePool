@@ -1,4 +1,4 @@
-Icon slots for release packaging (picked up by `.github/workflows/release-apps.yml`):
+Icon slots for release packaging (picked up by `.github/workflows/release.yml`):
 
 - `AppIcon.icns` — macOS bundle icon
 - `icon.ico` — Windows Start-menu shortcut icon

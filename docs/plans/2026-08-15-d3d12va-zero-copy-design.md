@@ -1,5 +1,7 @@
 # D3D12VA zero-copy design (#110 replacement path)
 
+> Written in the rustjay-engine tree before CuePool moved to its own repository on 2026-09-03. Issue numbers refer to BlueJayLouche/rustjay-engine. Paths have been rewritten to this repo's layout; line numbers were not re-verified.
+
 Replaces the experimental D3D11VA→Vulkan keyed-mutex interop (#114 design,
 #118 implementation) with FFmpeg D3D12VA decoding consumed directly by wgpu's
 DX12 backend on one shared `ID3D12Device`. Qualification target is the

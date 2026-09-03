@@ -1,5 +1,7 @@
 # CuePool D3D11 to wgpu zero-copy video design
 
+> Written in the rustjay-engine tree before CuePool moved to its own repository on 2026-09-03. Issue numbers refer to BlueJayLouche/rustjay-engine. Paths have been rewritten to this repo's layout; line numbers were not re-verified.
+
 Issue: [#110](https://github.com/BlueJayLouche/rustjay-engine/issues/110)
 
 ## Decision
@@ -10,13 +12,13 @@ The direct decoder-pool path must remain disabled until those gaps are closed an
 
 ## Verification boundary
 
-The dependency versions are those in `examples/cuepool/Cargo.lock`: `wgpu`, `wgpu-core`, `wgpu-hal`, and `wgpu-types` 29.0.4, plus `ffmpeg-next` and `ffmpeg-sys-next` 8.1.0. `ffmpeg-sys-next` generates bindings against the target's installed FFmpeg headers. The local sysroot selected by `~/sandbox/ap/ashof/cuepool-linux-check.env` contains FFmpeg 6.1.1-3ubuntu5 headers (`libavutil` 58.29.100 and `libavcodec` 60.31.102). This note distinguishes the Rust crate version from that C ABI version.
+The dependency versions are those in `Cargo.lock`: `wgpu`, `wgpu-core`, `wgpu-hal`, and `wgpu-types` 29.0.4, plus `ffmpeg-next` and `ffmpeg-sys-next` 8.1.0. `ffmpeg-sys-next` generates bindings against the target's installed FFmpeg headers. The local sysroot selected by `~/sandbox/ap/ashof/cuepool-linux-check.env` contains FFmpeg 6.1.1-3ubuntu5 headers (`libavutil` 58.29.100 and `libavcodec` 60.31.102). This note distinguishes the Rust crate version from that C ABI version.
 
 Claims labelled **locally verified** were checked in the repository, those registry sources, or the local FFmpeg headers. D3D11 and Vulkan platform claims are labelled **spec-level, unverified locally** because this Linux worktree cannot compile or run the Windows path. The FFmpeg 6.1.1 implementation link is a source cross-check; the struct and function declarations themselves were verified in the local sysroot.
 
 ## Current path and target boundary
 
-`VideoSource::open_with` creates an `AV_HWDEVICE_TYPE_D3D11VA` device, stores it in `AVCodecContext.hw_device_ctx`, and installs `hw_get_format`. The callback only chooses `AV_PIX_FMT_D3D11`, so FFmpeg constructs `hw_frames_ctx` and its texture pool implicitly. `VideoSource::handle_decoded` then calls `av_hwframe_transfer_data`; `plane` calls `to_vec()` for each plane. A bounded channel with `VIDEO_QUEUE_CAP == 3` carries owned CPU frames to `video_consume_thread`. `YuvConverter::upload` writes R8 and RG8 textures, then `YuvConverter::encode` samples those textures into the RGBA canvas. See `examples/cuepool/crates/cuepool-video/src/video_source.rs::{hw_get_format,VideoSource::open_with,VideoSource::handle_decoded,plane}`, `frame.rs::{VideoFrame,FramePixels}`, `yuv_converter.rs::YuvConverter::upload`, and `examples/cuepool/crates/cuepool/src/main.rs::{VIDEO_QUEUE_CAP,video_consume_thread}`. **Locally verified.**
+`VideoSource::open_with` creates an `AV_HWDEVICE_TYPE_D3D11VA` device, stores it in `AVCodecContext.hw_device_ctx`, and installs `hw_get_format`. The callback only chooses `AV_PIX_FMT_D3D11`, so FFmpeg constructs `hw_frames_ctx` and its texture pool implicitly. `VideoSource::handle_decoded` then calls `av_hwframe_transfer_data`; `plane` calls `to_vec()` for each plane. A bounded channel with `VIDEO_QUEUE_CAP == 3` carries owned CPU frames to `video_consume_thread`. `YuvConverter::upload` writes R8 and RG8 textures, then `YuvConverter::encode` samples those textures into the RGBA canvas. See `crates/cuepool-video/src/video_source.rs::{hw_get_format,VideoSource::open_with,VideoSource::handle_decoded,plane}`, `frame.rs::{VideoFrame,FramePixels}`, `yuv_converter.rs::YuvConverter::upload`, and `crates/cuepool/src/main.rs::{VIDEO_QUEUE_CAP,video_consume_thread}`. **Locally verified.**
 
 The target replaces only the D3D11VA plus NV12 payload:
 

@@ -1,10 +1,12 @@
 # CuePool main.rs decomposition plan
 
+> Written in the rustjay-engine tree before CuePool moved to its own repository on 2026-09-03. Issue numbers refer to BlueJayLouche/rustjay-engine. Paths have been rewritten to this repo's layout; line numbers were not re-verified.
+
 Issue: [#125](https://github.com/BlueJayLouche/rustjay-engine/issues/125)
 
 ## Goal
 
-Split `examples/cuepool/crates/cuepool/src/main.rs` (6,337 lines) into cohesive
+Split `crates/cuepool/src/main.rs` (6,337 lines) into cohesive
 modules with **zero behavior change**. Mechanical moves only: no renames beyond
 visibility adjustments (`pub(crate)` where a move requires it), no logic edits,
 no reordering of runtime behavior, no new abstractions. `lighting_engine.rs`,
@@ -18,7 +20,7 @@ than forcing it.
 
 ## Ground rules
 
-- Nested workspace: run everything from `examples/cuepool/`, never the repo root.
+- Run everything from the repo root; it is the Cargo workspace.
 - Gates after every stage (same as CI):
   - `cargo check --workspace --all-targets`
   - `cargo clippy --workspace --all-targets -- -D warnings`

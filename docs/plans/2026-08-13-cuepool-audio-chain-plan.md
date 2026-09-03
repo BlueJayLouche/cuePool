@@ -1,5 +1,7 @@
 # CuePool per-cue DSP chain consolidation plan
 
+> Written in the rustjay-engine tree before CuePool moved to its own repository on 2026-09-03. Issue numbers refer to BlueJayLouche/rustjay-engine. Paths have been rewritten to this repo's layout; line numbers were not re-verified.
+
 Issue: [#126](https://github.com/BlueJayLouche/rustjay-engine/issues/126)
 
 ## Goal
@@ -64,7 +66,7 @@ One library entry point in `cuepool-audio` builds and plays the per-cue chain;
 
 ## Gates
 
-From `examples/cuepool/` (nested workspace — never the repo root), same as CI:
+From the repo root, same as CI:
 
 - `cargo check --workspace --all-targets`
 - `cargo clippy --workspace --all-targets -- -D warnings`
