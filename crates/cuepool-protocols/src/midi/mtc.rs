@@ -278,6 +278,62 @@ pub struct MtcReceiver {
     last_refresh: std::time::Instant,
 }
 
+/// One MIDI message from one port, applied to the shared published state.
+/// Called from the midir callback thread; keep it allocation-free on the
+/// quarter-frame path.
+fn handle_midi_message(
+    msg: &[u8],
+    device: &str,
+    decoder: &mut MtcDecoder,
+    published: &MtcPublished,
+) {
+    if msg.is_empty() {
+        return;
+    }
+    match msg[0] {
+        0xF1 if msg.len() >= 2 => {
+            // Record arrival time before any decode work.
+            published.last_qf_ms.store(now_ms(), Ordering::Release);
+
+            if let Some(tc) = decoder.feed_quarter_frame(msg[1]) {
+                log::debug!("[MTC] {} from {}", tc, device);
+                // Update source device name — try_lock avoids any
+                // block if the reader happens to hold it.
+                if let Ok(mut src) = published.source_device.try_lock()
+                    && src.as_str() != device
+                {
+                    src.clear();
+                    src.push_str(device);
+                }
+                published
+                    .smpte
+                    .store(pack_smpte(&tc, true, true), Ordering::Release);
+            } else {
+                // Running but no complete SMPTE yet — set flags only.
+                published
+                    .smpte
+                    .fetch_or((1u64 << 24) | (1u64 << 25), Ordering::Relaxed);
+            }
+        }
+        0xF0 if msg.len() >= 10 && msg[3] == 0x01 && msg[4] == 0x01 => {
+            if let Some(tc) = MtcDecoder::parse_full_frame(msg) {
+                log::info!("[MTC] Full-frame locate: {} from {}", tc, device);
+                if let Ok(mut src) = published.source_device.try_lock()
+                    && src.as_str() != device
+                {
+                    src.clear();
+                    src.push_str(device);
+                }
+                // Full-frame is a locate — running but not playing.
+                published
+                    .smpte
+                    .store(pack_smpte(&tc, true, false), Ordering::Release);
+            }
+        }
+        _ => {}
+    }
+}
+
 impl MtcReceiver {
     /// Create a receiver and immediately connect to all currently visible ports.
     pub fn new() -> Self {
@@ -340,53 +396,7 @@ impl MtcReceiver {
             let result = input.connect(
                 &port,
                 "cuepool-mtc",
-                move |_, msg, _| {
-                    if msg.is_empty() {
-                        return;
-                    }
-                    match msg[0] {
-                        0xF1 if msg.len() >= 2 => {
-                            // Record arrival time before any decode work.
-                            published.last_qf_ms.store(now_ms(), Ordering::Release);
-
-                            if let Some(tc) = decoder.feed_quarter_frame(msg[1]) {
-                                log::debug!("[MTC] {} from {}", tc, device);
-                                // Update source device name — try_lock avoids any
-                                // block if the reader happens to hold it.
-                                if let Ok(mut src) = published.source_device.try_lock()
-                                    && src.as_str() != device
-                                {
-                                    src.clear();
-                                    src.push_str(&device);
-                                }
-                                published
-                                    .smpte
-                                    .store(pack_smpte(&tc, true, true), Ordering::Release);
-                            } else {
-                                // Running but no complete SMPTE yet — set flags only.
-                                published
-                                    .smpte
-                                    .fetch_or((1u64 << 24) | (1u64 << 25), Ordering::Relaxed);
-                            }
-                        }
-                        0xF0 if msg.len() >= 10 && msg[3] == 0x01 && msg[4] != 0x01 => {
-                            if let Some(tc) = MtcDecoder::parse_full_frame(msg) {
-                                log::info!("[MTC] Full-frame locate: {} from {}", tc, device);
-                                if let Ok(mut src) = published.source_device.try_lock()
-                                    && src.as_str() != device
-                                {
-                                    src.clear();
-                                    src.push_str(&device);
-                                }
-                                // Full-frame is a locate — running but not playing.
-                                published
-                                    .smpte
-                                    .store(pack_smpte(&tc, true, false), Ordering::Release);
-                            }
-                        }
-                        _ => {}
-                    }
-                },
+                move |_, msg, _| handle_midi_message(msg, &device, &mut decoder, &published),
                 (),
             );
 
@@ -550,5 +560,27 @@ mod tests {
         assert!(MtcDecoder::parse_full_frame(&[0xF0, 0x7F]).is_none());
         let wrong_subid = [0xF0, 0x7F, 0x7F, 0x02, 0x01, 0x21, 0x0C, 0x22, 0x04, 0xF7];
         assert!(MtcDecoder::parse_full_frame(&wrong_subid).is_none());
+    }
+
+    #[test]
+    fn a_full_frame_locate_reaches_the_published_state() {
+        let published = MtcPublished::new();
+        let mut decoder = MtcDecoder::new();
+        // F0 7F 7F 01 01 hr mn sc fr F7 — 01:12:34:04 at 25 fps
+        let msg = [0xF0, 0x7F, 0x7F, 0x01, 0x01, 0x21, 0x0C, 0x22, 0x04, 0xF7];
+
+        handle_midi_message(&msg, "Unit MTC", &mut decoder, &published);
+
+        let packed = published.smpte.load(Ordering::Acquire);
+        assert_ne!(packed, 0, "the locate must be published");
+        assert_eq!(published.source_device.lock().unwrap().as_str(), "Unit MTC");
+
+        let (tc, running, playing) = unpack_smpte(packed);
+        assert_eq!(tc.hours, 1);
+        assert_eq!(tc.minutes, 12);
+        assert_eq!(tc.seconds, 34);
+        assert_eq!(tc.frames, 4);
+        assert!(running, "a full-frame locate is running");
+        assert!(!playing, "a full-frame locate is not playing");
     }
 }
