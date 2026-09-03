@@ -130,6 +130,10 @@ pub struct ShowSettings {
     pub audio_output_device: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limiter: Option<AudioLimiterSettings>,
+    /// Master output gain in dB, ahead of the limiter: the room trim. Set in
+    /// Project Settings or by OSC `/qplayer/volume`. 0 = unity.
+    #[serde(default)]
+    pub master_volume_db: f32,
 
     // OSC
     /// Deprecated, superseded by `osc_tx_host`. Never read at runtime: its only
@@ -270,6 +274,7 @@ impl Default for ShowSettings {
             audio_output_driver: AudioOutputDriver::default(),
             audio_output_device: String::new(),
             limiter: None,
+            master_volume_db: 0.0,
             osc_nic: String::new(),
             osc_tx_host: default_osc_tx_host(),
             osc_rx_port: default_osc_rx(),
@@ -472,6 +477,8 @@ impl std::fmt::Display for TimecodeFrameRate {
     }
 }
 
+/// Master-bus limiter. The engine reads `enabled` and `threshold` (dBFS);
+/// the other fields are carried for the show file and not applied yet.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
 pub struct AudioLimiterSettings {
     #[serde(default)]
@@ -484,6 +491,53 @@ pub struct AudioLimiterSettings {
     pub attack: f32,
     #[serde(default)]
     pub release: f32,
+}
+
+impl AudioLimiterSettings {
+    /// Ceiling for a show with no limiter block: just under full scale, and a
+    /// round figure in the unit the settings window shows. (The engine's old
+    /// hard-coded 0.95 linear surfaced as an odd-looking −0.446 dB.)
+    pub const DEFAULT_THRESHOLD_DB: f32 = -0.5;
+}
+
+impl ShowSettings {
+    /// Limiter ceiling in dBFS. A disabled limiter reads as 0 dB, which the
+    /// engine treats as bypass.
+    pub fn limiter_threshold_db(&self) -> f32 {
+        match self.limiter {
+            None => AudioLimiterSettings::DEFAULT_THRESHOLD_DB,
+            Some(limiter) if !limiter.enabled => 0.0,
+            Some(limiter) => limiter.threshold,
+        }
+    }
+
+    pub fn set_limiter_threshold_db(&mut self, db: f32) {
+        let limiter = self.limiter.get_or_insert_default();
+        limiter.enabled = true;
+        limiter.threshold = db;
+    }
+}
+
+#[cfg(test)]
+mod level_tests {
+    use super::*;
+
+    #[test]
+    fn limiter_ceiling_defaults_and_round_trips() {
+        let mut settings = ShowSettings::default();
+        assert_eq!(settings.limiter_threshold_db(), -0.5);
+        settings.set_limiter_threshold_db(-3.0);
+        assert_eq!(settings.limiter_threshold_db(), -3.0);
+        settings.limiter.as_mut().unwrap().enabled = false;
+        assert_eq!(settings.limiter_threshold_db(), 0.0, "disabled = bypass");
+    }
+
+    #[test]
+    fn older_show_files_load_at_unity() {
+        let settings: ShowSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(settings.master_volume_db, 0.0);
+        assert!(settings.limiter.is_none());
+    }
 }
 
 // Default helpers

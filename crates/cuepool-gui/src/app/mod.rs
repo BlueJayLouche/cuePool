@@ -839,7 +839,10 @@ pub enum AppCommand {
         to_idx: usize,
         parent: Option<Decimal>,
     },
-    SetLimiterThreshold(f32),
+    /// Master output gain in dB from OSC `/qplayer/volume`. The Project
+    /// Settings fader edits the show setting directly and re-applies with
+    /// [`AppCommand::ApplyAudioSettings`].
+    SetMasterVolume(f32),
     SetAudioDriver(cuepool_core::AudioOutputDriver),
     SetAudioDevice(String),
     ApplyAudioSettings,
@@ -1572,7 +1575,7 @@ impl CuePoolApp {
         };
         if show_settings {
             let mut settings_changed = false;
-            let mut limiter_cmd: Option<AppCommand> = None;
+            let mut levels_changed = false;
             let mut audio_driver_cmd: Option<AppCommand> = None;
             let mut audio_device_cmd: Option<AppCommand> = None;
             egui::Window::new("Project Settings")
@@ -1588,9 +1591,6 @@ impl CuePoolApp {
                         let ltc_inputs = state.ltc_input_devices.clone();
                         let ltc_outputs = state.ltc_output_devices.clone();
                         let audio_error = state.audio_error.clone();
-                        let threshold = state.command_queue.iter().rev().find_map(|cmd| {
-                            if let AppCommand::SetLimiterThreshold(t) = cmd { Some(*t) } else { None }
-                        }).unwrap_or(0.95);
                         let settings = &mut state.show_file.show_settings;
 
                         egui::CollapsingHeader::new("Show Info").default_open(true).show(ui, |ui| {
@@ -1685,13 +1685,28 @@ impl CuePoolApp {
                                 );
                             }
 
-                            ui.label("Master Limiter Threshold:");
-                            let mut db = 20.0 * threshold.log10();
-                            let response = ui.add(egui::Slider::new(&mut db, -24.0..=0.0).text("dB"));
-                            if response.changed() {
-                                let linear = 10.0f32.powf(db / 20.0);
-                                limiter_cmd = Some(AppCommand::SetLimiterThreshold(linear));
-                            }
+                            ui.horizontal(|ui| {
+                                ui.label("Master Volume:").on_hover_text(
+                                    "Room trim ahead of the limiter — also set by OSC /qplayer/volume",
+                                );
+                                if crate::master_fader::show(ui, &mut settings.master_volume_db) {
+                                    settings_changed = true;
+                                    levels_changed = true;
+                                }
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Master Limiter Threshold:")
+                                    .on_hover_text("Brick-wall ceiling on the master bus");
+                                let mut db = settings.limiter_threshold_db();
+                                if ui
+                                    .add(egui::Slider::new(&mut db, -24.0..=0.0).text("dB").fixed_decimals(1))
+                                    .changed()
+                                {
+                                    settings.set_limiter_threshold_db(db);
+                                    settings_changed = true;
+                                    levels_changed = true;
+                                }
+                            });
                         });
                         ui.separator();
 
@@ -2002,8 +2017,8 @@ impl CuePoolApp {
                 if settings_changed {
                     state.dirty = true;
                 }
-                if let Some(cmd) = limiter_cmd {
-                    state.command_queue.push(cmd);
+                if levels_changed {
+                    state.command_queue.push(AppCommand::ApplyAudioSettings);
                 }
                 if let Some(cmd) = audio_driver_cmd {
                     state.command_queue.push(cmd);
@@ -2735,7 +2750,7 @@ impl CuePoolApp {
     }
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
-        let (active_count, cue_count, show_mode, dirty, video) = {
+        let (active_count, cue_count, show_mode, dirty, video, master_db) = {
             let Ok(state) = self.state.lock() else {
                 return;
             };
@@ -2745,8 +2760,10 @@ impl CuePoolApp {
                 state.show_mode,
                 state.dirty,
                 state.diagnostics.video.clone(),
+                state.show_file.show_settings.master_volume_db,
             )
         };
+        let mut open_settings = false;
 
         ui.horizontal(|ui| {
             // Status text
@@ -2806,6 +2823,30 @@ impl CuePoolApp {
 
                 ui.separator();
 
+                // Master trim, only while it is doing something: a quiet show
+                // should say why on the main screen. Click opens the settings.
+                if master_db != 0.0 {
+                    let text = format!(
+                        "Master {}",
+                        crate::master_fader::format_master_db(master_db)
+                    );
+                    if ui
+                        .add(
+                            egui::Label::new(
+                                egui::RichText::new(text)
+                                    .small()
+                                    .color(egui::Color32::YELLOW),
+                            )
+                            .sense(egui::Sense::click()),
+                        )
+                        .on_hover_text("Master output gain is not 0 dB — Project Settings → Audio")
+                        .clicked()
+                    {
+                        open_settings = true;
+                    }
+                    ui.separator();
+                }
+
                 // Video decode path — the same diagnostic Help → Status carries,
                 // put where an operator will actually notice acceleration going
                 // away. A silent fall back to CPU decode is the difference
@@ -2815,6 +2856,9 @@ impl CuePoolApp {
                     .on_hover_text(video_tip);
             });
         });
+        if open_settings && let Ok(mut state) = self.state.lock() {
+            state.show_settings_window = true;
+        }
     }
 
     /// Gate a destructive command (New / Open) behind the in-app discard modal.

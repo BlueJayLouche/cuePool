@@ -12,6 +12,8 @@
 //!   that submits behind vsync-blocked swapchains).
 
 use cuepool::{EngineAction, EngineCommand, EngineEvent, ShowEngine};
+use cuepool_audio::engine::clamp_master_volume_db;
+use cuepool_audio::mixer::db_to_linear;
 use cuepool_audio::{AudioEngine, QueueOutput};
 use cuepool_core::{
     AudioOutputDriver, CanvasFit, LockExt, MidiTrigger, MidiTriggerKind, SerializedColour,
@@ -501,6 +503,9 @@ struct App {
     // ── app state ──
     cuepool: CuePoolApp,
     profile: AppProfile,
+    /// When to log the master/limiter levels after a change. Debounced so a
+    /// fader drag is one log line, not one per frame.
+    levels_log_due: Option<Instant>,
     show_engine: ShowEngine,
     engine_epoch: Instant,
     window_ids: Option<WindowIds>,
@@ -963,6 +968,7 @@ impl App {
             egui_renderer: None,
             cuepool,
             profile,
+            levels_log_due: None,
             show_engine,
             engine_epoch: Instant::now(),
             window_ids: None,
@@ -2060,9 +2066,45 @@ impl App {
         target.trim() == local_name.trim() || target.trim() == "*"
     }
 
-    /// Apply the project's exact driver/device request. Any failure drops the
-    /// previous stream before reporting the error, so ASIO can never fall back
-    /// to WASAPI or continue through a stale device.
+    /// Master output gain from OSC. The Project Settings fader edits the show
+    /// setting directly and re-applies through `ApplyAudioSettings`; this path
+    /// does the same for a controller, so both end in the show file.
+    fn set_master_volume(&mut self, db: f32) {
+        let db = clamp_master_volume_db(db);
+        {
+            let mut state = self.cuepool.state().lock_unpoisoned();
+            if state.show_file.show_settings.master_volume_db == db {
+                return;
+            }
+            state.show_file.show_settings.master_volume_db = db;
+            state.dirty = true;
+        }
+        self.apply_audio_levels();
+    }
+
+    /// Push the show's master gain and limiter ceiling to the running engine.
+    /// A fresh engine starts at unity and 0.95, so this runs after every
+    /// rebuild and every show load as well as after an edit.
+    fn apply_audio_levels(&mut self) {
+        let (master_db, limiter_db) = {
+            let state = self.cuepool.state().lock_unpoisoned();
+            let settings = &state.show_file.show_settings;
+            (
+                clamp_master_volume_db(settings.master_volume_db),
+                settings.limiter_threshold_db(),
+            )
+        };
+        if let Some(audio) = self.show_engine.audio_engine() {
+            audio.set_master_volume_db(master_db);
+            audio.set_limiter_threshold(db_to_linear(limiter_db));
+        }
+        self.levels_log_due
+            .get_or_insert(Instant::now() + Duration::from_secs(1));
+    }
+
+    /// Apply the project's audio settings: open the requested driver/device if
+    /// it is not already the one running, then push the master and limiter
+    /// levels to whatever engine is running.
     fn apply_audio_settings(&mut self) {
         let (driver, configured_device, audio_ok) = {
             let state = self.cuepool.state().lock_unpoisoned();
@@ -2073,15 +2115,21 @@ impl App {
             )
         };
 
-        if audio_ok
+        let unchanged = audio_ok
             && self.show_engine.audio_engine().is_some_and(|engine| {
                 engine.driver() == driver
                     && (configured_device.is_empty() || configured_device == engine.device_name())
-            })
-        {
-            return;
+            });
+        if !unchanged {
+            self.rebuild_audio_engine(driver, &configured_device);
         }
+        self.apply_audio_levels();
+    }
 
+    /// Drop the current stream and open the exact driver/device request. Any
+    /// failure drops the previous stream before reporting the error, so ASIO
+    /// can never fall back to WASAPI or continue through a stale device.
+    fn rebuild_audio_engine(&mut self, driver: AudioOutputDriver, configured_device: &str) {
         let now = self.engine_now();
         let _ = self.show_engine.command(EngineCommand::Stop, now);
         self.stop_video_playback();
@@ -2089,7 +2137,7 @@ impl App {
         self.stop_external_outputs();
         self.show_engine.replace_audio_engine(None);
 
-        let setup = AudioEngine::configure(driver, &configured_device);
+        let setup = AudioEngine::configure(driver, configured_device);
         if let Some(error) = setup.device_list_error {
             log::error!("Could not list {driver} output devices: {error}");
         }
@@ -2114,14 +2162,14 @@ impl App {
                 log::info!("Applied {driver} audio output configuration");
             }
             Err(error) => {
-                let message = configured_audio_error(driver, &configured_device, &error);
+                let message = configured_audio_error(driver, configured_device, &error);
                 log::error!("{message}; audio playback is disabled");
                 let mut state = self.cuepool.state().lock_unpoisoned();
                 state.audio_devices = devices;
                 state.audio_device_name = if configured_device.is_empty() {
                     "<default>".to_string()
                 } else {
-                    configured_device
+                    configured_device.to_string()
                 };
                 state.audio_error = Some(message);
                 state.show_settings_window = true;
@@ -2999,15 +3047,7 @@ impl App {
                     };
                     let _ = self.execute_show_control(command, event_loop);
                 }
-                AppCommand::SetLimiterThreshold(threshold) => {
-                    if let Some(audio) = self.show_engine.audio_engine() {
-                        audio.set_limiter_threshold(threshold);
-                        log::info!(
-                            "Set master limiter threshold to {:.2} dB",
-                            20.0 * threshold.log10()
-                        );
-                    }
-                }
+                AppCommand::SetMasterVolume(db) => self.set_master_volume(db),
                 AppCommand::SetAudioDriver(driver) => {
                     {
                         let mut state = self.cuepool.state().lock_unpoisoned();
@@ -3468,6 +3508,11 @@ impl App {
                             state.command_queue.push(AppCommand::SaveProject);
                         }
                     }
+                    OscEvent::Volume { db } => {
+                        if let Ok(mut state) = self.cuepool.state().lock() {
+                            state.command_queue.push(AppCommand::SetMasterVolume(db));
+                        }
+                    }
                     OscEvent::DmxChannel {
                         universe,
                         channel,
@@ -3722,6 +3767,16 @@ impl App {
                     _ => {}
                 }
             }
+        }
+
+        if self.levels_log_due.is_some_and(|due| Instant::now() >= due) {
+            self.levels_log_due = None;
+            let (master, limiter) = {
+                let state = self.cuepool.state().lock_unpoisoned();
+                let settings = &state.show_file.show_settings;
+                (settings.master_volume_db, settings.limiter_threshold_db())
+            };
+            log::info!("Master volume {master:+.1} dB, limiter ceiling {limiter:+.1} dB");
         }
 
         // Discovery broadcast every 1 second

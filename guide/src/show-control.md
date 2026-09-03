@@ -22,6 +22,7 @@ controller rigs):
 | `/qplayer/preload` | cue #, time | Decode a cue and hold it Ready |
 | `/qplayer/select` | cue # | Move the selection |
 | `/qplayer/save` | — | Save the project |
+| `/qplayer/volume` | dB (float) | Set the master output gain, −96 (silence) to +12 — the status-bar **Master** fader follows; saved per machine, not with the show |
 
 The cue number can also ride in the address instead of the argument list —
 `/qplayer/go/1.1` is the same command as `/qplayer/go` with `"1.1"` as its
