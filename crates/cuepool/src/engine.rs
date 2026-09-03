@@ -1006,22 +1006,30 @@ impl ShowEngine {
         fade_out_secs: f32,
         fade_type: cuepool_core::FadeType,
     ) {
-        if let Some(index) = self.active_cues.iter().position(|active| active.qid == qid) {
+        // Every playing instance of `qid`, not just the first — a cue fired
+        // twice has two (see `set_volume`).
+        let rate = self.audio_sample_rate();
+        for active in self
+            .active_cues
+            .iter_mut()
+            .filter(|active| active.qid == qid)
+        {
             if mode == StopMode::LoopEnd {
-                self.active_cues[index].pending_stop = Some(PendingStop {
+                active.pending_stop = Some(PendingStop {
                     mode,
                     fade_out_time: fade_out_secs,
                     fade_type,
                 });
             } else if fade_out_secs > 0.0 {
-                let frames = (fade_out_secs * self.audio_sample_rate() as f32) as u32;
-                self.active_cues[index]
-                    .input
-                    .start_fade(0.0, frames.max(1), fade_type);
+                let frames = (fade_out_secs * rate as f32) as u32;
+                active.input.start_fade(0.0, frames.max(1), fade_type);
+                // Owned by this stop now; the cue's own tail fade must not
+                // restart it from the pre-fade level.
+                active.fade_out_started = true;
             } else {
-                self.active_cues[index].input.set_active(false);
-                self.active_cues[index].input.set_volume(0.0);
-                self.active_cues[index].state = CueState::Done;
+                active.input.set_active(false);
+                active.input.set_volume(0.0);
+                active.state = CueState::Done;
             }
         }
         if mode != StopMode::LoopEnd {
@@ -1069,6 +1077,7 @@ impl ShowEngine {
             cue.follow_after_last = false;
             if cue.input.is_active() {
                 cue.input.start_fade(0.0, frames.max(1), fade_type);
+                cue.fade_out_started = true;
             } else {
                 // A preloaded input is never rendered; a fade would strand it.
                 cue.input.set_volume(0.0);
@@ -2533,5 +2542,88 @@ mod tests {
             !stopped.contains(&Decimal::from(9)),
             "another group's member is untouched"
         );
+    }
+
+    fn sound_instance(qid: Decimal, instance_id: u64, fade_out: f32) -> ActiveCue {
+        let input = Arc::new(cuepool_audio::MixerInput::new(
+            Box::new(PositionSource {
+                position: Arc::new(AtomicUsize::new(0)),
+            }),
+            2,
+        ));
+        ActiveCue {
+            instance_id,
+            qid,
+            name: format!("Q{qid} #{instance_id}"),
+            input,
+            state: CueState::Playing,
+            loop_counter: None,
+            video_loop_count: 0,
+            video_loop_limit: None,
+            loop_start_frame: 0,
+            loop_end_frame: 0,
+            fade_out,
+            fade_type: Default::default(),
+            fade_out_started: false,
+            pending_stop: None,
+            follow_after_last: true,
+        }
+    }
+
+    #[test]
+    fn stop_single_stops_every_instance_of_a_retriggered_cue() {
+        let app = cuepool_gui::CuePoolApp::new();
+        let mut engine = ShowEngine::new(app.state().clone(), None);
+        engine
+            .active_cues
+            .push(sound_instance(Decimal::ONE, 1, 0.0));
+        engine
+            .active_cues
+            .push(sound_instance(Decimal::ONE, 2, 0.0));
+
+        engine.stop_single(Decimal::ONE, StopMode::Immediate, 0.0, Default::default());
+
+        assert!(
+            engine
+                .active_cues
+                .iter()
+                .all(|cue| cue.state == CueState::Done)
+        );
+        assert!(engine.active_cues.iter().all(|cue| !cue.input.is_active()));
+    }
+
+    #[test]
+    fn a_faded_stop_owns_the_fade_on_every_instance() {
+        let app = cuepool_gui::CuePoolApp::new();
+        let mut engine = ShowEngine::new(app.state().clone(), None);
+        engine
+            .active_cues
+            .push(sound_instance(Decimal::ONE, 1, 2.0));
+        engine
+            .active_cues
+            .push(sound_instance(Decimal::ONE, 2, 2.0));
+
+        engine.stop_single(Decimal::ONE, StopMode::Immediate, 3.0, Default::default());
+
+        for cue in &engine.active_cues {
+            assert!(cue.input.is_fading(), "stop must start the fade");
+            assert!(cue.fade_out_started, "tail fade must not restart it");
+        }
+    }
+
+    #[test]
+    fn stop_all_faded_marks_every_fade_owned() {
+        let app = cuepool_gui::CuePoolApp::new();
+        let mut engine = ShowEngine::new(app.state().clone(), None);
+        engine
+            .active_cues
+            .push(sound_instance(Decimal::ONE, 1, 2.0));
+        engine
+            .active_cues
+            .push(sound_instance(Decimal::TWO, 2, 2.0));
+
+        engine.stop_all_faded(3.0, Default::default());
+
+        assert!(engine.active_cues.iter().all(|cue| cue.fade_out_started));
     }
 }
