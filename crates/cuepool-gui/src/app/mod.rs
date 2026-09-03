@@ -760,7 +760,7 @@ impl SharedState {
         path: &std::path::Path,
         data: &str,
     ) -> Result<(), serde_json::Error> {
-        let show: ShowFile = serde_json::from_str(data)?;
+        let show = cuepool_core::parse_show_file(data)?;
         self.apply_show_file(path, show);
         Ok(())
     }
@@ -1184,7 +1184,7 @@ impl CuePoolApp {
     }
 
     fn apply_project_text(&mut self, path: &std::path::Path, data: &str) -> Result<(), String> {
-        let show = serde_json::from_str(data)
+        let show = cuepool_core::parse_show_file(data)
             .map_err(|error| format!("failed to parse '{}': {error}", path.display()))?;
         self.apply_project_show(path, show)
     }
@@ -1249,7 +1249,7 @@ pub fn prepare_unattended_project(path: &std::path::Path) -> Result<PreparedProj
             MAX_AUTOMATION_PROJECT_BYTES / 1024 / 1024
         ));
     }
-    let show = serde_json::from_str(&data)
+    let show = cuepool_core::parse_show_file(&data)
         .map_err(|error| format!("failed to parse '{}': {error}", canonical.display()))?;
     Ok(PreparedProject {
         path: canonical,
@@ -2536,7 +2536,7 @@ impl CuePoolApp {
                         // Same deserialize path as OpenProject, minus the replace.
                         match std::fs::read_to_string(&path)
                             .map_err(|e| e.to_string())
-                            .and_then(|data| serde_json::from_str::<ShowFile>(&data).map_err(|e| e.to_string()))
+                            .and_then(|data| cuepool_core::parse_show_file(&data).map_err(|e| e.to_string()))
                         {
                             Ok(show) => {
                                 let name = path
