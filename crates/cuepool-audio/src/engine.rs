@@ -12,7 +12,7 @@ use crate::host::{HostChoice, HostError, host_choice, host_for_driver};
 use crate::limiter_processor::Limiter;
 use crate::loop_processor::LoopProcessor;
 use crate::metering_processor::{MeterData, MeteringProcessor};
-use crate::mixer::{Mixer, MixerInput, RenderCache};
+use crate::mixer::{Mixer, MixerInput, RenderCache, db_to_linear, linear_to_db};
 use crate::resampler::ResamplerProcessor;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SizedSample, SupportedBufferSize};
@@ -132,6 +132,12 @@ fn available_devices(devices: &[AudioDeviceInfo]) -> String {
 fn device_diagnostics(devices: &[AudioDeviceInfo]) -> String {
     format!("{}; {DEVICE_TROUBLESHOOTING}", available_devices(devices))
 }
+
+/// Master gain floor in dB; at or below this the output is silent.
+pub const MASTER_VOLUME_DB_MIN: f32 = -96.0;
+/// Master gain ceiling in dB. Boost is bounded so a fader at full scale on a
+/// quiet show cannot drive the limiter into constant reduction.
+pub const MASTER_VOLUME_DB_MAX: f32 = 12.0;
 
 /// Central audio engine.
 pub struct AudioEngine {
@@ -507,6 +513,21 @@ impl AudioEngine {
             threshold.clamp(0.01, 1.0),
             std::sync::atomic::Ordering::Relaxed,
         );
+    }
+
+    /// Set the master gain in dB, clamped to [`MASTER_VOLUME_DB_MIN`]..=
+    /// [`MASTER_VOLUME_DB_MAX`]. The floor is silence. Applied ahead of the
+    /// limiter; not saved in the show file.
+    pub fn set_master_volume_db(&self, db: f32) {
+        let db = if db.is_nan() { 0.0 } else { db };
+        self.mixer.set_master_volume(db_to_linear(
+            db.clamp(MASTER_VOLUME_DB_MIN, MASTER_VOLUME_DB_MAX),
+        ));
+    }
+
+    /// Current master gain in dB (`-inf` at the floor).
+    pub fn master_volume_db(&self) -> f32 {
+        linear_to_db(self.mixer.master_volume())
     }
 
     /// Read master metering data.

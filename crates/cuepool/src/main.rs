@@ -2087,6 +2087,12 @@ impl App {
         self.stop_video_playback();
         self.set_video_paused(false);
         self.stop_external_outputs();
+        // The master gain is runtime state on the mixer; a device change must
+        // not silently return a room fader to unity.
+        let master_volume_db = self
+            .show_engine
+            .audio_engine()
+            .map(AudioEngine::master_volume_db);
         self.show_engine.replace_audio_engine(None);
 
         let setup = AudioEngine::configure(driver, &configured_device);
@@ -2098,6 +2104,9 @@ impl App {
         match setup.engine {
             Ok(engine) => {
                 let device_name = engine.device_name().to_string();
+                if let Some(db) = master_volume_db {
+                    engine.set_master_volume_db(db);
+                }
                 self.show_engine.replace_audio_engine(Some(engine));
                 let mut state = self.cuepool.state().lock_unpoisoned();
                 state.audio_devices = devices;
@@ -3466,6 +3475,15 @@ impl App {
                     OscEvent::Save => {
                         if let Ok(mut state) = self.cuepool.state().lock() {
                             state.command_queue.push(AppCommand::SaveProject);
+                        }
+                    }
+                    OscEvent::Volume { db } => {
+                        if let Some(audio) = self.show_engine.audio_engine() {
+                            audio.set_master_volume_db(db);
+                            log::info!(
+                                "Set master volume to {:.1} dB (OSC)",
+                                audio.master_volume_db()
+                            );
                         }
                     }
                     OscEvent::DmxChannel {

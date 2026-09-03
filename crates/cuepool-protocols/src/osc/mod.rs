@@ -33,6 +33,11 @@ pub enum OscEvent {
         qid: String,
     },
     Save,
+    /// `/qplayer/volume <dB>` — set the master output gain. Runtime-only; a
+    /// controller re-sends its fader on connect.
+    Volume {
+        db: f32,
+    },
     RemoteDiscovery {
         name: String,
         addr: Option<std::net::SocketAddr>,
@@ -417,6 +422,13 @@ impl OscManager {
             let tx = event_tx.clone();
             r.subscribe("/qplayer/save", move |_msg, _src| {
                 let _ = tx.send(OscEvent::Save);
+            });
+
+            let tx = event_tx.clone();
+            r.subscribe("/qplayer/volume", move |msg, _src| {
+                if let Some(db) = msg.args.first().and_then(arg_to_f32) {
+                    let _ = tx.send(OscEvent::Volume { db });
+                }
             });
 
             // Path form: the cue number as a trailing address segment

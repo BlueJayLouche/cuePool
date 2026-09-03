@@ -269,6 +269,10 @@ pub struct Mixer {
     snapshot_generation: AtomicU64,
     /// Total frames rendered since creation. Used as the audio master clock.
     frame_counter: AtomicU64,
+    /// Master gain (linear, f32::to_bits) applied to the summed output. Sits
+    /// before the limiter in the engine's render path, so the limiter still
+    /// protects the output at any setting.
+    master_volume: AtomicU32,
 }
 
 /// Callback-owned copy of the mixer input list. `Mixer::render` refreshes it
@@ -307,11 +311,24 @@ impl Mixer {
             dirty: AtomicBool::new(false),
             snapshot_generation: AtomicU64::new(0),
             frame_counter: AtomicU64::new(0),
+            master_volume: AtomicU32::new(1.0f32.to_bits()),
         }
     }
 
     pub fn sample_rate(&self) -> u32 {
         self.sample_rate
+    }
+
+    /// Master gain (linear). 1.0 = unity.
+    pub fn master_volume(&self) -> f32 {
+        f32::from_bits(self.master_volume.load(Ordering::Relaxed))
+    }
+
+    /// Set the master gain (linear). Call from the main thread; takes effect on
+    /// the next render.
+    pub fn set_master_volume(&self, gain: f32) {
+        self.master_volume
+            .store(gain.max(0.0).to_bits(), Ordering::Relaxed);
     }
 
     pub fn channels(&self) -> u16 {
@@ -472,6 +489,13 @@ impl Mixer {
                     pan,
                     input.send(),
                 );
+            }
+        }
+
+        let master = self.master_volume();
+        if master != 1.0 {
+            for s in buffer.iter_mut() {
+                *s *= master;
             }
         }
 
@@ -682,6 +706,18 @@ mod tests {
         for s in &output {
             assert!((s - 0.8).abs() < 0.001, "expected 0.8, got {}", s);
         }
+
+        // The master gain scales the sum, not each input.
+        mixer.set_master_volume(0.5);
+        mixer.render(&mut output, &mut RenderCache::new());
+        for s in &output {
+            assert!((s - 0.4).abs() < 0.001, "expected 0.4, got {}", s);
+        }
+
+        // Negative gains clamp to silence rather than inverting phase.
+        mixer.set_master_volume(-1.0);
+        mixer.render(&mut output, &mut RenderCache::new());
+        assert!(output.iter().all(|s| *s == 0.0));
     }
 
     #[test]

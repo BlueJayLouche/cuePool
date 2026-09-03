@@ -3,8 +3,13 @@
 CuePool decodes with [symphonia](https://github.com/pdeljanov/Symphonia)
 (all formats enabled — WAV, FLAC, MP3, OGG/Vorbis, AAC, ALAC, …), resamples
 to the device rate, and mixes every playing cue through a per-cue DSP chain
-(fade → EQ → pan → routing) into a master bus with metering and an optional
-limiter. Output is via cpal.
+(fade → EQ → pan → routing) into a master bus with a master gain, metering,
+and an optional limiter. Output is via cpal.
+
+The master gain defaults to 0 dB and is set over OSC
+([`/qplayer/volume`](show-control.md#osc)) — the hook for a room-wide fader on
+a venue control system. It sits ahead of the limiter and is not saved in the
+show file; each change is reported in *Window → Log*.
 
 ## Project audio settings
 
