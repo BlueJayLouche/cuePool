@@ -51,17 +51,17 @@ CuePool releases on macOS and Windows and is compiled and tested on Linux in CI,
 Run the focused checks first:
 
 ```sh
-cargo test -p cuepool-harness --tests
-cargo test -p cuepool
+cargo test -p cuepool-harness --tests --locked
+cargo test -p cuepool --locked
 ```
 
 Before opening a PR, run:
 
 ```sh
 cargo fmt --all -- --check
-cargo check --workspace --all-targets
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+cargo check --workspace --all-targets --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
 ```
 
 Headless tests cover show logic and decoder timing. They do not prove presentation cadence, vsync behavior, audio-device routing, protocols, lighting hardware, or projector output. Changes at those boundaries still need an attended binary or rig smoke test.
