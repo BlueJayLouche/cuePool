@@ -4,7 +4,7 @@
 //! frames on a background thread, keeping only the latest frame in a shared
 //! slot. Software decode only; audio and other streams are skipped.
 
-use crate::video_source::open_input;
+use crate::video_source::open_input_with_options;
 use ffmpeg_next::format::{self, Pixel};
 use ffmpeg_next::software::scaling;
 use ffmpeg_next::{codec, frame, media::Type};
@@ -32,7 +32,14 @@ impl StreamCapture {
         let stop = Arc::new(AtomicBool::new(false));
         // Open on the calling thread; the interrupt flag also lets Drop abort
         // a blocked open/read.
-        let ictx = open_input(url, Some(&stop))?;
+        // Camera streams only. HLS playlists and RTSP setups may reference
+        // further URLs; the whitelist keeps those on the network too.
+        let mut options = ffmpeg_next::Dictionary::new();
+        options.set(
+            "protocol_whitelist",
+            "rtsp,rtsps,rtp,http,https,tcp,udp,tls,crypto,srtp,hls,applehttp",
+        );
+        let ictx = open_input_with_options(url, &stop, options)?;
 
         let latest = Arc::new(Mutex::new(None));
         let running = Arc::new(AtomicBool::new(true));

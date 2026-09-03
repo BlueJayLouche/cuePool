@@ -28,6 +28,21 @@ use cuepool_video::homography::{apply_3x3, compute_forward_homography, invert_3x
 
 use crate::video_pipeline::CanvasCommand;
 
+/// Stream URLs arrive over unauthenticated OSC. Only network camera schemes
+/// are accepted; anything else (bare paths, `file:`, `concat:`, `subfile:`,
+/// raw `tcp:`/`udp:` ...) would let one datagram point FFmpeg at an
+/// arbitrary local file or host.
+fn is_calibration_url(url: &str) -> bool {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return false;
+    };
+    !rest.is_empty()
+        && matches!(
+            scheme.to_ascii_lowercase().as_str(),
+            "rtsp" | "rtsps" | "http" | "https"
+        )
+}
+
 /// Pattern → capture settle time: the camera needs a few frames of the new
 /// pattern before measurement.
 const SETTLE: Duration = Duration::from_millis(750);
@@ -146,6 +161,15 @@ impl AutoBlend {
 
     /// `/qplayer/projection/autoblend/stream <url>` — (re)start the camera.
     pub(crate) fn stream(&mut self, url: &str) {
+        if !is_calibration_url(url) {
+            log::warn!(
+                "[autoblend] refusing stream URL {url:?}: only rtsp/rtsps/http/https are accepted"
+            );
+            self.capture = None;
+            self.pending = None;
+            self.phase = Phase::Idle;
+            return;
+        }
         self.capture = None; // Drop stops the old decode thread.
         self.pending = None;
         match StreamCapture::start(url) {
@@ -1260,6 +1284,42 @@ mod tests {
             ab.run_queue.is_empty(),
             "failed stream must not queue steps"
         );
+        assert_eq!(ab.phase, Phase::Idle);
+    }
+
+    #[test]
+    fn calibration_urls_are_network_schemes_only() {
+        for ok in [
+            "rtsp://cam.local/live",
+            "RTSPS://cam/1",
+            "http://10.0.0.5/stream.m3u8",
+            "https://x/y",
+        ] {
+            assert!(is_calibration_url(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            "not a url",
+            "/etc/hosts",
+            "file:///etc/hosts",
+            "concat:a|b",
+            "subfile,,start,0,end,1,,:x",
+            "tcp://10.0.0.1:22",
+            "udp://239.0.0.1:1234",
+            "rtsp://",
+        ] {
+            assert!(!is_calibration_url(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn run_with_a_file_url_is_refused_before_ffmpeg() {
+        let mut config = two_output_config();
+        let (tx, _rx) = dummy_tx();
+        let mut ab = AutoBlend::new();
+        ab.run("file:///etc/hosts", None, &mut config, &tx);
+        assert!(ab.capture.is_none());
+        assert!(ab.run_queue.is_empty());
         assert_eq!(ab.phase, Phase::Idle);
     }
 }
