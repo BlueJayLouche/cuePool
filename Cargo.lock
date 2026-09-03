@@ -1386,7 +1386,6 @@ dependencies = [
  "rustjay-lighting",
  "serde",
  "serde_json",
- "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -1400,7 +1399,6 @@ dependencies = [
  "eframe",
  "egui",
  "egui-wgpu",
- "egui-winit",
  "egui_kittest",
  "env_logger",
  "if-addrs",
@@ -1459,7 +1457,6 @@ dependencies = [
  "image",
  "log",
  "pollster 0.3.0",
- "thiserror 2.0.20",
  "wgpu",
  "windows 0.62.2",
  "winit",
