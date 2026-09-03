@@ -263,16 +263,30 @@ fn mode_button_toggles_show_mode() {
 }
 
 #[test]
-fn master_fader_readout_follows_state() {
+fn master_volume_lives_in_project_settings_and_flags_the_status_bar() {
     let (mut harness, state) = demo_harness();
 
-    assert!(harness.query_by_label("Master +0.0 dB").is_some());
+    // At unity the main screen says nothing about it.
+    assert!(harness.query_by_label("Master +0.0 dB").is_none());
 
-    // OSC or a restored setting lands in shared state; the readout must follow
-    // without a local copy going stale.
-    state.lock().unwrap().master_volume_db = -6.0;
+    state.lock().unwrap().show_settings_window = true;
+    harness.run();
+    assert!(
+        harness.query_by_label("+0.0 dB").is_some(),
+        "fader readout under Project Settings → Audio"
+    );
+
+    // A trim from OSC or a loaded show must be visible without opening a
+    // window, and the readout follows the show setting, not a local copy.
+    state
+        .lock()
+        .unwrap()
+        .show_file
+        .show_settings
+        .master_volume_db = -6.0;
     harness.run();
     assert!(harness.query_by_label("Master -6.0 dB").is_some());
+    assert!(harness.query_by_label("-6.0 dB").is_some());
 }
 
 #[test]
@@ -1514,3 +1528,4 @@ fn enter_opens_the_selected_cue_for_renaming() {
         Some(Decimal::new(12, 1))
     );
 }
+

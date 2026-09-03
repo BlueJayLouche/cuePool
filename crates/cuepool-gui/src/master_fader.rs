@@ -1,7 +1,6 @@
-//! Master output fader — the room trim, in the status bar next to the audio
-//! state. Mirrors OSC `/qplayer/volume`; the binary persists it per machine.
+//! Master output fader — the room trim, in Project Settings → Audio under the
+//! limiter. Mirrors OSC `/qplayer/volume`; saved with the show.
 
-use crate::app::{AppCommand, SharedStateHandle};
 use cuepool_audio::engine::{MASTER_VOLUME_DB_MAX, MASTER_VOLUME_DB_MIN};
 use egui::RichText;
 
@@ -19,41 +18,27 @@ fn db_to_fader(db: f32) -> f32 {
     1.0 - ((MASTER_VOLUME_DB_MAX - db) / span).sqrt()
 }
 
-fn format_master_db(db: f32) -> String {
+pub(crate) fn format_master_db(db: f32) -> String {
     if db <= MASTER_VOLUME_DB_MIN {
-        "Master −∞ dB".to_string()
+        "−∞ dB".to_string()
     } else {
-        format!("Master {db:+.1} dB")
+        format!("{db:+.1} dB")
     }
 }
 
-/// Readout then slider, for a right-to-left row: the value sits to the right
-/// of the fader as egui's own sliders do. Queues [`AppCommand::SetMasterVolume`]
-/// on drag, and on double-click (back to 0 dB).
-pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
-    let master_db = match state.lock() {
-        Ok(state) => state.master_volume_db,
-        Err(_) => return,
-    };
-    ui.label(
-        RichText::new(format_master_db(master_db))
-            .small()
-            .monospace(),
-    )
-    .on_hover_text("Master output gain");
-
-    let mut pos = db_to_fader(master_db);
-    ui.spacing_mut().slider_width = 100.0;
+/// Slider plus dB readout bound to a show setting. Returns true when `db`
+/// changed (drag, or double-click back to 0 dB); the caller marks the show
+/// dirty and re-applies the audio levels.
+pub fn show(ui: &mut egui::Ui, db: &mut f32) -> bool {
+    let mut pos = db_to_fader(*db);
+    ui.spacing_mut().slider_width = 160.0;
     let response = ui
         .add(
             egui::Slider::new(&mut pos, 0.0..=1.0)
                 .show_value(false)
                 .trailing_fill(true),
         )
-        .on_hover_text(
-            "Master volume — drag, or double-click for 0 dB.\n\
-             Also set by OSC /qplayer/volume. Saved per machine, not with the show.",
-        );
+        .on_hover_text("Drag, or double-click for 0 dB");
     let new_db = if response.double_clicked() {
         Some(0.0)
     } else if response.changed() {
@@ -61,10 +46,14 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
     } else {
         None
     };
-    if let Some(db) = new_db
-        && let Ok(mut state) = state.lock()
-    {
-        state.command_queue.push(AppCommand::SetMasterVolume(db));
+    ui.label(RichText::new(format_master_db(*db)).monospace())
+        .on_hover_text("Master output gain");
+    match new_db {
+        Some(value) if value != *db => {
+            *db = value;
+            true
+        }
+        _ => false,
     }
 }
 
@@ -90,8 +79,8 @@ mod tests {
 
     #[test]
     fn readout_formats_sign_and_floor() {
-        assert_eq!(format_master_db(0.0), "Master +0.0 dB");
-        assert_eq!(format_master_db(-6.04), "Master -6.0 dB");
-        assert_eq!(format_master_db(-96.0), "Master −∞ dB");
+        assert_eq!(format_master_db(0.0), "+0.0 dB");
+        assert_eq!(format_master_db(-6.04), "-6.0 dB");
+        assert_eq!(format_master_db(-96.0), "−∞ dB");
     }
 }
