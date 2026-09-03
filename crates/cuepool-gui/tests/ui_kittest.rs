@@ -1528,4 +1528,3 @@ fn enter_opens_the_selected_cue_for_renaming() {
         Some(Decimal::new(12, 1))
     );
 }
-
