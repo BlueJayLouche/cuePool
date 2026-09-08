@@ -1,12 +1,12 @@
 mod support;
 
 use cuepool::EngineTrace;
-use cuepool_core::{LoopMode, TriggerMode};
+use cuepool_core::{Cue, LoopMode, StopMode, Timespan, TriggerMode};
 use cuepool_harness::{HeadlessShowRunner, RunnerTrace};
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 use std::fs;
-use support::{Fixture, dummy, hap_video, sound, video};
+use support::{Fixture, base, dummy, hap_video, sound, video};
 
 fn started(trace: &[RunnerTrace]) -> Vec<i64> {
     trace
@@ -26,6 +26,154 @@ fn video_pts(trace: &[RunnerTrace]) -> Vec<f64> {
             _ => None,
         })
         .collect()
+}
+
+fn stop(qid: i64, trigger: TriggerMode, fade_out_time: f32, stop_all: bool) -> Cue {
+    Cue::Stop {
+        base: base(qid, trigger),
+        stop_qid: Decimal::ONE,
+        stop_mode: StopMode::Immediate,
+        fade_out_time,
+        fade_type: Default::default(),
+        stop_all,
+    }
+}
+
+fn terminal_stop_all_keeps_show_clock_stopped(fade_out_time: f32) {
+    for (trigger, grouped) in [
+        (TriggerMode::Go, false),
+        (TriggerMode::WithLast, false),
+        (TriggerMode::AfterLast, false),
+        (TriggerMode::Go, true),
+    ] {
+        let mut bed = sound(1, TriggerMode::Go);
+        bed.base_mut().loop_mode = LoopMode::LoopedInfinite;
+        let mut cues = vec![
+            bed,
+            Cue::TimeCode {
+                base: base(2, TriggerMode::Go),
+                start_time: Timespan::from_secs_f64(0.05),
+                duration: Timespan::ZERO,
+            },
+            dummy(3, TriggerMode::AfterLast),
+        ];
+        let stop_qid = if grouped || trigger != TriggerMode::Go {
+            cues.push(if grouped {
+                Cue::Group {
+                    base: base(4, TriggerMode::Go),
+                }
+            } else {
+                dummy(4, TriggerMode::Go)
+            });
+            5
+        } else {
+            4
+        };
+        let mut ending = stop(stop_qid, trigger, fade_out_time, true);
+        if grouped {
+            ending.base_mut().parent = Some(Decimal::from(4));
+        }
+        cues.push(ending);
+        let mut disabled = dummy(6, TriggerMode::WithLast);
+        disabled.base_mut().enabled = false;
+        cues.push(disabled);
+
+        let fixture = Fixture::new(cues).unwrap();
+        let mut runner = HeadlessShowRunner::open(&fixture.project).unwrap();
+        runner.select(Decimal::ONE).unwrap();
+        runner.go().unwrap();
+        runner.advance_blocks(10).unwrap();
+        assert_eq!(started(&runner.take_trace()), vec![1, 3]);
+        assert!(!runner.snapshot().active_cues.is_empty());
+
+        runner.select(Decimal::from(4)).unwrap();
+        runner.go().unwrap();
+        let clock_at_stop = runner.snapshot().show_elapsed_secs;
+        assert!(started(&runner.take_trace()).contains(&stop_qid));
+        runner.advance_blocks(30).unwrap();
+        let snapshot = runner.snapshot();
+        let replayed = started(&runner.take_trace()).contains(&3);
+        assert_eq!(
+            (clock_at_stop, snapshot.show_elapsed_secs, replayed),
+            (None, None, false),
+            "terminal stop ({trigger:?}, grouped={grouped}) must keep the clock off and timecodes silent"
+        );
+        assert!(snapshot.active_cues.is_empty());
+    }
+}
+
+#[test]
+fn immediate_terminal_stop_all_keeps_show_clock_stopped() {
+    terminal_stop_all_keeps_show_clock_stopped(0.0);
+}
+
+#[test]
+fn faded_terminal_stop_all_keeps_show_clock_stopped() {
+    terminal_stop_all_keeps_show_clock_stopped(0.2);
+}
+
+#[test]
+fn opening_reset_chains_start_playback_with_show_clock_at_zero() {
+    for fade_out_time in [0.0, 0.2] {
+        for trigger in [TriggerMode::WithLast, TriggerMode::AfterLast] {
+            for grouped in [false, true] {
+                let reset_qid = if grouped { 2 } else { 1 };
+                let mut reset = stop(reset_qid, TriggerMode::Go, fade_out_time, true);
+                let mut feature = sound(reset_qid + 1, trigger);
+                feature.base_mut().loop_mode = LoopMode::LoopedInfinite;
+                let mut cues = Vec::new();
+                if grouped {
+                    cues.push(Cue::Group {
+                        base: base(1, TriggerMode::Go),
+                    });
+                    reset.base_mut().parent = Some(Decimal::ONE);
+                    feature.base_mut().parent = Some(Decimal::ONE);
+                }
+                cues.extend([reset, feature]);
+                let fixture = Fixture::new(cues).unwrap();
+                let mut runner = HeadlessShowRunner::open(&fixture.project).unwrap();
+                // Exercise both a fresh show and a RESET during a running show.
+                for _ in 0..2 {
+                    runner.select(Decimal::ONE).unwrap();
+                    runner.go().unwrap();
+                    assert_eq!(runner.snapshot().show_elapsed_secs, Some(0.0));
+                    assert_eq!(
+                        started(&runner.take_trace()),
+                        vec![reset_qid, reset_qid + 1]
+                    );
+                    // Advance past the fade deadline to ensure old cues finishing
+                    // cannot stop the new clock or the new playback instance.
+                    runner.advance_blocks(30).unwrap();
+                    let snapshot = runner.snapshot();
+                    assert_eq!(snapshot.show_elapsed_secs, Some(0.3));
+                    assert_eq!(snapshot.active_cues.len(), 1);
+                    assert_eq!(snapshot.active_cues[0].qid, Decimal::from(reset_qid + 1));
+                    runner.take_trace();
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn targeted_stops_preserve_the_running_show_clock() {
+    for fade_out_time in [0.0, 0.2] {
+        let mut bed = sound(1, TriggerMode::Go);
+        bed.base_mut().loop_mode = LoopMode::LoopedInfinite;
+        let fixture =
+            Fixture::new(vec![bed, stop(2, TriggerMode::Go, fade_out_time, false)]).unwrap();
+        let mut runner = HeadlessShowRunner::open(&fixture.project).unwrap();
+        runner.select(Decimal::ONE).unwrap();
+        runner.go().unwrap();
+        runner.advance_blocks(10).unwrap();
+        assert!(!runner.snapshot().active_cues.is_empty());
+        runner.select(Decimal::TWO).unwrap();
+        runner.go().unwrap();
+        assert_eq!(runner.snapshot().show_elapsed_secs, Some(0.1));
+        runner.advance_blocks(30).unwrap();
+        assert_eq!(runner.snapshot().show_elapsed_secs, Some(0.4));
+        assert!(runner.snapshot().active_cues.is_empty());
+    }
 }
 
 #[test]

@@ -191,6 +191,7 @@ pub struct ShowEngine {
     delayed_cues: Vec<DelayedCue>,
     paused: bool,
     now: Duration,
+    go_in_progress: bool,
     show_start: Option<Duration>,
     show_pause_started: Option<Duration>,
     show_paused_offset: Duration,
@@ -226,6 +227,7 @@ impl ShowEngine {
             delayed_cues: Vec::new(),
             paused: false,
             now: Duration::ZERO,
+            go_in_progress: false,
             show_start: None,
             show_pause_started: None,
             show_paused_offset: Duration::ZERO,
@@ -427,21 +429,11 @@ impl ShowEngine {
             (index, cues)
         };
 
+        self.go_in_progress = true;
         for cue in cues {
             self.play_cue(cue);
         }
-
-        // Arm the show clock *after* the chain has played: shows open with a
-        // stop-all RESET cue, and a stop-all resets the clock — arming first
-        // would hand the show it just started a dead clock (no LTC output, no
-        // timecode triggers). `self.now` is fixed for the whole command, so
-        // the clock still reads zero at the instant the chain fired.
-        if self.show_start.is_none() {
-            self.show_start = Some(self.now);
-            self.show_paused_offset = Duration::ZERO;
-            self.show_adjustment_secs = 0.0;
-            self.show_pause_started = self.paused.then_some(self.now);
-        }
+        self.go_in_progress = false;
 
         let next = {
             let state = self.state.lock_unpoisoned();
@@ -487,6 +479,16 @@ impl ShowEngine {
         let qid = cue.base().qid;
         if !cue.base().retriggerable && self.cue_is_active(qid) {
             return;
+        }
+
+        // Arm before each cue fired by GO, including Group and AfterLast
+        // members. A RESET's next cue restarts the clock at zero; a terminal
+        // stop-all leaves it stopped. Direct Fire and later ticks cannot rearm it.
+        if self.go_in_progress && self.show_start.is_none() {
+            self.show_start = Some(self.now);
+            self.show_paused_offset = Duration::ZERO;
+            self.show_adjustment_secs = 0.0;
+            self.show_pause_started = self.paused.then_some(self.now);
         }
 
         // Routing is resolved before anything is prepared locally: a cue bound to
@@ -2109,8 +2111,8 @@ mod tests {
     }
 
     /// Same guarantee when the RESET fades instead of cutting: the faded
-    /// stop-all resets the clock at fire time, and GO re-arms it after the
-    /// chain — the fade landing later must not touch the new clock.
+    /// stop-all resets the clock at fire time, and its next cue re-arms it —
+    /// the fade landing later must not touch the new clock.
     #[test]
     fn go_through_a_faded_stop_all_reset_still_starts_the_show_clock() {
         let app = reset_then_feature_app(2.0);
