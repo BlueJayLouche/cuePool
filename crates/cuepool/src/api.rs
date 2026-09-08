@@ -677,6 +677,12 @@ struct HealthResponse {
     status: &'static str,
     version: &'static str,
     commit: Option<&'static str>,
+    build_identity: &'static str,
+    source_commit: Option<&'static str>,
+    source_dirty: Option<bool>,
+    version_tag: Option<&'static str>,
+    commits_since_tag: Option<u64>,
+    tag_publication: &'static str,
     pid: u32,
     uptime_seconds: u64,
     profile: String,
@@ -713,7 +719,13 @@ async fn health(State(api): State<ApiState>) -> Result<Json<HealthResponse>, Api
                 "starting"
             },
             version: env!("CARGO_PKG_VERSION"),
-            commit: option_env!("CUEPOOL_BUILD_ID"),
+            commit: cuepool_core::build_identity::BUILD.build_id,
+            build_identity: cuepool_core::build_identity::BUILD.display,
+            source_commit: cuepool_core::build_identity::BUILD.commit,
+            source_dirty: cuepool_core::build_identity::BUILD.dirty,
+            version_tag: cuepool_core::build_identity::BUILD.version_tag,
+            commits_since_tag: cuepool_core::build_identity::BUILD.commits_since_tag,
+            tag_publication: cuepool_core::build_identity::BUILD.publication,
             pid: std::process::id(),
             uptime_seconds: api.started_at.elapsed().as_secs(),
             profile: api.profile.to_string(),
@@ -1444,6 +1456,13 @@ mod tests {
         let health = json(response).await;
         assert_eq!(health["status"], "starting");
         assert_eq!(health["profile"], "default");
+        let build = &cuepool_core::build_identity::BUILD;
+        assert_eq!(health["version"], build.version);
+        assert_eq!(health["commit"], serde_json::json!(build.build_id));
+        assert_eq!(health["source_commit"], serde_json::json!(build.commit));
+        assert_eq!(health["source_dirty"], serde_json::json!(build.dirty));
+        assert_eq!(health["build_identity"], build.display);
+        assert_eq!(health["dirty"], false); // Still the show's dirty state.
         assert_eq!(health["ready"], false);
         assert_eq!(health["control_enabled"], false);
 
