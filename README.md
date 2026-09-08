@@ -348,3 +348,7 @@ space928, renamed to avoid confusion with the original project. It builds on
 Local Cargo builds identify their source automatically. Open Help → Changes for
 embedded notes and the comparison baseline. See [build identity](docs/build-identity.md)
 for overrides, modified checkouts, archives and API compatibility.
+
+Release preparation maintains a reviewable product version and changelog PR.
+See [releases](docs/releases.md) for contributor conventions, GitHub App setup,
+platform gates and safe retries.

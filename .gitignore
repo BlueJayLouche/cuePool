@@ -32,3 +32,6 @@ ffmpeg/
 
 # mdBook output
 guide/book/
+
+# Release tooling bytecode
+__pycache__/
