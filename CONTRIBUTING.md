@@ -50,16 +50,26 @@ requires a graphical desktop and audio output.
 
 Use the MSVC Rust toolchain with the Visual Studio C++ build tools and LLVM
 for bindgen. Download and extract the shared FFmpeg SDK pinned in the
-[release workflow](.github/workflows/release.yml), then set `FFMPEG_DIR` to its
-root directory (containing `bin`, `include`, and `lib`):
+[Windows dependency setup](.github/actions/setup-windows-deps/action.yml), then
+set `FFMPEG_DIR` to its root directory (containing `bin`, `include`, and `lib`):
 
 ```powershell
 $env:FFMPEG_DIR = "C:\path\to\ffmpeg-sdk"
 $env:PATH = "$env:FFMPEG_DIR\bin;$env:PATH"
 ```
 
-Keep the SDK and runtime DLLs from the same FFmpeg build. The release workflow
-pins FFmpeg 8.0 for the Windows D3D12VA zero-copy path's ABI requirements.
+Keep the SDK and runtime DLLs from the same FFmpeg build. The Windows setup
+pins FFmpeg 8.0 for the D3D12VA zero-copy path's ABI requirements.
+
+AprilTag calibration also needs static pthreads. Install it with vcpkg, then
+set the include and library paths to absolute paths in your vcpkg installation:
+
+```powershell
+vcpkg install pthreads:x64-windows-static-md
+$env:APRILTAG_SYS_METHOD = "raw,static"
+$env:APRILTAG_SYS_WINDOWS_PTHREAD_INCLUDE_DIR = "C:\path\to\vcpkg\installed\x64-windows-static-md\include"
+$env:APRILTAG_SYS_WINDOWS_PTHREAD_STATIC_LIB = "C:\path\to\vcpkg\installed\x64-windows-static-md\lib\pthreadVC3.lib"
+```
 
 ### Run
 

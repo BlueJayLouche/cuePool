@@ -111,22 +111,9 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install ffmpeg dylibbundler
 
-      - name: Install FFmpeg SDK (Windows)
+      - name: Install Windows dependencies
         if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          # Pinned to the immutable 8.0 SDK: it matches the FFMPEG_DIR SDK and
-          # runtime DLLs on the venue rigs, and CuePool's D3D12VA layout guard
-          # rejects the 8.1.2+ ABI (struct rework) by design. BtbN's
-          # "n8.1-latest" is a moving target that crossed that rework.
-          curl.exe -L -o "$env:RUNNER_TEMP\ffmpeg.zip" "https://github.com/GyanD/codexffmpeg/releases/download/8.0/ffmpeg-8.0-full_build-shared.zip"
-          # Digest recorded 2026-09-04 against the URL above.
-          $expected = "d2bfb598ec5d8d69c86cb198decc829fefb2c0acaa7ddd27ab5348139cce3dea"
-          $actual = (Get-FileHash "$env:RUNNER_TEMP\ffmpeg.zip" -Algorithm SHA256).Hash.ToLower()
-          if ($actual -ne $expected) { throw "ffmpeg-8.0 SDK digest mismatch: $actual" }
-          Expand-Archive "$env:RUNNER_TEMP\ffmpeg.zip" -DestinationPath "$env:RUNNER_TEMP\ffmpeg"
-          $dir = Get-ChildItem "$env:RUNNER_TEMP\ffmpeg" -Directory | Select-Object -First 1
-          "FFMPEG_DIR=$($dir.FullName)" >> $env:GITHUB_ENV
+        uses: ./.github/actions/setup-windows-deps
 
       - name: Build identity from Cargo and Git
         shell: bash

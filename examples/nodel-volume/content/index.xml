@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<?xml-stylesheet type="text/xsl" href="v1/index.xsl"?>
+<pages title="CuePool volume" js="volume.js">
+  <page title="Audio">
+    <row>
+      <column xs="12" sm="6">
+        <title>Master volume</title>
+        <!-- Custom JS handles input and confirmation; deliberately no event
+             binding that could overwrite a drag before its final reply. -->
+        <range action="Volume" min="-96" max="12" step="0.5"/>
+      </column>
+    </row>
+  </page>
+</pages>

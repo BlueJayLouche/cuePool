@@ -66,6 +66,25 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
 
+  cuepool-windows:
+    name: CuePool (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.source_ref || github.sha }}
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master (toolchain: 1.97.1)
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/setup-windows-deps
+      # Match the release build so Windows failures are caught before tagging.
+      - run: cargo build --release --locked -p cuepool --all-features
+      - name: Test AprilTag calibration
+        run: cargo test --release --locked -p cuepool-video --lib calibration::detect::tests::apriltag_roundtrip_synthetic_frame -- --exact
+
   cuepool-mcp:
     name: CuePool MCP (Node 20)
     runs-on: ubuntu-latest

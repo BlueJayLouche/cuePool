@@ -22,7 +22,7 @@ your first show.
 | Left | **Active Cues** — every playing cue with state, volume meter, and a progress bar (`elapsed / total  −remaining`; yellow = paused) |
 | Center | **Cue list** — the show, in playback order. The standby cue (what GO will fire) carries a chevron in the left gutter and an outlined row; playing cues are green with a ▶ marker, paused cues amber, idle standby blue |
 | Right | **Inspector** — full editor for the selected cue |
-| Bottom | Status bar — playing-cue count, mode, cue total, unsaved marker, **master fader**, and the live **Video** / **Audio** indicators |
+| Bottom | Status bar — playing-cue count, mode, cue total, unsaved marker, nonzero **master gain** indicator, and the live **Video** / **Audio** indicators |
 
 Extra panels live in the **Window** menu: Log, Waveform, Video Output,
 Projection Mapping, and Lighting.
