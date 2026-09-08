@@ -393,6 +393,57 @@ fn osc_take_file_name(name: &str) -> Option<String> {
     Some(file)
 }
 
+/// Wall-clock triggers due at `now`. A trigger is due when the clock is
+/// within a second of its target and it has not already fired for that
+/// target today (`fired` holds the last (date, target) each cue fired for).
+/// Comparing against the *target* rather than a cooldown closes the window
+/// where a cooldown expired while the clock was still within a second of
+/// the target, which fired the cue twice.
+fn due_wall_clock_cues(
+    cues: &[cuepool_core::Cue],
+    today: chrono::NaiveDate,
+    now: chrono::NaiveTime,
+    fired: &std::collections::HashMap<
+        rust_decimal::Decimal,
+        (chrono::NaiveDate, chrono::NaiveTime),
+    >,
+) -> Vec<(rust_decimal::Decimal, chrono::NaiveTime, String)> {
+    cues.iter()
+        .filter(|c| c.enabled())
+        .filter_map(|c| {
+            let trigger = c.base().triggers.wall_clock.as_ref()?;
+            let target = chrono::NaiveTime::parse_from_str(&trigger.time, "%H:%M:%S")
+                .or_else(|_| chrono::NaiveTime::parse_from_str(&trigger.time, "%I:%M:%S %p"))
+                .ok()?;
+            if now.signed_duration_since(target).num_seconds().abs() > 1 {
+                return None;
+            }
+            let qid = c.base().qid;
+            match (fired.get(&qid), trigger.repeat) {
+                (Some(_), cuepool_core::RepeatMode::Once) => None,
+                (Some((date, at)), _) if *date == today && *at == target => None,
+                _ => Some((qid, target, trigger.time.clone())),
+            }
+        })
+        .collect()
+}
+
+/// Timecode triggers due at `elapsed` show seconds that have not fired.
+fn due_timecode_cues(
+    cues: &[cuepool_core::Cue],
+    elapsed: f64,
+    fired: &std::collections::HashSet<rust_decimal::Decimal>,
+) -> Vec<(rust_decimal::Decimal, f64)> {
+    cues.iter()
+        .filter(|c| c.enabled())
+        .filter_map(|c| {
+            let target = c.base().triggers.timecode.as_ref()?.time.as_secs_f64();
+            let qid = c.base().qid;
+            (elapsed >= target && !fired.contains(&qid)).then_some((qid, target))
+        })
+        .collect()
+}
+
 fn clamp_video_seek_secs(target: f64, length_secs: Option<f64>) -> f64 {
     match length_secs.filter(|length| length.is_finite() && *length > 0.0) {
         Some(length) => target.min(length.next_down()),
@@ -661,7 +712,8 @@ struct App {
     current_pixmap_qid: Option<rust_decimal::Decimal>,
 
     // ── trigger state ──
-    wall_clock_fired: std::collections::HashMap<rust_decimal::Decimal, Instant>,
+    wall_clock_fired:
+        std::collections::HashMap<rust_decimal::Decimal, (chrono::NaiveDate, chrono::NaiveTime)>,
     timecode_fired: std::collections::HashSet<rust_decimal::Decimal>,
 
     // ── polish ──
@@ -3355,42 +3407,22 @@ impl App {
     /// Poll wall-clock triggers and fire any cue whose scheduled time has arrived.
     fn poll_wall_clock_triggers(&mut self, event_loop: &ActiveEventLoop) {
         let now = chrono::Local::now();
-        let current = now.time();
-        let cues: Vec<_> = {
+        let due = {
             let Ok(state) = self.cuepool.state().lock() else {
                 return;
             };
-            state
-                .show_file
-                .cues
-                .iter()
-                .filter(|c| c.enabled())
-                .cloned()
-                .collect()
+            due_wall_clock_cues(
+                &state.show_file.cues,
+                now.date_naive(),
+                now.time(),
+                &self.wall_clock_fired,
+            )
         };
-
-        for cue in cues {
-            let Some(trigger) = cue.base().triggers.wall_clock.as_ref() else {
-                continue;
-            };
-            let parsed = chrono::NaiveTime::parse_from_str(&trigger.time, "%H:%M:%S")
-                .or_else(|_| chrono::NaiveTime::parse_from_str(&trigger.time, "%I:%M:%S %p"));
-            let Ok(target) = parsed else { continue };
-
-            let diff = current.signed_duration_since(target).num_seconds().abs();
-            if diff <= 1 {
-                let qid = cue.base().qid;
-                let should_fire = self
-                    .wall_clock_fired
-                    .get(&qid)
-                    .map(|t| t.elapsed() > Duration::from_secs(2))
-                    .unwrap_or(true);
-                if should_fire {
-                    log::info!("Wall-clock trigger fired Q{} at {}", qid, trigger.time);
-                    self.wall_clock_fired.insert(qid, Instant::now());
-                    self.play_cue_by_qid(qid, event_loop);
-                }
-            }
+        for (qid, target, text) in due {
+            log::info!("Wall-clock trigger fired Q{} at {}", qid, text);
+            self.wall_clock_fired
+                .insert(qid, (now.date_naive(), target));
+            self.play_cue_by_qid(qid, event_loop);
         }
     }
 
@@ -3449,36 +3481,27 @@ impl App {
             state.pending_timecode_capture = None;
         }
 
-        let cues: Vec<_> = {
+        let due = {
             let Ok(state) = self.cuepool.state().lock() else {
                 return;
             };
-            state.show_file.cues.clone()
+            unlatch_rewound_timecode_triggers(
+                &mut self.timecode_fired,
+                &state.show_file.cues,
+                elapsed,
+            );
+            // Frozen clock: never fire while paused (a just-captured or
+            // stepped-past trigger would fire instantly). Anything passed by
+            // stepping fires on resume.
+            if self.paused {
+                return;
+            }
+            due_timecode_cues(&state.show_file.cues, elapsed, &self.timecode_fired)
         };
-
-        unlatch_rewound_timecode_triggers(&mut self.timecode_fired, &cues, elapsed);
-
-        // Frozen clock: never fire while paused (a just-captured or stepped-past
-        // trigger would fire instantly). Anything passed by stepping fires on
-        // resume.
-        if self.paused {
-            return;
-        }
-
-        for cue in cues {
-            if !cue.enabled() {
-                continue;
-            }
-            let Some(trigger) = cue.base().triggers.timecode.as_ref() else {
-                continue;
-            };
-            let qid = cue.base().qid;
-            let target = trigger.time.as_secs_f64();
-            if elapsed >= target && !self.timecode_fired.contains(&qid) {
-                log::info!("Timecode trigger fired Q{} at {:.2}s", qid, target);
-                self.timecode_fired.insert(qid);
-                self.play_cue_by_qid(qid, event_loop);
-            }
+        for (qid, target) in due {
+            log::info!("Timecode trigger fired Q{} at {:.2}s", qid, target);
+            self.timecode_fired.insert(qid);
+            self.play_cue_by_qid(qid, event_loop);
         }
     }
 
@@ -5670,6 +5693,95 @@ mod tests {
         };
         unlatch_rewound_timecode_triggers(&mut fired, &[plain], 42.0);
         assert!(fired.is_empty());
+    }
+
+    fn wall_clock_cue(qid: i64, time: &str, repeat: cuepool_core::RepeatMode) -> cuepool_core::Cue {
+        let mut base = cuepool_core::CueBase {
+            qid: rust_decimal::Decimal::from(qid),
+            ..Default::default()
+        };
+        base.triggers.wall_clock = Some(cuepool_core::WallClockTrigger {
+            time: time.to_string(),
+            mode: Default::default(),
+            repeat,
+        });
+        cuepool_core::Cue::Dummy { base }
+    }
+
+    #[test]
+    fn a_wall_clock_trigger_fires_once_per_target_even_across_the_whole_window() {
+        use chrono::{NaiveDate, NaiveTime};
+        let qid = rust_decimal::Decimal::from(3);
+        let cues = vec![wall_clock_cue(
+            3,
+            "20:00:00",
+            cuepool_core::RepeatMode::Daily,
+        )];
+        let today = NaiveDate::from_ymd_opt(2026, 9, 3).unwrap();
+        let target = NaiveTime::from_hms_opt(20, 0, 0).unwrap();
+        let mut fired = std::collections::HashMap::new();
+
+        // 1.9 s early: inside the window, fires.
+        let early = NaiveTime::from_hms_milli_opt(19, 59, 58, 100).unwrap();
+        let due = due_wall_clock_cues(&cues, today, early, &fired);
+        assert_eq!(due.len(), 1);
+        fired.insert(qid, (today, target));
+
+        // 1.5 s late: still inside the window; the old cooldown would refire.
+        let late = NaiveTime::from_hms_milli_opt(20, 0, 1, 500).unwrap();
+        assert!(due_wall_clock_cues(&cues, today, late, &fired).is_empty());
+
+        // Next day, same time: fires again (Daily).
+        let tomorrow = today.succ_opt().unwrap();
+        assert_eq!(
+            due_wall_clock_cues(&cues, tomorrow, target, &fired).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_once_wall_clock_trigger_never_fires_a_second_day() {
+        use chrono::{NaiveDate, NaiveTime};
+        let qid = rust_decimal::Decimal::from(3);
+        let cues = vec![wall_clock_cue(
+            3,
+            "20:00:00",
+            cuepool_core::RepeatMode::Once,
+        )];
+        let today = NaiveDate::from_ymd_opt(2026, 9, 3).unwrap();
+        let target = NaiveTime::from_hms_opt(20, 0, 0).unwrap();
+        let fired = std::collections::HashMap::from([(qid, (today, target))]);
+        let tomorrow = today.succ_opt().unwrap();
+        assert!(due_wall_clock_cues(&cues, tomorrow, target, &fired).is_empty());
+    }
+
+    #[test]
+    fn twelve_hour_and_disabled_wall_clock_triggers_are_handled() {
+        use chrono::{NaiveDate, NaiveTime};
+        let mut disabled = wall_clock_cue(4, "08:00:00 PM", cuepool_core::RepeatMode::Daily);
+        disabled.base_mut().enabled = false;
+        let cues = vec![
+            wall_clock_cue(3, "08:00:00 PM", cuepool_core::RepeatMode::Daily),
+            disabled,
+        ];
+        let today = NaiveDate::from_ymd_opt(2026, 9, 3).unwrap();
+        let at = NaiveTime::from_hms_opt(20, 0, 0).unwrap();
+        let due = due_wall_clock_cues(&cues, today, at, &Default::default());
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].0, rust_decimal::Decimal::from(3));
+    }
+
+    #[test]
+    fn timecode_triggers_come_due_once_and_skip_disabled_cues() {
+        let mut off = timecode_cue(8, 2.0);
+        off.base_mut().enabled = false;
+        let cues = vec![timecode_cue(7, 5.0), off, timecode_cue(9, 9.0)];
+        let mut fired = std::collections::HashSet::new();
+        assert!(due_timecode_cues(&cues, 4.9, &fired).is_empty());
+        let due = due_timecode_cues(&cues, 5.0, &fired);
+        assert_eq!(due, vec![(rust_decimal::Decimal::from(7), 5.0)]);
+        fired.insert(rust_decimal::Decimal::from(7));
+        assert!(due_timecode_cues(&cues, 6.0, &fired).is_empty());
     }
 
     #[test]
