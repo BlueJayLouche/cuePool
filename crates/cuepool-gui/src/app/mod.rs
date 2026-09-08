@@ -846,6 +846,11 @@ pub enum AppCommand {
     /// Settings fader edits the show setting directly and re-applies with
     /// [`AppCommand::ApplyAudioSettings`].
     SetMasterVolume(f32),
+    /// Reply from the application queue, after preceding volume changes.
+    QueryMasterVolume {
+        reply_to: std::net::SocketAddr,
+        request_id: i32,
+    },
     SetAudioDriver(cuepool_core::AudioOutputDriver),
     SetAudioDevice(String),
     ApplyAudioSettings,

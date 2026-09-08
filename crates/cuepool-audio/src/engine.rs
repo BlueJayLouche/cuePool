@@ -527,7 +527,7 @@ impl AudioEngine {
 
     /// Set the master gain in dB, clamped to [`MASTER_VOLUME_DB_MIN`]..=
     /// [`MASTER_VOLUME_DB_MAX`]. The floor is silence. Applied ahead of the
-    /// limiter. Persistence is the binary's job (per-machine settings).
+    /// limiter. The application stores this value in the show settings.
     pub fn set_master_volume_db(&self, db: f32) {
         self.mixer
             .set_master_volume(db_to_linear(clamp_master_volume_db(db)));

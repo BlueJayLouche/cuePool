@@ -12,8 +12,6 @@
 //!   that submits behind vsync-blocked swapchains).
 
 use cuepool::{EngineAction, EngineCommand, EngineEvent, ShowEngine};
-use cuepool_audio::engine::clamp_master_volume_db;
-use cuepool_audio::mixer::db_to_linear;
 use cuepool_audio::{AudioEngine, QueueOutput};
 use cuepool_core::{
     AudioOutputDriver, CanvasFit, LockExt, MidiTrigger, MidiTriggerKind, SerializedColour,
@@ -2143,37 +2141,12 @@ impl App {
         target.trim() == local_name.trim() || target.trim() == "*"
     }
 
-    /// Master output gain from OSC. The Project Settings fader edits the show
-    /// setting directly and re-applies through `ApplyAudioSettings`; this path
-    /// does the same for a controller, so both end in the show file.
-    fn set_master_volume(&mut self, db: f32) {
-        let db = clamp_master_volume_db(db);
-        {
-            let mut state = self.cuepool.state().lock_unpoisoned();
-            if state.show_file.show_settings.master_volume_db == db {
-                return;
-            }
-            state.show_file.show_settings.master_volume_db = db;
-            state.dirty = true;
-        }
-        self.apply_audio_levels();
-    }
-
     /// Push the show's master gain and limiter ceiling to the running engine.
     /// A fresh engine starts at unity and 0.95, so this runs after every
     /// rebuild and every show load as well as after an edit.
     fn apply_audio_levels(&mut self) {
-        let (master_db, limiter_db) = {
-            let state = self.cuepool.state().lock_unpoisoned();
-            let settings = &state.show_file.show_settings;
-            (
-                clamp_master_volume_db(settings.master_volume_db),
-                settings.limiter_threshold_db(),
-            )
-        };
         if let Some(audio) = self.show_engine.audio_engine() {
-            audio.set_master_volume_db(master_db);
-            audio.set_limiter_threshold(db_to_linear(limiter_db));
+            cuepool::master_volume::apply_to_engine(self.cuepool.state(), audio);
         }
         self.levels_log_due
             .get_or_insert(Instant::now() + Duration::from_secs(1));
@@ -3109,6 +3082,21 @@ impl App {
         // <show.qproj>` startup loads and OSC-triggered saves (#138).
         let state = Arc::clone(self.cuepool.state());
         drain_app_commands(&state, |cmd| {
+            let cmd =
+                match cuepool::master_volume::process(&state, cmd, || self.apply_audio_levels()) {
+                    Ok(reply) => {
+                        if let Some((destination, message)) = reply
+                            && let Some(osc) = &self.osc_manager
+                            && let Err(error) = osc.send_to(message, destination)
+                        {
+                            log::warn!(
+                                "Could not send master-volume feedback to {destination}: {error}"
+                            );
+                        }
+                        return Ok(());
+                    }
+                    Err(cmd) => cmd,
+                };
             match cmd {
                 AppCommand::Go => {
                     let _ = self.execute_show_control(ShowControlCommand::Go, event_loop);
@@ -3124,7 +3112,6 @@ impl App {
                     };
                     let _ = self.execute_show_control(command, event_loop);
                 }
-                AppCommand::SetMasterVolume(db) => self.set_master_volume(db),
                 AppCommand::SetAudioDriver(driver) => {
                     {
                         let mut state = self.cuepool.state().lock_unpoisoned();
@@ -3510,6 +3497,10 @@ impl App {
         if let Some(rx) = &self.osc_rx {
             while let Ok(ev) = rx.try_recv() {
                 log::debug!("OSC event: {ev:?}");
+                let ev = match cuepool::master_volume::enqueue(self.cuepool.state(), ev) {
+                    Ok(()) => continue,
+                    Err(ev) => ev,
+                };
                 match ev {
                     OscEvent::Go { qid } => {
                         if let Some(qid_str) = qid
@@ -3554,11 +3545,6 @@ impl App {
                     OscEvent::Save => {
                         if let Ok(mut state) = self.cuepool.state().lock() {
                             state.command_queue.push(AppCommand::SaveProject);
-                        }
-                    }
-                    OscEvent::Volume { db } => {
-                        if let Ok(mut state) = self.cuepool.state().lock() {
-                            state.command_queue.push(AppCommand::SetMasterVolume(db));
                         }
                     }
                     OscEvent::DmxChannel {
