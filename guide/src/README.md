@@ -11,21 +11,18 @@ Under the hood: audio decode via symphonia with a custom DSP chain on cpal,
 video via FFmpeg with GPU YUV→RGB conversion, DMX over sACN or Art-Net, and
 OSC / MIDI show control.
 
-Build and run it with:
-
-```sh
-cargo run --release
-```
+Start with [Getting Started](getting-started.md) to build the app and program
+your first show.
 
 ## The main window
 
 | Area | What it is |
 |---|---|
-| Top | Menu bar + transport (GO / Stop / Pause, master meter) |
+| Top | Menu bar + transport (GO / Stop / Pause, standby readout, master meter) |
 | Left | **Active Cues** — every playing cue with state, volume meter, and a progress bar (`elapsed / total  −remaining`; yellow = paused) |
-| Center | **Cue list** — the show, in playback order |
+| Center | **Cue list** — the show, in playback order. The standby cue (what GO will fire) carries a chevron in the left gutter and an outlined row; playing cues are green with a ▶ marker, paused cues amber, idle standby blue |
 | Right | **Inspector** — full editor for the selected cue |
-| Bottom | Status bar — playback state, cue count, nonzero **master gain** indicator, audio and video status |
+| Bottom | Status bar — playing-cue count, mode, cue total, unsaved marker, nonzero **master gain** indicator, and the live **Video** / **Audio** indicators |
 
 Extra panels live in the **Window** menu: Log, Waveform, Video Output,
 Projection Mapping, and Lighting.
@@ -44,6 +41,9 @@ backup every 60 seconds, rotating through five slots
 and a crash handler saves `crash_recovery.qproj` on the way down. *File →
 Pack…* copies all referenced media next to the project file for touring.
 
+OSC receive/transmit ports and the network interface live in
+[Project Settings](show-control.md#osc) (defaults: receive 9000, transmit 8000).
+
 ## Chapters
 
 - [Getting Started](getting-started.md) — build, run, and program your first show
@@ -53,13 +53,10 @@ Pack…* copies all referenced media next to the project file for touring.
 - [Lighting & Pixel Mapping](lighting.md) — DMX patch, lighting cues, and LED segments
 - [Show Control](show-control.md) — OSC, MIDI/MSC, hotkeys, timecode, and remote nodes
 
-## Where to look (for developers)
+## Developer documentation
 
-| Area | Crate / module |
-|---|---|
-| App binary, event loop, playback engine | `crates/cuepool/src/main.rs` |
-| Cue model, show file, projection & lighting config | `crates/cuepool-core` |
-| Audio engine (decode, DSP, mixer) | `crates/cuepool-audio` |
-| Video decode + projection renderer | `crates/cuepool-video` |
-| egui panels (cue list, inspector, transport, …) | `crates/cuepool-gui` |
-| OSC, MIDI, and MSC | `crates/cuepool-protocols` |
+See [Contributing](https://github.com/BlueJayLouche/cuePool/blob/main/CONTRIBUTING.md)
+for build requirements, checks, and a map of the codebase. The
+[automation API](https://github.com/BlueJayLouche/cuePool/blob/main/docs/AUTOMATION.md)
+and [pixel feed](https://github.com/BlueJayLouche/cuePool/blob/main/docs/PIXEL_FEED.md)
+have separate references.
