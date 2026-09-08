@@ -13,7 +13,13 @@ plus OSC/MIDI show control, projection-mapped video outputs, and lighting cues
   - macOS: `brew install ffmpeg` (add `dylibbundler` for a shareable `.app`).
   - Ubuntu/Debian: `sudo apt-get install libasound2-dev libudev-dev pkg-config clang libavcodec-dev libavformat-dev libavutil-dev libavfilter-dev libavdevice-dev libswscale-dev libswresample-dev`
   - Windows: the FFmpeg 8.0 shared SDK, with `FFMPEG_DIR` pointing at its
-    root (see `.github/workflows/release.yml` for the exact archive).
+    root (see `.github/actions/setup-windows-deps/action.yml` for the exact archive).
+    AprilTag calibration also needs `vcpkg install pthreads:x64-windows-static-md`.
+    Set `APRILTAG_SYS_METHOD=raw,static`,
+    `APRILTAG_SYS_WINDOWS_PTHREAD_INCLUDE_DIR` to vcpkg's
+    `installed\x64-windows-static-md\include`, and
+    `APRILTAG_SYS_WINDOWS_PTHREAD_STATIC_LIB` to
+    `installed\x64-windows-static-md\lib\pthreadVC3.lib` (both absolute paths).
 - Build and test with `--locked` so `Cargo.lock` stays authoritative:
   `cargo build --release --locked`.
 
