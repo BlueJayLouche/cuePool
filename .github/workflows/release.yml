@@ -4,9 +4,9 @@ name: Release
 #   macOS   -> .app bundle in a .dmg (ad-hoc signed)
 #   Windows -> portable .zip + .msi installer (WiX, Start-menu shortcut)
 #
-# Trigger: push a tag like `v0.11.0`, or run manually (workflow_dispatch).
-# With `release_tag` empty a manual run is a dry run (artifacts only); set it
-# to an existing v* tag to re-release — same-name assets are replaced.
+# Product version changes on main create a candidate. Manual runs without a
+# release_tag are artifacts-only dry runs. Tags and retries use the same gate.
+# This workflow alone owns publication and published/v* receipts.
 #
 # Icon slots, picked up automatically if present:
 #   packaging/AppIcon.icns -> macOS bundle icon
@@ -17,22 +17,74 @@ name: Release
 
 on:
   push:
+    branches: [main]
     tags: ["v*"]
   workflow_dispatch:
     inputs:
       release_tag:
-        description: "Existing v* tag to attach the packages to (empty = artifacts-only dry run)"
+        description: "Existing vX.Y.Z tag to release or retry (empty = artifacts-only dry run)"
         default: ""
 
+concurrency:
+  group: cuepool-release
+  queue: max
+  cancel-in-progress: false
+
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
   DISPLAY_NAME: CuePool
 
 jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      active: ${{ steps.candidate.outputs.active }}
+      published: ${{ steps.candidate.outputs.published }}
+      tag: ${{ steps.candidate.outputs.tag }}
+      sha: ${{ steps.candidate.outputs.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.release_tag || github.sha }}
+          fetch-depth: 0
+      - id: candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: python3 .github/scripts/release.py candidate
+
+  verify:
+    needs: prepare
+    if: needs.prepare.outputs.active == 'true'
+    uses: ./.github/workflows/ci.yml
+    with:
+      source_ref: ${{ needs.prepare.outputs.sha }}
+
+  tag:
+    needs: [prepare, verify]
+    if: needs.prepare.outputs.active == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+      - name: Create immutable candidate tag after verification
+        if: needs.prepare.outputs.tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          SOURCE_SHA: ${{ needs.prepare.outputs.sha }}
+        run: python3 .github/scripts/release.py tag --tag "$RELEASE_TAG" --sha "$SOURCE_SHA"
+      # GITHUB_TOKEN-created tags do not trigger push workflows. The build job
+      # below explicitly continues this workflow, so no token-trigger assumption.
+
   build:
+    needs: [prepare, verify, tag]
     name: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -41,6 +93,9 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          fetch-depth: 0
 
       # dtolnay/rust-toolchain publishes per-version refs (like `1.97.1`) only
       # as branches, which can be force-pushed and orphan their old commits.
@@ -65,7 +120,6 @@ jobs:
         run: |
           package_id="$(cargo pkgid -p cuepool)"
           echo "VERSION=${package_id##*#}" >> "$GITHUB_ENV"
-          echo "CUEPOOL_BUILD_ID=$(git rev-parse --short=7 HEAD)" >> "$GITHUB_ENV"
 
       - name: Build
         run: cargo build --release --locked -p cuepool --all-features
@@ -96,6 +150,8 @@ jobs:
           codesign --force --deep -s - "$APP"
           hdiutil create -volname "$DISPLAY_NAME" -srcfolder "$APP" -ov -format UDZO \
             out/cuepool-macos-arm64.dmg
+          hdiutil verify out/cuepool-macos-arm64.dmg
+          codesign --verify --deep --strict "$APP"
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
@@ -117,25 +173,70 @@ jobs:
         with:
           name: cuepool-${{ matrix.os }}
           path: out/*
+          if-no-files-found: error
 
-  release:
-    name: Create Release
-    if: startsWith(github.ref, 'refs/tags/v') || inputs.release_tag != ''
-    needs: build
+  validate-packages:
+    name: Validate publication prerequisites
+    needs: [prepare, verify, build]
+    if: always() && needs.prepare.outputs.active == 'true'
     runs-on: ubuntu-latest
     steps:
-      - name: Download all artifacts
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: needs.build.result == 'success' && needs.verify.result == 'success'
+        with:
+          path: artifacts
+      # This read-only gate also runs for artifacts-only rehearsals and failed
+      # builds: a missing platform cannot pass even when publication is disabled.
+      - env:
+          BUILD_RESULT: ${{ needs.build.result }}
+          VERIFY_RESULT: ${{ needs.verify.result }}
+        run: >-
+          python3 .github/scripts/release.py validate-artifacts --artifacts artifacts
+          --build-result "$BUILD_RESULT" --verification-result "$VERIFY_RESULT"
+
+  release:
+    name: Publish verified release
+    needs: [prepare, verify, build, validate-packages]
+    if: needs.prepare.outputs.tag != '' && needs.validate-packages.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+      - name: Download both platform packages
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: artifacts
+      - name: Verify, upload draft, read back, publish, record receipt
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          SOURCE_SHA: ${{ needs.prepare.outputs.sha }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          VERIFY_RESULT: ${{ needs.verify.result }}
+        run: >-
+          python3 .github/scripts/release.py publish
+          --tag "$RELEASE_TAG" --sha "$SOURCE_SHA" --artifacts artifacts
+          --build-result "$BUILD_RESULT" --verification-result "$VERIFY_RESULT"
 
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+  recover-receipt:
+    name: Recover already published release receipt
+    needs: prepare
+    if: needs.prepare.outputs.published == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          tag_name: ${{ inputs.release_tag || github.ref_name }}
-          generate_release_notes: true
-          body: |
-            **macOS**: the app is ad-hoc signed, not notarized. On first launch macOS will block it:
-            right-click → Open, or approve under System Settings → Privacy & Security, or
-            `xattr -dr com.apple.quarantine "/Applications/CuePool.app"`.
-          files: artifacts/**/*
+          ref: ${{ needs.prepare.outputs.sha }}
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          SOURCE_SHA: ${{ needs.prepare.outputs.sha }}
+        run: python3 .github/scripts/release.py repair-receipt --tag "$RELEASE_TAG" --sha "$SOURCE_SHA"

@@ -76,7 +76,7 @@ are retained for compatibility.
 | `CUEPOOL_PIXELS_BIND` | Launch | Bind address for the unauthenticated pixel-feed WebSocket listener. | Unset; the listener is disabled. |
 | `CUEPOOL_PIXELS_ORIGINS` | Launch | Comma-separated browser `Origin` allowlist for the pixel feed; `null` permits `file://` pages. | Unset; any origin is accepted. |
 | `CUEPOOL_AUTOMATION_PROFILE` | Launch | Lowercase profile name for isolated locks, settings, and logs. | Unset or empty; use the default profile. |
-| `CUEPOOL_BUILD_ID` | Build | Embeds a build identifier in diagnostics and API status. | Unset or empty; report `Local build`. |
+| `CUEPOOL_BUILD_ID` | Build | Embeds a build identifier in diagnostics and API status. | Unset or empty; derive identity from Git, or report identity unavailable. |
 | `CUEPOOL_LX_FIXTURES` | Example launch | Fixture directory used by the `gen_lx_test` example. | The workspace's `testFiles` directory. |
 | `QPLAYER_ZEROCOPY` | Launch | Enables the Windows D3D12VA zero-copy path when set to `1` and no CLI override is supplied. | Disabled. |
 | `QPLAYER_PRESENT_MODE` | Launch | Requests `fifo`, `fifo_relaxed`, `mailbox`, or `immediate` for every output. | `fifo`; unsupported requests also fall back to `fifo`. |
@@ -348,3 +348,13 @@ CuePool is a Rust port of [QPlayer](https://github.com/space928/QPlayer) by
 space928, renamed to avoid confusion with the original project. It builds on
 [rustjay-engine](https://github.com/BlueJayLouche/rustjay-engine) and consumes
 `rustjay-lighting` (MIT) from crates.io.
+
+### Build identity and offline changes
+
+Local Cargo builds identify their source automatically. Open Help → Changes for
+embedded notes and the comparison baseline. See [build identity](docs/build-identity.md)
+for overrides, modified checkouts, archives and API compatibility.
+
+Release preparation maintains a reviewable product version and changelog PR.
+See [releases](docs/releases.md) for contributor conventions, GitHub App setup,
+platform gates and safe retries.

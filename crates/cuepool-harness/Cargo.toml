@@ -4,7 +4,6 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-publish = false
 
 # Dev-only test harness. Video is decoded through FFmpeg but never presented,
 # so the runner still needs no window, GPU, or audio device.

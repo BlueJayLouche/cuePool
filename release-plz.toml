@@ -1,0 +1,32 @@
+[workspace]
+# Baseline is always a checked-out Git tag supplied by scripts/prepare-release.py.
+# Built-in git_only packages old tags as registry crates, which cannot represent
+# CuePool private path dependencies and patched wgpu features. No registry lookup.
+git_only = false
+publish = false
+git_release_enable = false
+git_tag_enable = false
+git_tag_name = "v{{ version }}"
+dependencies_update = false
+semver_check = false
+features_always_increment_minor = true
+# release-plz synthesizes this message for root manifest/lockfile-only changes.
+release_commits = '^(feat|fix)(\([^)]*\))?!?:|^[a-z]+(\([^)]*\))?!:|^chore: update Cargo\.(toml|lock) dependencies$|(?m:^BREAKING[ -]CHANGE:)'
+changelog_update = false
+pr_name = "chore: release CuePool {{ version }}"
+
+[[package]]
+name = "cuepool"
+changelog_update = true
+changelog_path = "CHANGELOG.md"
+changelog_include = ["cuepool-core", "cuepool-audio", "cuepool-gui", "cuepool-video", "cuepool-protocols", "cuepool-harness"]
+
+[changelog]
+protect_breaking_commits = true
+commit_parsers = [
+ { message = "^feat", group = "Application features" },
+ { message = "^fix\\(deps\\)|^chore: update Cargo\\.(toml|lock) dependencies$", group = "Application dependencies" },
+ { message = "^fix", group = "Application fixes" },
+ { message = "^(ci|docs|chore|build)", group = "Build maintenance and documentation" },
+ { message = ".*", group = "Other changes" },
+]

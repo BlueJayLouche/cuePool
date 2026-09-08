@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+mod changes;
 mod identity_card;
 
 pub use identity_card::torus_colour;
@@ -523,6 +524,7 @@ pub struct SharedState {
     pub show_log_window: bool,
     /// Whether Help → About has asked for the identity card.
     pub show_about_window: bool,
+    pub show_changes_window: bool,
     /// Whether the Status diagnostics window is open.
     pub show_status_window: bool,
     /// Live snapshot behind the Status window, published by the engine.
@@ -691,6 +693,7 @@ impl Default for SharedState {
             audio_devices: Vec::new(),
             show_log_window: false,
             show_about_window: false,
+            show_changes_window: false,
             show_status_window: false,
             diagnostics: Diagnostics::default(),
             show_waveform_window: false,
@@ -2444,6 +2447,15 @@ impl CuePoolApp {
             }
         }
 
+        let mut show_changes = self
+            .state
+            .lock()
+            .is_ok_and(|state| state.show_changes_window);
+        changes::show(ctx, &mut show_changes);
+        if let Ok(mut state) = self.state.lock() {
+            state.show_changes_window = show_changes;
+        }
+
         // Sampled after the panels have laid out, so the next frame can tell an
         // Escape that cancels an edit from one that stops the show.
         self.keyboard_focus_at_frame_end = ctx.egui_wants_keyboard_input();
@@ -2736,6 +2748,12 @@ impl CuePoolApp {
                 if ui.button("Status…").clicked() {
                     if let Ok(mut state) = self.state.lock() {
                         state.show_status_window = true;
+                    }
+                    ui.close();
+                }
+                if ui.button("Changes…").clicked() {
+                    if let Ok(mut state) = self.state.lock() {
+                        state.show_changes_window = true;
                     }
                     ui.close();
                 }

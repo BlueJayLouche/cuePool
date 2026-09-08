@@ -3,6 +3,7 @@
 //! This crate is pure logic: no I/O, no OS dependencies. It defines the data types
 //! that cross all layer boundaries (plus one shared sync helper, [`sync::LockExt`]).
 
+pub mod build_identity;
 pub mod colour;
 pub mod cue;
 pub mod eq;

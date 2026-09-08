@@ -1528,3 +1528,20 @@ fn enter_opens_the_selected_cue_for_renaming() {
         Some(Decimal::new(12, 1))
     );
 }
+
+#[test]
+fn changes_view_shows_shared_identity_and_offline_baseline() {
+    let (mut harness, state) = demo_harness();
+    state.lock().unwrap().show_changes_window = true;
+    harness.run();
+    assert!(harness.query_by_label(&build_identity()).is_some());
+    assert!(
+        harness
+            .query_by_label(&format!(
+                "Comparison baseline: {}",
+                cuepool_core::build_identity::BUILD.changes_baseline
+            ))
+            .is_some()
+    );
+    assert!(harness.query_by_label("Publication status is the recorded status at build time; a version tag alone is not a published release.").is_some());
+}

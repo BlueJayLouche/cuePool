@@ -65,3 +65,22 @@ cargo test --workspace --locked
 ```
 
 Headless tests cover show logic and decoder timing. They do not prove presentation cadence, vsync behavior, audio-device routing, protocols, lighting hardware, or projector output. Changes at those boundaries still need an attended binary or rig smoke test.
+
+## Build identity and releases
+
+`cuepool_core::build_identity::BUILD` owns source identity for all consumers.
+Do not reintroduce independent environment-variable reads in the GUI or API.
+Its build script intentionally checks Git on every Cargo invocation; preserve
+coverage for checkout changes, untracked files, worktrees, shallow clones and
+archives when changing it. Version tags do not prove publication; only matching
+`published/vX.Y.Z` receipts record confirmed releases.
+
+Use `fix(deps):` for application dependencies and `chore(deps):` for build tooling.
+Release-plz prepares one product release PR with an inherited workspace version;
+it must never publish internal crates or update unrelated dependencies. Invoke
+release-plz through `scripts/prepare-release.py` so it receives a verified Git
+baseline and the proposal checks run before creating a remote PR. Only
+`.github/workflows/release.yml` owns final GitHub publication, after the exact
+candidate passes CI and both platform packages are validated and read back.
+Do not bypass the minor-release welcome-copy gate when merging a release PR.
+See `docs/releases.md` for setup, retries and token-trigger rules.
