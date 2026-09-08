@@ -20,6 +20,9 @@ jobs:
     # Only trusted current main is read; never consume a run's checkout/artifacts.
     if: github.event_name != 'workflow_run' || github.event.workflow_run.head_branch == 'main'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -27,22 +30,6 @@ jobs:
           fetch-depth: 0
       - id: candidate
         run: python3 .github/scripts/release.py can-prepare
-      - name: Require release bot credentials
-        if: steps.candidate.outputs.ready == 'true'
-        env:
-          APP_ID: ${{ vars.RELEASE_APP_ID }}
-          APP_KEY: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
-        run: |
-          if [ -z "$APP_ID" ] || [ -z "$APP_KEY" ]; then
-            echo 'Configure RELEASE_APP_ID and RELEASE_APP_PRIVATE_KEY for release PRs and automatic PR CI. See docs/releases.md.' >&2
-            exit 1
-          fi
-      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
-        id: app
-        if: steps.candidate.outputs.ready == 'true'
-        with:
-          app-id: ${{ vars.RELEASE_APP_ID }}
-          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
       - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0
         if: steps.candidate.outputs.ready == 'true'
         with:
@@ -54,5 +41,7 @@ jobs:
       - name: Maintain product release PR
         if: steps.candidate.outputs.ready == 'true'
         env:
-          GIT_TOKEN: ${{ steps.app.outputs.token }}
+          GIT_TOKEN: ${{ github.token }}
+        # GitHub requires a user with write access to approve CI runs on PRs
+        # created or updated with this token. See docs/releases.md.
         run: python3 scripts/prepare-release.py release-pr
