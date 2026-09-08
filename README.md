@@ -356,5 +356,5 @@ embedded notes and the comparison baseline. See [build identity](docs/build-iden
 for overrides, modified checkouts, archives and API compatibility.
 
 Release preparation maintains a reviewable product version and changelog PR.
-See [releases](docs/releases.md) for contributor conventions, GitHub App setup,
+See [releases](docs/releases.md) for contributor conventions, GitHub Actions setup,
 platform gates and safe retries.

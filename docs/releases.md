@@ -126,16 +126,32 @@ both packagers without publishing.
 
 ## GitHub setup and token behavior
 
-Install a GitHub App on **BlueJayLouche/cuePool** with repository **Contents: read
-and write**, **Pull requests: read and write**, and the mandatory Metadata read
-permission. Store its numeric ID in repository variable `RELEASE_APP_ID` and its
-private key in Actions secret `RELEASE_APP_PRIVATE_KEY`. No crates.io token is
-needed. The preparation workflow fails with an explicit setup message if these
-are absent. Neither key contents nor tokens belong in this repository.
+Build identification is local: Cargo reads the workspace version and Git revision
+without a GitHub account, token or network connection. A development build reports
+how many commits it is beyond its version tag, its exact commit and local edits.
+Rebuilding the same source keeps the same identity. Product versions change through
+reviewed release PRs; they do not need to change for every identifiable build.
 
-The App token creates release PRs so their CI starts normally. We deliberately do
-not fall back silently to GITHUB_TOKEN: its generated PR events may require manual
-workflow approval, and its pushed tags do not start ordinary push workflows.
+Release preparation uses release-plz with the repository's built-in `GITHUB_TOKEN`.
+No custom GitHub App, private key, personal access token or crates.io token is needed.
+The job requests Contents and Pull requests write permissions; other jobs keep
+their existing permissions.
+
+The repository owner must enable **Settings → Actions → General → Workflow
+permissions → Allow GitHub Actions to create and approve pull requests** if it is
+not already enabled. The workflow declares its required write permissions, so
+there is no need to change the default token permission for all workflows.
+After setup, run **Actions → Release preparation → Run workflow** on `main` to
+create or refresh the proposal. If GitHub refuses PR creation, check that setting.
+Despite the setting's name, this workflow never approves or merges its own PR.
+
+GitHub puts CI runs for PRs created or updated with `GITHUB_TOKEN` into an
+approval-required state. A user with **write access** can select **Approve workflows
+to run** in the PR merge box; admin access is not needed for that per-proposal step.
+After the bot updates a release PR, approve the checks for its latest revision.
+Wait for those checks, review the version/changelog and update minor-release welcome
+copy before squash merging. Do not interpret pending or approval-required checks
+as a pass. See [GitHub's token event rules](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/trigger-a-workflow#triggering-a-workflow-from-a-workflow).
 
 Publication uses the job-scoped GITHUB_TOKEN with Contents write. The verification
 and packaging jobs continue in the **same release workflow** after it creates a
