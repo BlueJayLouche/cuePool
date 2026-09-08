@@ -22,7 +22,8 @@ controller rigs):
 | `/qplayer/preload` | cue #, time | Decode a cue and hold it Ready |
 | `/qplayer/select` | cue # | Move the selection |
 | `/qplayer/save` | — | Save the project |
-| `/qplayer/volume` | dB (float) | Set the master output gain, −96 (silence) to +12 — the status-bar **Master** fader follows; saved per machine, not with the show |
+| `/qplayer/volume` | dB (float), optional request ID (int32) | Set master gain, −96 (silence) to +12 dB; saved with the show. With an ID, reply after applying the setting |
+| `/qplayer/volume/get` | request ID (int32) | Read the current master-volume setting through the application command queue |
 
 The cue number can also ride in the address instead of the argument list —
 `/qplayer/go/1.1` is the same command as `/qplayer/go` with `"1.1"` as its
@@ -39,6 +40,49 @@ worth checking there before the network.
 
 Outbound messages are sent by [OSC cues](cues.md#osc) — command format
 `/address,arg1,arg2,…`.
+
+### Master-volume feedback
+
+Send `/qplayer/volume/get` with one OSC int32 argument, for example `41`.
+CuePool replies with `/qplayer/volume/state 41 -12.0`: the same int32 ID and
+the current gain as an OSC float32 in dB. The reply goes directly to the
+requesting **IP address and source UDP port**, from CuePool's receive socket;
+the configured OSC transmit host/port are not used. Send and listen on the
+same controller socket. Remote-control client mode swaps the configured
+receive/transmit ports; use the actual listening port shown in CuePool's log.
+
+To confirm an adjustment, send `/qplayer/volume -18.0 42` (type tags `,fi`).
+Its reply is `/qplayer/volume/state 42 -18.0` (`,if`). Setters and queries are
+processed in arrival order through the application's command queue, so the
+confirmation follows the applied change. Even an unchanged value receives a
+confirmation. The original single-argument setter remains valid and sends no
+reply. Queries do not change the gain or dirty the show.
+
+Request IDs are opaque signed 32-bit integers, including zero and negative
+values. Missing, non-int32 or extra query arguments are ignored. An invalid
+optional setter ID or extra setter arguments cause the whole request to be
+ignored. Volume retains the existing numeric conversion and clamping:
+−96 dB or below is silence, +12 dB is the ceiling, and NaN becomes 0 dB.
+Always use finite float32 dB values in controllers, not percentages or strings.
+
+Feedback reads the clamped `ShowSettings.master_volume_db` at processing time,
+so polling observes Project Settings edits, show loads and audio-device
+rebuilds. The value is **saved with the show**, not per machine; OSC edits mark
+the show dirty just like the GUI. Readback reports the master setting, not
+measured audio output or proof of a functioning audio device. The gain remains
+ahead of the limiter.
+
+For a Nodel slider, poll once per second and give each outstanding request a
+fresh ID. Keep pending user input separate from confirmed state, reject late
+replies, throttle previews and always confirm the final adjustment. After
+repeated timeouts, mark state unavailable and refresh by reading on reconnect.
+Do not send another setter in response to feedback. A complete recipe, slider,
+integration contract and automated tests are in
+[`examples/nodel-volume`](https://github.com/BlueJayLouche/cuePool/tree/main/examples/nodel-volume).
+
+OSC uses UDP here: IDs correlate replies but do not provide delivery guarantees,
+server-side deduplication or global ordering between different senders. Clients
+must not treat an old response as confirmation of a newer adjustment.
 
 ### DMX recorder
 
