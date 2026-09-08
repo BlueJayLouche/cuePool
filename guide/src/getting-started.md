@@ -2,28 +2,44 @@
 
 ## Build & run
 
-CuePool needs a Rust toolchain and the FFmpeg libraries (for video decode):
+CuePool needs Rust and native audio/video development libraries. Follow the
+[platform setup instructions](https://github.com/BlueJayLouche/cuePool/blob/main/CONTRIBUTING.md#building-from-source),
+then run from the repository root:
 
 ```sh
-# macOS
-brew install ffmpeg
-
-# then, from the repo:
-cargo run --release
+cargo run --release --locked -p cuepool
 ```
 
-On Windows, `package-windows.ps1` bundles a release build with its FFmpeg DLLs
-(build first with `cargo build --release --locked -p cuepool --all-features`,
-with `FFMPEG_DIR` set). You can also open a project straight from the command line:
+## Command-line options
+
+```text
+cuepool [--show-mode] [--zero-copy | --no-zero-copy] [--project <path> | <path>]
+```
+
+Use `--project <path>` or a single positional path to open a project at startup.
+When running through Cargo, put app options after `--`:
 
 ```sh
-cargo run --release -- --project MyShow.qproj
+cargo run --release --locked -p cuepool -- --project MyShow.qproj
 ```
 
 The legacy positional form, `cuepool MyShow.qproj`, remains supported. CuePool
 is single-instance: launching a second copy while one is running shows an error
 and exits with a nonzero status; it does not forward the project to the running
 instance.
+
+`--show-mode` starts the app in Show mode with cue editing locked. The Show/Edit
+button still works normally; the flag only chooses the starting mode. Without
+it, the app starts in Edit mode.
+
+`--zero-copy` opts into the Windows D3D12VA zero-copy video path;
+`--no-zero-copy` forces the stock readback path. The two options are mutually
+exclusive. When neither is supplied, the `QPLAYER_ZEROCOPY` fallback is used:
+the zero-copy path is enabled only when its value is exactly `1`. Either
+command-line option takes precedence over that environment variable.
+
+For separate process profiles and API control, see the
+[automation reference](https://github.com/BlueJayLouche/cuePool/blob/main/docs/AUTOMATION.md).
 
 ## Your first show
 
@@ -62,8 +78,10 @@ instance.
 
 | Key | Action |
 |---|---|
-| Space | GO (fire next cue) |
+| Space | GO (fire the standby cue) |
 | Esc | Stop all |
+| ↑ / ↓ | Move the standby cue up / down the list |
+| Home / End | Standby the first / last cue |
 | Cmd/Ctrl+Z / Shift+Z | Undo / Redo |
 | Cmd/Ctrl+N / O / S | New / Open / Save project |
 | Cmd/Ctrl+T | Add sound cue |

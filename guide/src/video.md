@@ -39,3 +39,15 @@ to the canvas:
 
 The canvas is also what lighting [pixel-map segments](lighting.md#pixel-map-segments)
 sample by default, so LEDs can mirror the projector picture.
+
+## Video status indicator
+
+The status bar shows the current clip's decode path. Green means GPU decoding
+is active with no reported fallback. Amber with a ⚠ means decoding has fallen
+back to the CPU or a slower GPU path. Hover over the indicator for the reason
+and source file; Help > Status provides more detail.
+
+The path is named as the decoder reports it: `hap gpu-native`,
+`d3d12va zero-copy (<adapter>)`, `d3d11va readback`, `hardware (videotoolbox)`,
+or `software`. The indicator stays amber after a fallback even if decoding
+still uses the GPU, such as when zero-copy was lost.

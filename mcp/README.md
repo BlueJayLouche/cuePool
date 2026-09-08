@@ -2,7 +2,8 @@
 
 This small STDIO server lets MCP clients inspect and control a running CuePool
 instance through CuePool's `/v1` automation API. It does not contain any
-show-control logic of its own.
+show-control logic of its own. See the [automation API reference](../docs/AUTOMATION.md)
+for authentication, command acknowledgements, and process profiles.
 
 Requires Node.js 20 or newer. Build it once:
 

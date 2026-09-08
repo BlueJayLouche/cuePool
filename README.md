@@ -1,354 +1,79 @@
-# CuePool
+<p align="center">
+  <img src="packaging/window-icon.png" width="64" height="64" alt="CuePool icon">
+</p>
 
-A theatre sound/video cue player — a Rust port of [QPlayer](https://github.com/space928/QPlayer)
-(QLab-style show control), built on the rustjay engine. Renamed CuePool to avoid
-confusion with the original project. Audio via symphonia/cpal, video via FFmpeg,
-plus OSC/MIDI show control, projection-mapped video outputs, and lighting cues
-(sACN / Art-Net).
+<h1 align="center">CuePool</h1>
 
-## Prerequisites
+<p align="center">Sound, video, and lighting cues for live shows.</p>
 
-- Rust 1.97.1 (`rust-toolchain.toml` selects it automatically via rustup).
-- FFmpeg development libraries and `pkg-config`:
-  - macOS: `brew install ffmpeg` (add `dylibbundler` for a shareable `.app`).
-  - Ubuntu/Debian: `sudo apt-get install libasound2-dev libudev-dev pkg-config clang libavcodec-dev libavformat-dev libavutil-dev libavfilter-dev libavdevice-dev libswscale-dev libswresample-dev`
-  - Windows: the FFmpeg 8.0 shared SDK, with `FFMPEG_DIR` pointing at its
-    root (see `.github/workflows/release.yml` for the exact archive).
-- Build and test with `--locked` so `Cargo.lock` stays authoritative:
-  `cargo build --release --locked`.
+<p align="center">
+  <a href="https://bluejaylouche.github.io/cuePool/">User guide</a> ·
+  <a href="#getting-started">Getting started</a> ·
+  <a href="CONTRIBUTING.md">Contributing</a>
+</p>
 
-```sh
-cargo run --release
-```
+CuePool is an open-source cue player for macOS, Windows, and Linux.
+Build a cue list and step through it with GO, or link cues to run in sequence.
 
-## macOS app bundle
+![CuePool in Edit mode with a sample show: active cues on the left, the cue list in the centre, and the sound inspector on the right.](crates/cuepool-gui/tests/snapshots/edit_mode.png)
 
-Cargo produces a bare executable, and macOS takes an icon only from an `.app`
-bundle, so launching that binary from Finder or the Dock shows the generic green
-`exec` tile. `packaging/window-icon.png` does not apply here either, because
-winit window icons are a no-op on macOS. For a real CuePool.app:
+## Features
 
-```sh
-cargo build --release
-./package-macos.sh
-```
+- **Audio and video** — play sound, video, images, and text from one cue list,
+  with fades, loops, and multichannel audio routing.
+- **Cue sequencing** — fire cues manually, together, or when the previous cue
+  finishes. Use groups and delays to control the sequence.
+- **Projection mapping** — map video to multiple outputs with warping
+  and edge blending.
+- **Lighting** — send DMX over sACN or Art-Net and map video onto LED fixtures.
+- **Show control** — use OSC, MIDI, and timecode, or connect through the
+  [HTTP API](docs/AUTOMATION.md) and [MCP server](mcp/README.md).
 
-That writes `dist/CuePool.app` at the repo root from the same `Info.plist` and
-`packaging/AppIcon.icns` the release workflow ships, so it matches the published
-build. Run `brew install dylibbundler` first to pull the FFmpeg dylib closure
-into the bundle and make it shareable. Without it the bundle still loads FFmpeg
-from Homebrew and runs only on the machine that built it.
+Edit mode is for programming; switch to Show mode to lock cue editing.
+Projects are `.qproj` files. Pack a project with its media to take it to another
+machine.
 
-## Command line
+## Getting started
 
-```text
-cuepool [--show-mode] [--zero-copy | --no-zero-copy] [--project <path> | <path>]
-```
-
-`--zero-copy` opts into the Windows D3D12VA zero-copy video path;
-`--no-zero-copy` forces the stock readback path. The two options are mutually
-exclusive. When neither is supplied, the existing `QPLAYER_ZEROCOPY` fallback
-is used: the zero-copy path is enabled only when its value is exactly `1`.
-Either command-line option takes precedence over that environment variable.
-
-Use `--project <path>` or a single positional path to open a project at startup.
-
-`--show-mode` starts the app in Show mode instead of Edit mode, so an unattended
-machine comes up with cue editing already locked. The Show/Edit button still
-works normally afterwards — the flag chooses the starting stance, it does not
-pin it. Without the flag the app starts in Edit mode as before.
-
-## Environment
-
-The `QPLAYER_*` names are the legacy prefix from before the CuePool rename and
-are retained for compatibility.
-
-| Variable | Read | Purpose | Default |
-|---|---|---|---|
-| `CUEPOOL_API_BIND` | Launch | Bind address for the read-only/control HTTP API; non-loopback addresses are rejected. | `127.0.0.1:7133` |
-| `CUEPOOL_API_CONTROL_TOKEN` | Launch | Non-empty bearer token that enables API commands. | Unset; commands are disabled. |
-| `CUEPOOL_PIXELS_BIND` | Launch | Bind address for the unauthenticated pixel-feed WebSocket listener. | Unset; the listener is disabled. |
-| `CUEPOOL_PIXELS_ORIGINS` | Launch | Comma-separated browser `Origin` allowlist for the pixel feed; `null` permits `file://` pages. | Unset; any origin is accepted. |
-| `CUEPOOL_AUTOMATION_PROFILE` | Launch | Lowercase profile name for isolated locks, settings, and logs. | Unset or empty; use the default profile. |
-| `CUEPOOL_BUILD_ID` | Build | Embeds a build identifier in diagnostics and API status. | Unset or empty; derive identity from Git, or report identity unavailable. |
-| `CUEPOOL_LX_FIXTURES` | Example launch | Fixture directory used by the `gen_lx_test` example. | The workspace's `testFiles` directory. |
-| `QPLAYER_ZEROCOPY` | Launch | Enables the Windows D3D12VA zero-copy path when set to `1` and no CLI override is supplied. | Disabled. |
-| `QPLAYER_PRESENT_MODE` | Launch | Requests `fifo`, `fifo_relaxed`, `mailbox`, or `immediate` for every output. | `fifo`; unsupported requests also fall back to `fifo`. |
-| `QPLAYER_FPS_DEBUG` | Launch | Enables once-per-second frame-pacing diagnostics when present. | Unset; diagnostics are disabled. |
-| `QPLAYER_NO_HWACCEL` | Launch | Forces software video decode and disables GPU-native HAP when set to `1`. | Hardware acceleration may be used. |
-| `RUST_LOG` | Launch | Configures stderr and in-app log filtering with `env_logger` syntax. | Error-level stderr filtering; CuePool still persists warnings and field events. |
-| `FFMPEG_DIR` | Build/package | Points Windows builds and `package-windows.ps1` at the FFmpeg shared SDK. | Unset; ignored by the custom build step off Windows MSVC. |
-| `CARGO_CFG_TARGET_OS` | Build (Cargo-provided) | Lets the video build script detect whether the target is Windows. | Set by Cargo. |
-| `CARGO_CFG_TARGET_ENV` | Build (Cargo-provided) | Lets the video build script detect whether the target uses MSVC. | Set by Cargo. |
-
-## Automation API
-
-CuePool starts a read-only HTTP API with the app at
-`http://127.0.0.1:7133/v1`. The OpenAPI document is available at
-`/v1/openapi.json`.
-
-Read endpoints cover health, the loaded project, cues, active cues, the full
-Help > Status snapshot, one-second status history, and cursor-based logs.
-Log reads accept an optional `limit` from 1 to 1000 for bounded paging.
-`/v1/events` is an SSE stream of status samples, new logs, and command results.
-
-Set `CUEPOOL_API_CONTROL_TOKEN` before launch to enable commands. Send the token
-as `Authorization: Bearer <token>`. Without it, all reads remain available and
-`POST /v1/commands` returns `403 control_disabled`.
+Follow the [build instructions](CONTRIBUTING.md#building-from-source) to install
+Rust and the platform dependencies, then run from the repository root:
 
 ```sh
-curl http://127.0.0.1:7133/v1/health
-
-curl -H "Authorization: Bearer $CUEPOOL_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"command":"go"}' \
-  http://127.0.0.1:7133/v1/commands
+cargo run --release --locked -p cuepool
 ```
 
-Commands are `open_project`, `select_cue`, `go`, `stop`, `pause`, `resume`,
-`preload`, `seek`, and `shutdown`. The API returns `202` with a pending command ID. Poll
-`/v1/commands/{id}` or listen to `/v1/events` for the applied or rejected
-result. Send an `Idempotency-Key` header when a command may be retried; reuse of
-the same key returns the original command instead of executing it twice while
-the result remains in CuePool's 256-command history. Once that result expires,
-the old key is rejected rather than executed again.
-`open_project` requires an absolute local `.qproj` path and rejects replacement
-of a dirty project or a project with active cues.
-`shutdown` waits for its final result before returning. It stops only the
-CuePool process serving that API, and rejects projects with unsaved changes or
-active playback.
+The [first-show walkthrough](guide/src/getting-started.md#your-first-show) covers
+adding a cue, playing it with **Space**, and saving your project.
 
-`CUEPOOL_API_BIND` can change the loopback address or port, but CuePool rejects
-non-loopback binds because the API is plain HTTP. For remote access, forward the
-loopback listener through an authenticated TLS tunnel or reverse proxy; never
-expose it directly to a network.
+## Documentation
 
-MCP clients can use the TypeScript STDIO sidecar in [`mcp/`](mcp/). It maps a
-small set of agent-friendly tools onto this API and only advertises control
-tools when a token is configured.
+- [User guide](https://bluejaylouche.github.io/cuePool/) — cue types, audio,
+  video, lighting, and show control. Also available [in this repository](guide/src/README.md).
+- [Command-line options](guide/src/getting-started.md#command-line-options) —
+  open a project at startup and choose the initial mode.
+- [Environment variables](docs/ENVIRONMENT.md) — build and runtime settings.
+- [Automation API](docs/AUTOMATION.md) — diagnostics, playback commands,
+  automation profiles, and Windows playback checks.
+- [Pixel feed](docs/PIXEL_FEED.md) — stream pixel-map samples to a visualiser.
+- [Build identity](docs/build-identity.md) — source versions, overrides, and
+  offline notes in **Help → Changes**.
+- [Packaging](packaging/README.md) and [releases](docs/releases.md) — app
+  bundles, product changelogs, and publication.
 
-### Automation profiles
+## Contributing
 
-Set `CUEPOOL_AUTOMATION_PROFILE` to a lowercase name such as `smoke-a` when an
-automation run must coexist with another CuePool process. Each named profile
-gets its own single-instance lock, recent-file settings, and persistent log.
-Use a different `CUEPOOL_API_BIND` port for each running profile.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for build requirements, checks, and a map
+of the codebase. Report bugs or suggest improvements in
+[GitHub issues](https://github.com/BlueJayLouche/cuePool/issues).
 
-The default profile is unchanged when the variable is unset or empty. Named
-profile settings and logs live below the platform's normal CuePool directory at
-`CuePool/automation/<name>/settings.json` and
-`CuePool/automation/<name>/cuepool.log`.
+## Credits and license
 
-### Unattended Windows smoke
-
-Build the exact revision with its commit identity embedded, then run the
-PowerShell smoke script from an interactive desktop session:
-
-```powershell
-$commit = (git rev-parse --short=7 HEAD).Trim()
-$env:CUEPOOL_BUILD_ID = $commit
-cargo build --release --locked -p cuepool --all-features
-# A scheduled task does not inherit Cargo's DLL search path. Make the build
-# directory runnable before launching it in an interactive desktop session.
-Copy-Item "$env:FFMPEG_DIR\bin\*.dll" .\target\release\
-
-.\scripts\unattended-smoke.ps1 `
-  -Executable .\target\release\cuepool.exe `
-  -Project C:\content\shows\smoke.qproj `
-  -Profile smoke-a `
-  -ApiPort 7141 `
-  -ExpectedCommit $commit `
-  -Artifact C:\content\smoke-results\cuepool-smoke.json `
-  -CueQid 1
-```
-
-The script selects and plays the cue, checks that active playback blocks
-shutdown, pauses, resumes, stops, captures health, GPU diagnostics, status
-history and logs, then performs an acknowledged shutdown. It writes one compact
-JSON artifact and never stores the generated control token. On failure it stops
-only the process it launched.
-
-Process launch remains outside MCP. The smoke artifact proves application and
-GPU state, but not physical projector mapping; that still needs an attended or
-camera-backed check.
-
-## Pixel feed
-
-A WebSocket mirror of the pixel-map samples, for driving an external visualiser.
-It is off unless `CUEPOOL_PIXELS_BIND` is set:
-
-```sh
-CUEPOOL_PIXELS_BIND=127.0.0.1:7134 cuepool
-```
-
-Connect to `ws://<bind>/v1/pixels`. Two optional query parameters: `fps` (1–60,
-default 30) and `segments`, a comma-separated id filter that defaults to every
-active segment. Ids that do not parse are dropped; a filter with no parseable
-id at all streams nothing rather than everything.
-
-This is a **separate listener from the automation API above**, on its own port
-and thread. Pixel data is the least sensitive thing CuePool holds — it is what
-the room already sees — while `/v1/project` and `/v1/logs` are the most, so they
-do not share a door. The API keeps its loopback-only rule; this listener accepts
-any address you give it. It is unauthenticated, on the same reasoning that sACN
-and Art-Net are: the real DMX output is already on that network in clear. Prefer
-a specific interface (`192.168.10.5:7134`) over `0.0.0.0` so a dual-homed machine
-does not serve the feed on a second network. Eight concurrent connections are
-allowed; further ones get `503`. Idle connections are pinged every 30 seconds so
-a vanished client's slot is reclaimed.
-
-One principal can reach the feed from outside that network reasoning: a browser,
-where any web page may open a WebSocket. `CUEPOOL_PIXELS_ORIGINS` (comma-separated,
-e.g. `https://vis.example`, or `null` for a `file://` page) restricts which browser
-`Origin`s may connect; unlisted origins get `403`. Requests without an `Origin`
-header — non-browser clients — always pass. Unset, any origin is accepted.
-
-On connect, and whenever the patch changes, the server sends a JSON text frame
-describing the segments:
-
-```json
-{"type": "segments", "segments": [
-  {"id": 1, "name": "Upstage truss", "cols": 32, "rows": 8,
-   "region": [0.0, 0.0, 1.0, 0.25], "source": "PixelMap",
-   "universe": 1, "address": 1, "gamma": 2.2,
-   "order": {"start_corner": "TopLeft", "serpentine": true, "primary": "Horizontal"}}]}
-```
-
-Pixel data then arrives as binary frames, one per segment, only when that
-segment's pixels changed — static content costs nothing. Each frame is a 12-byte
-little-endian header followed by tightly packed RGBA, row-major from the
-top-left:
-
-| Offset | Type | Meaning |
-|---|---|---|
-| 0 | `u32` | Segment id |
-| 4 | `u16` | Columns |
-| 6 | `u16` | Rows |
-| 8 | `u32` | Milliseconds since the stream opened (wraps every ~49.7 days) |
-| 12 | … | `cols * rows * 4` bytes RGBA |
-
-**Trust the frame header over the metadata for dimensions.** The sampler can lag
-a grid resize by a frame, so the two disagree briefly after an edit.
-
-These are raw samples, taken before `demux_tile` applies the segment's wiring and
-before the gamma, white-mode and colour correction that shape the actual DMX
-output. A visualiser showing source imagery can ignore `order`; one mirroring
-fixture wiring should apply it.
-
-```js
-const socket = new WebSocket("ws://127.0.0.1:7134/v1/pixels?fps=30");
-socket.binaryType = "arraybuffer";
-const ctx = document.querySelector("canvas").getContext("2d");
-
-socket.onmessage = (event) => {
-  if (typeof event.data === "string") {
-    console.log("segments", JSON.parse(event.data).segments);
-    return;
-  }
-  const view = new DataView(event.data);
-  const cols = view.getUint16(4, true);
-  const rows = view.getUint16(6, true);
-  const pixels = new Uint8ClampedArray(event.data, 12);
-  ctx.putImageData(new ImageData(pixels, cols, rows), 0, 0);
-};
-```
-
-## Window layout
-
-| Area | What it is |
-|---|---|
-| Top | Menu bar + transport (GO / Stop / Pause, standby readout, master meter) |
-| Left | **Active Cues** — every playing cue with state, volume meter, and a progress bar (`elapsed / total  −remaining`; yellow = paused) |
-| Center | **Cue list** — the show, in playback order. The standby cue (what GO will fire) carries a chevron in the left gutter and an outlined row; playing cues are green with a ▶ marker, paused cues amber, idle standby blue |
-| Right | **Inspector** — full editor for the selected cue |
-| Bottom | Status bar — playing-cue count, mode, cue total, unsaved marker, and the live **Video** / **Audio** indicators |
-
-The app has two modes. **Edit** mode enables all editing below; **Show** mode
-locks the cue list so a stray click can't rearrange your show mid-performance.
-
-### Video indicator
-
-The status bar names the decode path the current clip is actually using. Green
-means the GPU is doing the work and nothing was given up getting there. Amber
-with a ⚠ means the path is degraded, either because decoding fell back to the
-CPU or because a faster GPU path was abandoned. Hover it for the reason and the
-source file; Help > Status has the full picture.
-
-The path is named as the decoder reports it: `hap gpu-native`,
-`d3d12va zero-copy (<adapter>)`, `d3d11va readback`, `hardware (videotoolbox)`,
-or `software`. A hardware path still reads amber once it has fallen back,
-because a clip that lost zero-copy is running slower than it should even though
-the GPU is still decoding it.
-
-## Editing the cue list (Edit mode)
-
-- **Rename / renumber inline** — the `#` and `Name` cells are text fields; click
-  and type. Cue numbers commit when the field loses focus (Enter or click away;
-  Esc cancels), names commit as you type. Renumbering follows references: group
-  members, Stop/Volume/Goto cues targeting the old number, and the selection all
-  move to the new number. Duplicate numbers are rejected.
-- **Add cues** — toolbar buttons above the list, or right-click → *Add … Cue*.
-  New cues are numbered after the selected cue.
-- **Right-click menu** — Move Up/Down, Duplicate, Delete, Add cue.
-- **Reorder / group** — drag the `≡` handle. Drop a cue onto a Group (or one of
-  its members) to join the group — members draw indented under the group header.
-  Drop on the strip below the list to ungroup / move to the end.
-- **Delete** — right-click → Delete, or select and press Delete/Backspace.
-
-## Keyboard shortcuts
-
-| Key | Action |
-|---|---|
-| Space | GO (fire the standby cue) |
-| Esc | Stop all |
-| ↑ / ↓ | Move the standby cue up / down the list |
-| Home / End | Standby the first / last cue |
-| Cmd/Ctrl+Z / Shift+Z | Undo / Redo |
-| Cmd/Ctrl+N / O / S | New / Open / Save project |
-| Cmd/Ctrl+T | Add sound cue |
-| Cmd/Ctrl+D | Duplicate selected cue |
-| Cmd/Ctrl+↑ / ↓ | Move selected cue up / down |
-| Delete / Backspace | Delete selected cue |
-
-While a text field has keyboard focus — renaming a cue, editing a Q number —
-the field keeps its keystrokes. Only *New*, *Open*, *Save*, *Duplicate* and
-*Add sound cue* stay live; the rest resume when the edit ends.
-
-## Cue types
-
-Sound, Video, Image, Text, Group, Stop, Volume, Dummy, TimeCode, OSC, Goto,
-Lighting, PixelMap. Each cue has a trigger mode: **Go** (waits for GO),
-**WithLast** (fires with the previous cue), **AfterLast** (fires when the
-previous cue finishes).
-
-## Projects
-
-Projects are JSON `.qproj` files. *File → Pack Project* copies all referenced
-media next to the project file for touring. OSC receive/transmit ports and the
-network interface live in Project Settings (defaults: rx 9000 / tx 9001).
-
-## Guide
-
-Full user guide: <https://bluejaylouche.github.io/cuePool/> (source under `guide/`).
-
-## License
-
-Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
-[MIT license](LICENSE-MIT) at your option. Unless you explicitly state
-otherwise, any contribution intentionally submitted for inclusion in this work
-shall be dual licensed as above, without any additional terms or conditions.
-
-CuePool is a Rust port of [QPlayer](https://github.com/space928/QPlayer) by
-space928, renamed to avoid confusion with the original project. It builds on
-[rustjay-engine](https://github.com/BlueJayLouche/rustjay-engine) and consumes
+CuePool began as a Rust port of [QPlayer](https://github.com/space928/QPlayer)
+by space928 and was renamed to avoid confusion with the original project.
+It is now a standalone workspace, extracted from
+[rustjay-engine](https://github.com/BlueJayLouche/rustjay-engine), and uses
 `rustjay-lighting` (MIT) from crates.io.
 
-### Build identity and offline changes
-
-Local Cargo builds identify their source automatically. Open Help → Changes for
-embedded notes and the comparison baseline. See [build identity](docs/build-identity.md)
-for overrides, modified checkouts, archives and API compatibility.
-
-Release preparation maintains a reviewable product version and changelog PR.
-See [releases](docs/releases.md) for contributor conventions, GitHub App setup,
-platform gates and safe retries.
+Licensed under [Apache 2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT), at your option.
+Unless you explicitly state otherwise, contributions intentionally submitted for
+inclusion are dual licensed under the same terms, without additional conditions.
